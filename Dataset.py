@@ -72,7 +72,7 @@ class Dataset(torch.utils.data.Dataset):
             self.tree = neighbors.KDTree(index_tau)
 
             # Get neighbors
-            receivers_list = self.tree.query_radius(index_tau, r=1)
+            receivers_list = self.tree.query_radius(index_tau, r=2)
 
             senders = np.repeat(range(num_nodes), [len(a) for a in receivers_list])
             receivers = np.concatenate(receivers_list, axis=0)
