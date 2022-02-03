@@ -2,7 +2,7 @@
 Graphnets for solving radiative transfer problems in stellar atmospheres.
 
 Andres Vicente & Andrés Asensio:
-[link in prep](None)
+[Accelerating non-LTE synthesis and inversions with graph networks](https://arxiv.org/pdf/2111.10552.pdf)
 
 ## Dependencies
 
