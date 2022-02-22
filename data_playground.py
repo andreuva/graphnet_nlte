@@ -1,9 +1,7 @@
-from threading import main_thread
 import numpy as np
 import matplotlib.pyplot as plt
 import struct
 import os, sys
-from pip import main
 from scipy import interpolate
 import copy
 
@@ -149,7 +147,7 @@ def skip_plane(self, f, skip):
     return {}
 
 
-def get_plane(self, f):
+def get_plane(f, PMD, NRL, NRU):
     ''' Load the data from a plane in the pmd file
     '''
 
@@ -184,16 +182,27 @@ def get_plane(self, f):
                 if PMD['read'][4]:
                     T[4].append(struct.unpack( \
                                 CONF['endian'] + 'd', bytes)[0])
-            for ii in range(self.NRL*2):
-                bytes = f.read(8)
-                if PMD['read'][5]:
+            if PMD['read'][5]:
+                for ii in range(NRL*2):
+                    bytes = f.read(8)
                     T[5].append(struct.unpack( \
                                 CONF['endian'] + 'd', bytes)[0])
-            for ii in range(self.NRU*2):
-                bytes = f.read(8)
-                if PMD['read'][6]:
+            else:
+                chunks = 100_000_000
+                repetitions = NRL*2*8//chunks
+                offset = NRL*2*8%chunks
+                f.seek(offset, 1)
+                for ii in range(NRL):
+                    f.read(chunks)
+            
+            if PMD['read'][6]:
+                for ii in range(NRU*2):
+                    bytes = f.read(8)
                     T[6].append(struct.unpack( \
                                 CONF['endian'] + 'd', bytes)[0])
+            else:
+                f.seek(8*NRU*2, 1)
+
             for ii in range(9):
                 bytes = f.read(8)
                 if PMD['read'][7]:
@@ -236,11 +245,11 @@ def get_plane(self, f):
     if PMD['read'][5]:
         T[5] = np.array(T[5]).reshape(PMD['head']['nodes0'][1], \
                                         PMD['head']['nodes0'][0], \
-                                        self.NRL, 2)
+                                        NRL, 2)
     if PMD['read'][6]:
         T[6] = np.array(T[6]).reshape(PMD['head']['nodes0'][1], \
                                         PMD['head']['nodes0'][0], \
-                                        self.NRU, 2)
+                                        NRU, 2)
     if PMD['read'][7]:
         T[7] = np.array(T[7]).reshape(PMD['head']['nodes0'][1], \
                                         PMD['head']['nodes0'][0], \
@@ -260,27 +269,23 @@ def get_plane(self, f):
                                         PMD['head']['nodes0'][1], \
                                         PMD['head']['nodes0'][0])
 
-    self.pgc += 100./float(PMD['head']['nodes0'][2])
-    pgc = int(self.pgc)
-    if pgc > self.pgl:
-        diff = pgc - self.pgl
-        for ii in range(diff):
-            if pgc <= 99:
-                self.pg.step()
-                self.pg.update_idletasks()
-        self.pgl += diff
+    # self.pgc += 100./float(PMD['head']['nodes0'][2])
+    # pgc = int(self.pgc)
+    # if pgc > self.pgl:
+    #     diff = pgc - self.pgl
+    #     for ii in range(diff):
+    #         if pgc <= 99:
+    #             self.pg.step()
+    #             self.pg.update_idletasks()
+    #     self.pgl += diff
 
     return T
 
 
-def get_data(self):
+def get_data(PMD):
     ''' Reads the pmd for the twolevel module given the header
         Returns true if the reading went well and false otherwise.
     '''
-
-    # Initialize progress bar
-    self.pgc = 0
-    self.pgl = 0
 
     # Check if there is a file at all
     if not os.path.isfile(PMD['head']['name']):
@@ -291,8 +296,6 @@ def get_data(self):
 
     # Read it as a pmd file
     try:
-
-        self.pg.update_idletasks()
 
         with open(PMD['head']['name'],'rb') as f:
 
@@ -313,12 +316,12 @@ def get_data(self):
             inpt['Jl2'] = struct.unpack( \
                             CONF['endian'] + 'I', bytes)[0]
             inpt['NRL'] = (inpt['Jl2'] + 1)*(inpt['Jl2'] + 1)
-            self.NRL = inpt['NRL']
+            NRL = inpt['NRL']
             bytes = f.read(4)
             inpt['Ju2'] = struct.unpack( \
                             CONF['endian'] + 'I', bytes)[0]
             inpt['NRU'] = (inpt['Ju2'] + 1)*(inpt['Ju2'] + 1)
-            self.NRU = inpt['NRU']
+            NRU = inpt['NRU']
             bytes = f.read(8)
             inpt['gl'] = struct.unpack( \
                             CONF['endian'] + 'd', bytes)[0]
@@ -333,12 +336,9 @@ def get_data(self):
                                 PMD['head']['nodes0'][1], \
                                 PMD['head']['nodes0'][2])
 
-            inpt['x'] = PMD['head']['x'] \
-                                    [0:PMD['head']['nodes0'][0]]
-            inpt['y'] = PMD['head']['y'] \
-                                    [0:PMD['head']['nodes0'][1]]
-            inpt['z'] = PMD['head']['z'] \
-                                    [0:PMD['head']['nodes0'][2]]
+            inpt['x'] = PMD['head']['x'][0:PMD['head']['nodes0'][0]]
+            inpt['y'] = PMD['head']['y'][0:PMD['head']['nodes0'][1]]
+            inpt['z'] = PMD['head']['z'][0:PMD['head']['nodes0'][2]]
 
             #
             # Compatibility with pmd files that were different
@@ -373,7 +373,7 @@ def get_data(self):
 
             planesize = PMD['head']['nodes0'][0]* \
                         PMD['head']['nodes0'][1]* \
-                        8*(22 + 2*(self.NRL + self.NRU))
+                        8*(22 + 2*(NRL + NRU))
 
             # Create geometry axis
             if CONF['interpol']:
@@ -439,10 +439,29 @@ def get_data(self):
             # Identify scalars and vectors
             scal = [0,1,2,8,9,10,11]
             vec = [3,4]
+            PMD['vars'] = {0: 'Temperature', \
+                       1: 'Density', \
+                       2: 'B', \
+                       3: 'V', \
+                       4: 'Microturbulence', \
+                       5: 'Density matrix', \
+                       6: 'Radiation', \
+                       7: 'Damping', \
+                       8: 'Collisional rates', \
+                       9: 'Depolarizing rates.', \
+                       10: u'\u03B7 cont.', \
+                       11: u'\u03B5 cont.'}
+
+            if 'read' not in PMD.keys():
+                PMD['read'] = [False]*len(PMD['vars'].keys())
+            
+            PMD['read'][0] = True
+            PMD['read'][1] = True
+            PMD['read'][2] = True
+            PMD['read'][3] = True
 
             # Create space to read data
-            for ii,read in \
-                zip(range(len(PMD['read'])),PMD['read']):
+            for ii,read in enumerate(PMD['read']):
 
                 if read:
 
@@ -459,12 +478,12 @@ def get_data(self):
                         inpt[ii] = np.empty([inpt['nodes'][2], \
                                                 inpt['nodes'][1], \
                                                 inpt['nodes'][0], \
-                                                self.NRL, 2])
+                                                NRL, 2])
                     elif ii == 6:
                         inpt[ii] = np.empty([inpt['nodes'][2], \
                                                 inpt['nodes'][1], \
                                                 inpt['nodes'][0], \
-                                                self.NRU, 2])
+                                                NRU, 2])
                     elif ii == 7:
                         inpt[ii] = np.empty([inpt['nodes'][2], \
                                                 inpt['nodes'][1], \
@@ -494,7 +513,7 @@ def get_data(self):
                             check = P1['done']
                             P1 = {}
                         except KeyError:
-                            P0 = self.skip_plane(f, planesize)
+                            P0 = skip_plane(f, planesize)
                         except :
                             raise
                         continue
@@ -503,12 +522,12 @@ def get_data(self):
                     try:
                         check = P0['done']
                     except KeyError:
-                        P0 = self.get_plane(f)
+                        P0 = get_plane(f, PMD, NRL, NRU)
                     except:
                         raise
 
                     # Get P1
-                    P1 = self.get_plane(f)
+                    P1 = get_plane(f, PMD, NRL, NRU)
 
                     zz0 = temp['z'][iz]
                     zz1 = temp['z'][iz+1]
@@ -548,7 +567,7 @@ def get_data(self):
                                     P0[var] = P0[var][0:NY,0:NX,:]
                                 var = 5
                                 if PMD['read'][var]:
-                                    for ii in range(self.NRL):
+                                    for ii in range(NRL):
                                         for jj in range(2):
                                             r = interpolate.\
                                                     interp2d( \
@@ -563,7 +582,7 @@ def get_data(self):
                                                 [0:NY,0:NX,:,:]
                                 var = 6
                                 if PMD['read'][var]:
-                                    for ii in range(self.NRU):
+                                    for ii in range(NRU):
                                         for jj in range(2):
                                             r = interpolate. \
                                                     interp2d( \
@@ -614,7 +633,7 @@ def get_data(self):
                                     P1[var] = P1[var][0:NY,0:NX,:]
                                 var = 5
                                 if PMD['read'][var]:
-                                    for ii in range(self.NRL):
+                                    for ii in range(NRL):
                                         for jj in range(2):
                                             r = interpolate.\
                                                     interp2d( \
@@ -629,7 +648,7 @@ def get_data(self):
                                                 [0:NY,0:NX,:,:]
                                 var = 6
                                 if PMD['read'][var]:
-                                    for ii in range(self.NRU):
+                                    for ii in range(NRU):
                                         for jj in range(2):
                                             r = interpolate. \
                                                     interp2d( \
@@ -673,7 +692,7 @@ def get_data(self):
                                             w2*P1[var][:,:,ii]
                             var = 5
                             if PMD['read'][var]:
-                                for ii in range(self.NRL):
+                                for ii in range(NRL):
                                     for jj in range(2):
                                         inpt[var] \
                                             [izp,:,:,ii,jj] = \
@@ -681,7 +700,7 @@ def get_data(self):
                                             w2*P1[var][:,:,ii,jj]
                             var = 6
                             if PMD['read'][var]:
-                                for ii in range(self.NRU):
+                                for ii in range(NRU):
                                     for jj in range(2):
                                         inpt[var] \
                                             [izp,:,:,ii,jj] = \
@@ -712,7 +731,7 @@ def get_data(self):
 
                 for iz in range(inpt['nodes'][2]):
 
-                    P0 = self.get_plane(f)
+                    P0 = get_plane(f, PMD, NRL, NRU)
 
                     for ii in scal:
                         if PMD['read'][ii]:
@@ -733,7 +752,7 @@ def get_data(self):
 
 if __name__ == '__main__':
     inpt = {}
-    filein = '../../DATA/graphnet_nlte/AR_385_CAII.pmd'
+    filein = '/home/avicente/Documents/DATA/graphnet_nlte/AR_385_CAII.pmd'
     with open(filein,'rb') as f:
         inpt['io'] = "binary"
 
@@ -910,3 +929,7 @@ if __name__ == '__main__':
 
         inpt['pmd_dir'] = path
 
+    pmd = copy.deepcopy(PMD)
+    pmd['head'] = copy.deepcopy(inpt)
+    # Read the data
+    get_data(pmd)

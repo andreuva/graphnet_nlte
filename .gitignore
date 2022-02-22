@@ -9,6 +9,8 @@ __pycache__/
 # C extensions
 *.so
 
+caii/
+
 # Distribution / packaging
 .Python
 build/
