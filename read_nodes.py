@@ -47,16 +47,16 @@ def get_data(PMD):
                             8: 'dm[N_DM==20]', \
                             9: 'jkq[NLINES]'}
 
-            
+
             if 'read' not in PMD.keys():
                 PMD['read'] = [False]*len(PMD['vars'].keys())
-            
+
             PMD['read'][3] = True
-            PMD['read'][5] = True
-            PMD['read'][6] = True
+            # PMD['read'][5] = True
+            # PMD['read'][6] = True
             # Create space to read data
 
-            
+
             # Create space to read data
             for ii,read in enumerate(PMD['read']):
                 if read:
@@ -71,6 +71,11 @@ def get_data(PMD):
                                             3])
 
 
+            T = {}
+            for ii,read in enumerate(PMD['read']):
+                if read:
+                    T[ii] = []
+
             for iz in tqdm(range(inpt['nodes'][2])):
                 for iy in range(inpt['nodes'][1]):
                     for ix in range(inpt['nodes'][0]):
@@ -82,11 +87,12 @@ def get_data(PMD):
                                 if ii in scal:
                                     bytes = f.read(4)
                                     nsize += 4
-                                    inpt[ii][iz,iy,ix] = struct.unpack(PMD['head']['endian'] + 'f', bytes)[0]
+                                    T[ii].append(struct.unpack(PMD['head']['endian'] + 'f', bytes)[0])
                                 elif ii in vec:
-                                    bytes = f.read(4*3)
-                                    nsize += 4*3
-                                    inpt[ii][iz,iy,ix,:] = struct.unpack(PMD['head']['endian'] + 'f'*3, bytes)
+                                    for i in range(3):
+                                        bytes = f.read(4)
+                                        nsize += 4
+                                        T[ii].append(struct.unpack(PMD['head']['endian'] + 'f', bytes))
                             else:
                                 if ii in scal:
                                     f.seek(4, 1)
@@ -100,8 +106,17 @@ def get_data(PMD):
                                     # print('readed firts node with {}/584 bytes ignored'.format(remaining))
                                     break
 
-
-
+            for ii, read in enumerate(PMD['read']):
+                if read:
+                    if ii in scal:
+                        inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                                                            inpt['nodes'][1], \
+                                                            inpt['nodes'][0]])
+                    elif ii in vec:
+                        inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                                                            inpt['nodes'][1], \
+                                                            inpt['nodes'][0], \
+                                                            3])
 
         return inpt
     except:
