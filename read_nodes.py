@@ -17,7 +17,7 @@ def get_data(PMD):
 
     # Initialize output
     inpt = {}
-    inpt['nodes'] = (PMD['head']['nodes0'][0], \
+    inpt['nodes'] = (PMD['head']['nodes0'][0],\
                     PMD['head']['nodes0'][1], \
                     PMD['head']['nodes0'][2])
 
@@ -62,10 +62,10 @@ def get_data(PMD):
                 if read:
                     if ii in scal:
                         inpt[ii] = np.empty([inpt['nodes'][2], \
-                                            inpt['nodes'][1], \
+                                            inpt['nodes'][1],  \
                                             inpt['nodes'][0]])
                     elif ii in vec:
-                        inpt[ii] = np.empty([inpt['nodes'][2], \
+                        inpt[ii] = np.empty([inpt['nodes'][2],\
                                             inpt['nodes'][1], \
                                             inpt['nodes'][0], \
                                             3])
