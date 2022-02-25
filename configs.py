@@ -94,5 +94,15 @@ CONF = {'wfont_size' : 12, \
 
 PMD = {'data' : None, \
         'head' : None, \
-        'delete' : 'delete' \
+        'delete' : 'delete', \
+        'vars' : { 0: 'caii_density', \
+                   1: 'e_density', \
+                   2: 'hi_density', \
+                   3: 'temp', \
+                   4: 'micro_velocity', \
+                   5: 'B', \
+                   6: 'V', \
+                   7: 'ContOpac[NLINES=5]', \
+                   8: 'dm[N_DM==20]', \
+                   9: 'jkq[NLINES]'}
         }

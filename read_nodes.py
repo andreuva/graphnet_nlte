@@ -27,49 +27,24 @@ def get_data(PMD):
 
     # Read it as a pmd file
     try:
-
         with open(PMD['head']['name'],'rb') as f:
 
-            f.seek(PMD['head']['msize'])
+            f.seek(PMD['head']['size'], 1)
+            f.seek(PMD['head']['msize'], 1)
 
             # Identify scalars and vectors
             scal = [0,1,2,3,4]
             vec = [5,6]
             tens = [7,8,9]
-            PMD['vars'] = { 0: 'caii_density', \
-                            1: 'e_density', \
-                            2: 'hi_density', \
-                            3: 'temp', \
-                            4: 'micro_velocity', \
-                            5: 'B', \
-                            6: 'V', \
-                            7: 'ContOpac[NLINES=5]', \
-                            8: 'dm[N_DM==20]', \
-                            9: 'jkq[NLINES]'}
-
 
             if 'read' not in PMD.keys():
                 PMD['read'] = [False]*len(PMD['vars'].keys())
 
+            PMD['read'][0] = True
+            PMD['read'][1] = True
+            PMD['read'][2] = True
             PMD['read'][3] = True
-            # PMD['read'][5] = True
-            # PMD['read'][6] = True
-            # Create space to read data
-
-
-            # Create space to read data
-            for ii,read in enumerate(PMD['read']):
-                if read:
-                    if ii in scal:
-                        inpt[ii] = np.empty([inpt['nodes'][2], \
-                                            inpt['nodes'][1],  \
-                                            inpt['nodes'][0]])
-                    elif ii in vec:
-                        inpt[ii] = np.empty([inpt['nodes'][2],\
-                                            inpt['nodes'][1], \
-                                            inpt['nodes'][0], \
-                                            3])
-
+            PMD['read'][4] = True
 
             T = {}
             for ii,read in enumerate(PMD['read']):
@@ -109,15 +84,23 @@ def get_data(PMD):
             for ii, read in enumerate(PMD['read']):
                 if read:
                     if ii in scal:
-                        inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
-                                                            inpt['nodes'][1], \
-                                                            inpt['nodes'][0]])
-                    elif ii in vec:
-                        inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
-                                                            inpt['nodes'][1], \
-                                                            inpt['nodes'][0], \
-                                                            3])
+                        # inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                        #                                     inpt['nodes'][1], \
+                        #                                     inpt['nodes'][0]])
 
+                        inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                                                                        inpt['nodes'][1], \
+                                                                        inpt['nodes'][0]])
+                    elif ii in vec:
+                        # inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                        #                                     inpt['nodes'][1], \
+                        #                                     inpt['nodes'][0], \
+                        #                                     3])
+                        
+                        inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                                                                        inpt['nodes'][1], \
+                                                                        inpt['nodes'][0], \
+                                                                        3])
         return inpt
     except:
         raise Exception('Error reading file')
