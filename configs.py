@@ -104,5 +104,12 @@ PMD = {'data' : None, \
                    6: 'V', \
                    7: 'ContOpac[NLINES=5]', \
                    8: 'dm[N_DM==20]', \
-                   9: 'jkq[NLINES]'}
+                   9: 'jkq[NLINES]'},\
+        # select the variables to read
+        #        caii_d, e_d,   hi_d,  temp, mic_v,   B,    V,     opac,  d_mat, jkq
+        'read' : [False, False, False, False, False, False, False, False, True, False],\
+        # Identify scalars and vectors
+        'scal' : [0, 1, 2, 3, 4],\
+        'vec' : [5, 6],\
+        'tens' : [7, 8, 9] \
         }

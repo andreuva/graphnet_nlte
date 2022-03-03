@@ -32,20 +32,6 @@ def get_data(PMD):
             f.seek(PMD['head']['size'], 1)
             f.seek(PMD['head']['msize'], 1)
 
-            # Identify scalars and vectors
-            scal = [0,1,2,3,4]
-            vec = [5,6]
-            tens = [7,8,9]
-
-            if 'read' not in PMD.keys():
-                PMD['read'] = [False]*len(PMD['vars'].keys())
-
-            PMD['read'][0] = True
-            PMD['read'][1] = True
-            PMD['read'][2] = True
-            PMD['read'][3] = True
-            PMD['read'][4] = True
-
             T = {}
             for ii,read in enumerate(PMD['read']):
                 if read:
@@ -59,23 +45,39 @@ def get_data(PMD):
                         # Read the variables
                         for ii,read in enumerate(PMD['read']):
                             if read:
-                                if ii in scal:
+                                if ii in PMD['scal']:
                                     bytes = f.read(4)
                                     nsize += 4
                                     T[ii].append(struct.unpack(PMD['head']['endian'] + 'f', bytes)[0])
-                                elif ii in vec:
+                                elif ii in PMD['vec']:
                                     for i in range(3):
                                         bytes = f.read(4)
                                         nsize += 4
-                                        T[ii].append(struct.unpack(PMD['head']['endian'] + 'f', bytes))
+                                        T[ii].append(struct.unpack(PMD['head']['endian'] + 'f', bytes)[0])
+                                elif PMD['vars'][ii] == 'ContOpac[NLINES=5]':
+                                    for i in range(5):
+                                        bytes = f.read(4)
+                                        nsize += 4
+                                        T[ii].append(struct.unpack(PMD['head']['endian'] + 'f', bytes)[0])
+                                elif PMD['vars'][ii] == 'dm[N_DM==20]':
+                                    for i in range(20):
+                                        bytes = f.read(8)
+                                        nsize += 8
+                                        T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
                             else:
-                                if ii in scal:
+                                if ii in PMD['scal']:
                                     f.seek(4, 1)
                                     nsize += 4
-                                elif ii in vec:
+                                elif ii in PMD['vec']:
                                     f.seek(4*3, 1)
                                     nsize += 4*3
-                                elif ii in tens:
+                                elif PMD['vars'][ii] == 'ContOpac[NLINES=5]':
+                                    f.seek(4*5, 1)
+                                    nsize += 4*5
+                                elif PMD['vars'][ii] == 'dm[N_DM==20]':
+                                    f.seek(8*20, 1)
+                                    nsize += 8*20
+                                else:
                                     remaining = PMD['head']['gsize'] - nsize
                                     f.seek(remaining, 1)
                                     # print('readed firts node with {}/584 bytes ignored'.format(remaining))
@@ -83,24 +85,25 @@ def get_data(PMD):
 
             for ii, read in enumerate(PMD['read']):
                 if read:
-                    if ii in scal:
-                        # inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
-                        #                                     inpt['nodes'][1], \
-                        #                                     inpt['nodes'][0]])
-
+                    if ii in PMD['scal']:
                         inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
                                                                         inpt['nodes'][1], \
                                                                         inpt['nodes'][0]])
-                    elif ii in vec:
-                        # inpt[ii] = np.array(T[ii]).reshape([inpt['nodes'][2], \
-                        #                                     inpt['nodes'][1], \
-                        #                                     inpt['nodes'][0], \
-                        #                                     3])
-                        
+                    elif ii in PMD['vec']:
                         inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
                                                                         inpt['nodes'][1], \
                                                                         inpt['nodes'][0], \
                                                                         3])
+                    elif PMD['vars'][ii] == 'ContOpac[NLINES=5]':
+                        inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                                                                        inpt['nodes'][1], \
+                                                                        inpt['nodes'][0], \
+                                                                        5])
+                    elif PMD['vars'][ii] == 'dm[N_DM==20]':
+                        inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
+                                                                        inpt['nodes'][1], \
+                                                                        inpt['nodes'][0], \
+                                                                        20])
         return inpt
     except:
         raise Exception('Error reading file')
