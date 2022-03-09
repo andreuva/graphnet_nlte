@@ -63,7 +63,18 @@ def get_data(PMD):
                                     for i in range(20):
                                         bytes = f.read(8)
                                         nsize += 8
-                                        T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
+                                        if i == 0:
+                                            T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
+                                        elif i == 1:
+                                            T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
+                                        elif i == 7:
+                                            T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
+                                        elif i == 13:
+                                            T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
+                                        elif i == 14:
+                                            T[ii].append(struct.unpack(PMD['head']['endian'] + 'd', bytes)[0])
+                                        else:
+                                            pass
                             else:
                                 if ii in PMD['scal']:
                                     f.seek(4, 1)
@@ -103,7 +114,7 @@ def get_data(PMD):
                         inpt[PMD['vars'][ii]] = np.array(T[ii]).reshape([inpt['nodes'][2], \
                                                                         inpt['nodes'][1], \
                                                                         inpt['nodes'][0], \
-                                                                        20])
+                                                                        5])
         return inpt
     except:
         raise Exception('Error reading file')
