@@ -57,6 +57,7 @@ if 'dm[N_DM==20]' in data['nodes'].keys():
 if 'V' in data['nodes'].keys():
     data['nodes']['vz'] = data['nodes']['V'][:,:,:,2]
     del data['nodes']['V']
+    data['nodes']['vturb'] = data['nodes']['vz']*0.0
 
 if 'T' in data['nodes'].keys() and 'n' in data['nodes'].keys():
     # Energy diference between the level and the base level of the ion
