@@ -46,33 +46,29 @@ for var, read in enumerate(PMD['read']):
         plt.show()
         plt.close()
 
-'''
+
+
 # Compute the populations from the density matrix variables
-cont = 1 - np.sum(data['nodes']['dm[N_DM==20]'], axis=-1, keepdims=True)
-data['nodes']['n'] = np.append(data['nodes']['dm[N_DM==20]'], cont, axis=-1)
-del data['nodes']['dm[N_DM==20]']
+if 'dm[N_DM==20]' in data['nodes'].keys():
+    cont = 1 - np.sum(data['nodes']['dm[N_DM==20]'], axis=-1, keepdims=True)
+    data['nodes']['n'] = np.append(data['nodes']['dm[N_DM==20]'], cont, axis=-1)
+    del data['nodes']['dm[N_DM==20]']
 
-data['nodes']['n_lte'] = np.empty_like(data['nodes']['n'])
-for iz in range(data['head']['nodes0'][2]):
-    for iy in range(data['head']['nodes0'][1]):
-        for ix in range(data['head']['nodes0'][0]):
-            temp = data['nodes']['temp'][iz,iy,ix]
-            # Compute the populations for LTE
-            data['nodes']['n_lte'][iz,iy,ix,:] = np.exp(-data['nodes']['n'][iz,iy,ix,:]*temp)
+if 'V' in data['nodes'].keys():
+    data['nodes']['vz'] = data['nodes']['V'][:,:,:,2]
+    del data['nodes']['V']
 
-import lightweaver as lw
+if 'T' in data['nodes'].keys() and 'n' in data['nodes'].keys():
+    # Energy diference between the level and the base level of the ion
+    chi_ijk = [1, 2, 3, 4, 5]
+    # Ionization potential of the ion
+    chi_jk = [0, 1]
 
-xlowbc = lw.atmosphere.BoundaryCondition()
-xuppbc = lw.atmosphere.BoundaryCondition()
-ylowbc = lw.atmosphere.BoundaryCondition()
-yuppbc = lw.atmosphere.BoundaryCondition()
-zlowbc = lw.atmosphere.BoundaryCondition()
-zuppbc = lw.atmosphere.BoundaryCondition()
-
-lay = lw.atmosphere.Layout(3, data['head']['nodes0'][0], data['head']['nodes0'][1], data['head']['nodes0'][2],
-                         data['nodes']['V'][0], data['nodes']['V'][1], data['nodes']['V'][2],
-                         xlowbc, xuppbc, ylowbc, yuppbc, zlowbc, zuppbc)
-
-atmos = lw.atmosphere.Atmosphere(lay, data['nodes']['temp'], data['nodes']['temp']*0 , data['nodes']['e_density'], data['nodes']['hi_density'])
-'''
-
+    # initialization of the variable that will store the populations
+    data['nodes']['n_lte'] = np.empty_like(data['nodes']['n'])
+    for iz in range(data['head']['nodes0'][2]):
+        for iy in range(data['head']['nodes0'][1]):
+            for ix in range(data['head']['nodes0'][0]):
+                temp = data['nodes']['temp'][iz,iy,ix]
+                # Compute the populations for LTE
+                data['nodes']['n_lte'][iz,iy,ix,:] = np.exp(-data['nodes']['n'][iz,iy,ix,:]*temp)
