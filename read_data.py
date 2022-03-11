@@ -2,7 +2,9 @@ from read_header import read_generic_header
 from read_nodes import get_data
 from configs import PMD
 import numpy as np
-import lte
+from sklearn import neighbors
+import torch
+from tqdm import tqdm
 import copy
 import matplotlib.pyplot as plt
 
@@ -59,7 +61,7 @@ if 'V' in data['nodes'].keys():
     del data['nodes']['V']
     data['nodes']['vturb'] = data['nodes']['vz']*0.0
 
-if 'T' in data['nodes'].keys() and 'n' in data['nodes'].keys():
+if 'temp' in data['nodes'].keys() and 'n' in data['nodes'].keys():
     # Energy diference between the level and the base level of the ion
     chi_ijk = [1, 2, 3, 4, 5]
     # Ionization potential of the ion
@@ -73,3 +75,7 @@ if 'T' in data['nodes'].keys() and 'n' in data['nodes'].keys():
                 temp = data['nodes']['temp'][iz,iy,ix]
                 # Compute the populations for LTE
                 data['nodes']['n_lte'][iz,iy,ix,:] = np.exp(-data['nodes']['n'][iz,iy,ix,:]*temp)
+
+###############################################################################################
+# BUILD THE GRAPH TO TEST THE 3D
+###############################################################################################
