@@ -1,159 +1,158 @@
+# DATASET CLASS DEFINITION
+
 import torch
-import pickle
-from tqdm import tqdm
-import os
 import numpy as np
-from sklearn import neighbors
-import torch_geometric.data
+from torch_geometric.data import Data
+import torch_geometric
+from torch_geometric.transforms import RadiusGraph
 
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, hyperparameters, datadir='../data/', prefix='train'):
+
+    def __init__(self, list_X: list, list_Y: list, radius_neibourghs=1.5, device='cpu'):
         """
         Dataset for the depth stratification
         """
         super(Dataset, self).__init__()
 
-        # Read the training database
-        with open(datadir + prefix + '_tau.pkl', 'rb') as filehandle:
-            self.tau_all = pickle.load(filehandle)
+        np.random.seed(777)
+        self.device = device
 
-        with open(datadir + prefix + '_vturb.pkl', 'rb') as filehandle:
-            self.vturb_all = pickle.load(filehandle)
+        # check that all the cubes in the list have the same (nx, ny, nz, *) dimensions
+        if len(list_X) < 1:
+            raise ValueError("You should provide some datacube")
+        
+        self.shape_cube = np.shape(list_X[0])[:-1]
+        self.nz, self.ny, self.nx = self.shape_cube
 
-        with open(datadir + prefix + '_vlos.pkl', 'rb') as filehandle:
-            self.vlos_all = pickle.load(filehandle)
+        values = []
+        print("  Joining the cubes into a data structure")
+        for ind_cube, cube in enumerate(list_X):
+            if np.shape(cube)[:-1] != self.shape_cube:
+                raise ValueError(f"Dimensions of cube {ind_cube} do not match")
 
-        with open(datadir + prefix + '_T.pkl', 'rb') as filehandle:
-            self.T_all = pickle.load(filehandle)
+            values.append(cube.reshape(self.nz*self.ny*self.nx, -1))
+        
+        targets = []
+        for ind_cube, cube in enumerate(list_Y):
+            if np.shape(cube)[:-1] != self.shape_cube:
+                raise ValueError(f"Dimensions of target cube {ind_cube} do not match")
 
-        with open(datadir + prefix + '_logdeparture.pkl', 'rb') as filehandle:
-            self.dep_all = pickle.load(filehandle)
+            targets.append(cube.reshape(self.nz*self.ny*self.nx, -1))
 
-        self.n_Nat_activated = False
-        if os.path.isfile(datadir + prefix + '_n_Nat.pkl'):
-            self.n_Nat_activated = True
-            with open(datadir + prefix + '_n_Nat.pkl', 'rb') as filehandle:
-                self.n_Nat = pickle.load(filehandle)
+        self.values_graph = torch.tensor(np.hstack(values))
+        self.targets_graph = torch.tensor(np.hstack(targets))
 
-        self.ne_activated = False
-        if os.path.isfile(datadir + prefix + '_ne.pkl'):
-            self.ne_activated = True
-            with open(datadir + prefix + '_ne.pkl', 'rb') as filehandle:
-                self.ne = pickle.load(filehandle)
+        print("  Creating the grid to calculate the conections of the graph")
+        self.xx = np.linspace(0, self.nx - 1, self.nx)
+        self.yy = np.linspace(0, self.ny - 1, self.ny)
+        self.zz = np.linspace(0, self.nz - 1, self.nz)
+        zv, yv, xv = np.meshgrid(self.zz, self.yy, self.xx, indexing='ij')
+        self.grid = np.stack([zv.ravel(), yv.ravel(), xv.ravel()], axis=1)
+        self.grid = torch.tensor(self.grid, dtype=torch.float)
 
-        self.cmass_activated = False
-        if os.path.isfile(datadir + prefix + '_cmass.pkl'):
-            self.cmass_activated = True
-            with open(datadir + prefix + '_cmass.pkl', 'rb') as filehandle:
-                self.cmass_all = pickle.load(filehandle)
+        self.u = torch.zeros((1,1), dtype=torch.float)
 
-        # Now we need to define the graphs for each one of the computed models
-        # The graph will connect all points at certain distance. We define this distance
-        # as integer indices, so that we make sure that nodes are connected to the neighbors
-        self.n_training = len(self.T_all)
+        print("  Calculating all the connections of the graph")
+        self.constructor_graph_radius = RadiusGraph(r=radius_neibourghs, num_workers=12)
+        print("...")
+        self.graph = self.constructor_graph_radius(torch_geometric.data.Data(x=self.values_graph,
+                                                        pos=self.grid,
+                                                        y=self.targets_graph))
 
-        # Initialize the graph information
-        self.edge_index = [None] * self.n_training
-        self.nodes = [None] * self.n_training
-        self.edges = [None] * self.n_training
-        self.u = [None] * self.n_training
-        self.target = [None] * self.n_training
+    def create_sample_indices(self, xpos, ypos, xdim=1, ydim=1):
+        # Calculate the valid x and y ranges for the subgrid
+        x_start = max(0, xpos - xdim)
+        x_end = min(self.nx, xpos + xdim + 1)
+        y_start = max(0, ypos - ydim)
+        y_end = min(self.ny, ypos + ydim + 1)
 
-        # Loop over all training examples
-        for i in tqdm(range(self.n_training)):
+        subgrid_indices = [
+            k * self.ny * self.nx + j * self.nx + i
+            for k in range(self.nz)
+            for j in range(y_start, y_end)
+            for i in range(x_start, x_end)
+        ]
 
-            num_nodes = len(self.tau_all[i])
-            index_tau = np.zeros((num_nodes, 1))
-
-            index_tau[:, 0] = np.arange(num_nodes)
-
-            # Build the KDTree
-            self.tree = neighbors.KDTree(index_tau)
-
-            # Get neighbors
-            receivers_list = self.tree.query_radius(index_tau, r=1)
-
-            senders = np.repeat(range(num_nodes), [len(a) for a in receivers_list])
-            receivers = np.concatenate(receivers_list, axis=0)
-
-            # Mask self edges
-            mask = senders != receivers
-
-            # Transform senders and receivers to tensors
-            senders = torch.tensor(senders[mask].astype('long'))
-            receivers = torch.tensor(receivers[mask].astype('long'))
-
-            # Define the graph for this model by using the sender/receiver information
-            self.edge_index[i] = torch.cat([senders[None, :], receivers[None, :]], dim=0)
-
-            n_edges = self.edge_index[i].shape[1]
-
-            # Now define the nodes. For the moment we use only one quantity, the log10(T)
-            node_input_size = hyperparameters['node_input_size']
-            self.nodes[i] = np.zeros((num_nodes, node_input_size))
-            self.nodes[i][:, 0] = np.log10(self.T_all[i])
-            if node_input_size > 1:
-                self.nodes[i][:, 1] = np.log10(self.tau_all[i])
-            if node_input_size > 2 and self.ne_activated:
-                self.nodes[i][:, 2] = np.log10(self.ne[i])
-            if node_input_size > 3:
-                self.nodes[i][:, 3] = self.vturb_all[i]/1e3
-            if node_input_size > 4:
-                self.nodes[i][:, 4] = self.vlos_all[i]/1e3
-
-            # We use two quantities for the information encoded on the edges: log(column mass) and log(tau)
-            edge_input_size = hyperparameters['edge_input_size']
-            self.edges[i] = np.zeros((n_edges, edge_input_size))
-
-            if edge_input_size == 2:
-                cmass_0 = np.log10(self.cmass_all[i][self.edge_index[i][0, :]])
-                cmass_1 = np.log10(self.cmass_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 0] = (cmass_0 - cmass_1)
-
-                tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
-                tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 1] = (tau0 - tau1)
-            elif edge_input_size == 1:
-                tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
-                tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 0] = (tau0 - tau1)
-            else:
-                raise ValueError("Incompatible edge input size")
-
-            # We don't use at the moment any global property of the graph, so we set it to zero.
-            self.u[i] = np.zeros((1, 1))
-            # self.u[i][0, :] = np.array([np.log10(self.eps_all[i][0, 0]), np.log10(self.ratio_all[i][0, 0])], dtype=np.float32)
-
-            # We use the log10(departure coeff) as output, divided by 5 to make it closer to 1. In case a NaN is found, we
-            # make them equal to zero
-            self.target[i] = np.nan_to_num(self.dep_all[i][:, :].T / 5.0)
-
-            # Finally, all information is transformed to float32 tensors
-            self.nodes[i] = torch.tensor(self.nodes[i].astype('float32'))
-            self.edges[i] = torch.tensor(self.edges[i].astype('float32'))
-            self.u[i] = torch.tensor(self.u[i].astype('float32'))
-            self.target[i] = torch.tensor(self.target[i].astype('float32'))
-
-    def __getitem__(self, index):
-
-        # When we are asked to return the information of a graph, we encode
-        # it in a Data class. Batches in graphs work slightly different than
-        # in more classical situations. Since we have the connectivity of each
-        # graph, batches are built by generating a big graph containing all
-        # graphs of the batch.
-        node = self.nodes[index]
-        edge_attr = self.edges[index]
-        target = self.target[index]
-        u = self.u[index]
-        edge_index = self.edge_index[index]
-
-        data = torch_geometric.data.Data(x=node, edge_index=edge_index, edge_attr=edge_attr, y=target, u=u)
-
-        return data
+        return np.array(subgrid_indices)
 
     def __len__(self):
-        return self.n_training
+        return self.nx*self.ny
 
-    def __call__(self, index):
-        return self.cmass_all[index], self.tau_all[index], self.vturb_all[index], self.vlos_all[index], self.T_all[index], self.u[index], self.dep_all[index]
+    def __call__(self):
+        ix = np.random.randint(1, self.nx + 1)
+        iy = np.random.randint(1, self.ny + 1)
+        subgraph = self.graph.subgraph(torch.tensor(self.create_sample_indices(ix, iy)))
+        subgraph.u = self.u
+        return subgraph
+
+    def __getitem__(self, index):
+        np.random.seed(index)
+        ix = np.random.randint(1, self.nx + 1)
+        iy = np.random.randint(1, self.ny + 1)
+        subgraph = self.graph.subgraph(torch.tensor(self.create_sample_indices(ix, iy)))
+        subgraph.u = self.u
+        return subgraph
+
+
+class EfficientDataset(torch.utils.data.Dataset):
+    def __init__(self, list_X: list, list_Y: list, radius_neighbors=1.5, device='cpu', xdim=1, ydim=1):
+        super(EfficientDataset, self).__init__()
+        self.device = device
+        self.radius = radius_neighbors
+        self.xdim = xdim
+        self.ydim = ydim
+
+        # Store data as numpy arrays to keep them on CPU until needed
+        self.features = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_X], axis=1)
+        self.targets = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_Y], axis=1)
+
+        self.nz, self.ny, self.nx = list_X[0].shape[:-1]
+        
+        # This transform will be applied to each sample in __getitem__
+        self.radius_transform = RadiusGraph(r=self.radius)
+
+    def __len__(self):
+        # The number of samples is the number of columns you can extract
+        return self.nx * self.ny
+
+    def __getitem__(self, index):
+        # Determine the x, y position for this sample
+        iy = index // self.nx
+        ix = index % self.nx
+
+        # 1. Get indices for the nodes in the sub-grid (a single column)
+        subgrid_indices = []
+        for k in range(self.nz):
+            for j in range(max(0, iy - self.ydim), min(self.ny, iy + self.ydim + 1)):
+                for i in range(max(0, ix - self.xdim), min(self.nx, ix + self.xdim + 1)):
+                    flat_index = k * self.ny * self.nx + j * self.nx + i
+                    subgrid_indices.append(flat_index)
+        
+        # 2. Get the features and positions for ONLY this sub-grid
+        node_features = torch.tensor(self.features[subgrid_indices], dtype=torch.float)
+        node_targets = torch.tensor(self.targets[subgrid_indices], dtype=torch.float)
+        
+        # Create positions (pos) for the nodes in the sub-grid
+        # This is crucial for RadiusGraph to work
+        k_coords = torch.arange(self.nz).repeat_interleave((2*self.ydim+1)*(2*self.xdim+1))
+        j_coords = torch.arange(iy - self.ydim, iy + self.ydim + 1).repeat(self.nz * (2*self.xdim+1))
+        i_coords = torch.arange(ix - self.xdim, ix + self.xdim + 1).repeat_interleave(self.nz * (2*self.ydim+1))
+        node_pos = torch.stack([k_coords, j_coords, i_coords], axis=1).float()
+
+
+        # 3. Create a Data object for this small sample
+        data = Data(x=node_features, pos=node_pos, y=node_targets)
+
+        # 4. Generate edges for this small graph ONLY
+        graph_data = self.radius_transform(data)
+        # Add proper edge attributes if they don't exist
+        if graph_data.edge_attr is None:
+            # Create edge attributes with proper shape [num_edges, edge_feature_dim]
+            # Using 1 as the edge feature dimension to match your model's expectations
+            graph_data.edge_attr = torch.ones((graph_data.num_edges, 1), dtype=torch.float)
+        
+        # Add a placeholder for global attribute 'u' if your model needs it
+        graph_data.u = torch.zeros((1,1), dtype=torch.float)
+
+        return graph_data
