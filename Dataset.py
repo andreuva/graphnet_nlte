@@ -110,48 +110,57 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.nz, self.ny, self.nx = list_X[0].shape[:-1]
         
         # This transform will be applied to each sample in __getitem__
-        self.radius_transform = RadiusGraph(r=self.radius)
+        self.radius_transform = RadiusGraph(r=self.radius, loop=False)
+
+        print(f'Dataset created. Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
 
     def __len__(self):
         # The number of samples is the number of columns you can extract
-        return self.nx * self.ny
+        # return (self.nx-1)*(self.ny-1)
+        return 1000
 
     def __getitem__(self, index):
         # Determine the x, y position for this sample
-        iy = index // self.nx
-        ix = index % self.nx
+        ix, iy = np.random.randint(0, self.nx), np.random.randint(0, self.ny)
 
-        # 1. Get indices for the nodes in the sub-grid (a single column)
-        subgrid_indices = []
-        for k in range(self.nz):
-            for j in range(max(0, iy - self.ydim), min(self.ny, iy + self.ydim + 1)):
-                for i in range(max(0, ix - self.xdim), min(self.nx, ix + self.xdim + 1)):
-                    flat_index = k * self.ny * self.nx + j * self.nx + i
-                    subgrid_indices.append(flat_index)
-        
-        # 2. Get the features and positions for ONLY this sub-grid
-        node_features = torch.tensor(self.features[subgrid_indices], dtype=torch.float)
-        node_targets = torch.tensor(self.targets[subgrid_indices], dtype=torch.float)
-        
-        # Create positions (pos) for the nodes in the sub-grid
-        # This is crucial for RadiusGraph to work
-        k_coords = torch.arange(self.nz).repeat_interleave((2*self.ydim+1)*(2*self.xdim+1))
-        j_coords = torch.arange(iy - self.ydim, iy + self.ydim + 1).repeat(self.nz * (2*self.xdim+1))
-        i_coords = torch.arange(ix - self.xdim, ix + self.xdim + 1).repeat_interleave(self.nz * (2*self.ydim+1))
-        node_pos = torch.stack([k_coords, j_coords, i_coords], axis=1).float()
+        # 1. Get indices and positions for the nodes in the sub-grid, handling boundaries correctly.
+        y_range = np.arange(max(1, iy - self.ydim), min(self.ny, iy + self.ydim + 1))
+        x_range = np.arange(max(1, ix - self.xdim), min(self.nx, ix + self.xdim + 1))
+        k_range = np.arange(self.nz)
 
+        # Create a grid of coordinates for the sub-volume
+        kv, yv, xv = np.meshgrid(k_range, y_range, x_range, indexing='ij')
+        
+        # Flatten and stack to get node positions
+        node_pos = torch.tensor(np.stack([kv.ravel(), yv.ravel(), xv.ravel()], axis=1), dtype=torch.float)
+
+        # Calculate flat indices from the coordinate grid to slice the original numpy arrays
+        flat_indices = (kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel())
+        
+        # 2. Get the features and targets for ONLY this sub-grid
+        node_features = torch.tensor(self.features[flat_indices], dtype=torch.float)
+        node_targets = torch.tensor(self.targets[flat_indices], dtype=torch.float)
 
         # 3. Create a Data object for this small sample
+        # By construction, node_features and node_pos will have the same number of nodes
         data = Data(x=node_features, pos=node_pos, y=node_targets)
 
         # 4. Generate edges for this small graph ONLY
         graph_data = self.radius_transform(data)
+
         # Add proper edge attributes if they don't exist
         if graph_data.edge_attr is None:
             # Create edge attributes with proper shape [num_edges, edge_feature_dim]
             # Using 1 as the edge feature dimension to match your model's expectations
             graph_data.edge_attr = torch.ones((graph_data.num_edges, 1), dtype=torch.float)
-        
+
+            # Compute edge attributes (distances between connected nodes)
+            row, col = graph_data.edge_index
+            edge_vectors = graph_data.pos[row] - graph_data.pos[col]
+            edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)  # Shape [num_edges, 1]
+
+            graph_data.edge_attr = edge_attr
+            
         # Add a placeholder for global attribute 'u' if your model needs it
         graph_data.u = torch.zeros((1,1), dtype=torch.float)
 

@@ -5,4 +5,4 @@ latent_size = 64
 mlp_hidden_size = 64
 mlp_n_hidden_layers = 2
 n_message_passing_steps = 100
-output_size = 5
+output_size = 6
