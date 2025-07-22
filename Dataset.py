@@ -96,7 +96,7 @@ class Dataset(torch.utils.data.Dataset):
 
 
 class EfficientDataset(torch.utils.data.Dataset):
-    def __init__(self, list_X: list, list_Y: list, radius_neighbors=1.5, device='cpu', xdim=1, ydim=1):
+    def __init__(self, list_X: list, list_Y: list, radius_neighbors=1.5, xdim=1, ydim=1, seed=777, train_ratio=0.9, split='train', device='cpu'):
         super(EfficientDataset, self).__init__()
         self.device = device
         self.radius = radius_neighbors
@@ -112,20 +112,33 @@ class EfficientDataset(torch.utils.data.Dataset):
         # This transform will be applied to each sample in __getitem__
         self.radius_transform = RadiusGraph(r=self.radius, loop=False)
 
-        print(f'Dataset created. Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
+        valid_ix = np.arange(xdim, self.nx - xdim)
+        valid_iy = np.arange(ydim, self.ny - ydim)
+        all_indices = [(x, y) for x in valid_ix for y in valid_iy]
+
+        # Shuffle and split
+        np.random.seed(seed)
+        np.random.shuffle(all_indices)
+
+        split_idx = int(train_ratio * len(all_indices))
+        if split == 'train':
+            self.sample_centers = all_indices[:split_idx]
+        elif split == 'test':
+            self.sample_centers = all_indices[split_idx:]
+        else:
+            raise ValueError("split must be 'train' or 'test'")
+
+        print(f'{split.capitalize()} dataset created. Total samples: {len(self.sample_centers)}')
+        print(f'Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
 
     def __len__(self):
-        # The number of samples is the number of columns you can extract
-        # return (self.nx-1)*(self.ny-1)
-        return 1000
+        return len(self.sample_centers)//10
 
     def __getitem__(self, index):
-        # Determine the x, y position for this sample
-        ix, iy = np.random.randint(0, self.nx), np.random.randint(0, self.ny)
+        ix, iy = self.sample_centers[index]
 
-        # 1. Get indices and positions for the nodes in the sub-grid, handling boundaries correctly.
-        y_range = np.arange(max(1, iy - self.ydim), min(self.ny, iy + self.ydim + 1))
-        x_range = np.arange(max(1, ix - self.xdim), min(self.nx, ix + self.xdim + 1))
+        y_range = np.arange(iy - self.ydim, iy + self.ydim + 1)
+        x_range = np.arange(ix - self.xdim, ix + self.xdim + 1)
         k_range = np.arange(self.nz)
 
         # Create a grid of coordinates for the sub-volume
@@ -150,18 +163,10 @@ class EfficientDataset(torch.utils.data.Dataset):
 
         # Add proper edge attributes if they don't exist
         if graph_data.edge_attr is None:
-            # Create edge attributes with proper shape [num_edges, edge_feature_dim]
-            # Using 1 as the edge feature dimension to match your model's expectations
-            graph_data.edge_attr = torch.ones((graph_data.num_edges, 1), dtype=torch.float)
-
-            # Compute edge attributes (distances between connected nodes)
             row, col = graph_data.edge_index
             edge_vectors = graph_data.pos[row] - graph_data.pos[col]
-            edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)  # Shape [num_edges, 1]
+            graph_data.edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
 
-            graph_data.edge_attr = edge_attr
-            
-        # Add a placeholder for global attribute 'u' if your model needs it
-        graph_data.u = torch.zeros((1,1), dtype=torch.float)
-
+        # Add a place holder for the global attributes 'u' because the model needs it
+        graph_data.u = torch.zeros((1, 1), dtype=torch.float)
         return graph_data
