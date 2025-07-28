@@ -111,7 +111,7 @@ from scipy.interpolate import interpn
 # Define a new, higher-resolution grid
 z, y, x = (np.arange(d) for d in (nz, ny, nx))
 
-new_nz, new_ny, new_nx = 128, nx, ny
+new_nz, new_ny, new_nx = 50, nx, ny
 new_z, new_y, new_x = (np.linspace(0, d-1, new_d) for d, new_d in zip((nz,ny,nx), (new_nz,new_ny,new_nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
@@ -166,11 +166,18 @@ model = EncodeProcessDecode(**hyperparameters).to(device)
 print('N. total trainable parameters : {0}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
 # %%
-datast_train = EfficientDataset([vel/vel.mean(), b_xyz/b_xyz.mean(), temp/temp.mean(), np.log10(n_h/n_h.mean()), np.log10(n_e/n_e.mean()), np.log10(n_p/n_p.mean())],
-                                [pops/pops.sum(axis=-1, keepdims=True)],
+
+# Normalize features and targets as done during training
+features_list = [(vel - vel.mean())/vel.std(),
+                 np.sign((b_xyz-b_xyz.mean())/b_xyz.std())*abs((b_xyz-b_xyz.mean())/b_xyz.std())**(1/4), 
+                 np.log10(temp/temp.mean()),
+                 np.log10(1/(n_h/n_h.mean()))/10, np.log10(1/(n_e/n_e.mean()))/10, np.log10(1/(n_p/n_p.mean()))/10]
+features_labels = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'nh', 'ne', 'np']
+targets_list = [np.log10(1/(pops/pops.sum(axis=-1, keepdims=True)))**(1/4)]
+
+datast_train = EfficientDataset(features_list, targets_list,
                                 radius_neighbors=1.77)
-datast_test = EfficientDataset([vel/vel.mean(), b_xyz/b_xyz.mean(), temp/temp.mean(), np.log10(n_h/n_h.mean()), np.log10(n_e/n_e.mean()), np.log10(n_p/n_p.mean())],
-                                [pops/pops.sum(axis=-1, keepdims=True)],
+datast_test = EfficientDataset(features_list, targets_list,
                                 radius_neighbors=1.77, split='test')
 # Get a single sample graph
 sample_graph = datast_train[0].to(device)
@@ -204,12 +211,12 @@ total_size = param_size + buffer_size
 print(f"Model size: {total_size / 1024 ** 2:.2f} MB")
 
 # %%
-loader_train = DataLoader( datast_train, batch_size=10, shuffle=True)
-loader_test = DataLoader( datast_test, batch_size=10, shuffle=True)
+loader_train = DataLoader( datast_train, batch_size=16, shuffle=True)
+loader_test = DataLoader( datast_test, batch_size=16, shuffle=True)
 
 # %%
 lr = 1e-3
-n_epochs = 50
+n_epochs = 150
 savedir = 'checkpoints/'
 smooth = 0.05
 
@@ -217,7 +224,9 @@ smooth = 0.05
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 # Cosine annealing learning rate scheduler. This will reduce the learning rate with a cosing law
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True, threshold=1e-3)
+scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 30, 45, 60, 100, 125, 145], gamma=0.4)
 
 # Loss function
 loss_fn = nn.MSELoss()
@@ -243,6 +252,7 @@ for epoch in range(1, n_epochs + 1):
     # Put the model in training mode
     model.train()
     print("\n"+"#"*80)
+    # print(f"Epoch {epoch}/{n_epochs}\nt = {filename}")
     print(f"Epoch {epoch}/{n_epochs}\nt = {filename}\nLR = {scheduler.get_last_lr()}")
     # t = tqdm(loader_train)
     loss_avg = 0.0
@@ -270,9 +280,6 @@ for epoch in range(1, n_epochs + 1):
 
         # Update the parameters
         optimizer.step()
-
-        for param_group in optimizer.param_groups:
-            current_lr = param_group['lr']
 
         # Compute smoothed loss
         if (batch_idx == 0):
@@ -350,4 +357,11 @@ plt.legend()
 plt.savefig(savedir + 'loss.pdf')
 plt.close()
 
+# %%
 
+# plt.figure(0, (10,15), dpi=100)
+# plt.plot(lr, label='Learning rate')
+# plt.xlabel('Itteration')
+# plt.legend()
+# plt.savefig(savedir + 'lr.pdf')
+# plt.close()
