@@ -96,7 +96,7 @@ class Dataset(torch.utils.data.Dataset):
 
 
 class EfficientDataset(torch.utils.data.Dataset):
-    def __init__(self, list_X: list, list_Y: list, radius_neighbors=1.5, xdim=1, ydim=1, seed=777, train_ratio=0.9, split='train', device='cpu'):
+    def __init__(self, list_X: list, list_Y: list, radius_neighbors=1.5, xdim=1, ydim=1, pos_file=None, seed=777, train_ratio=0.9, split='train', device='cpu'):
         super(EfficientDataset, self).__init__()
         self.device = device
         self.radius = radius_neighbors
@@ -108,6 +108,15 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.targets = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_Y], axis=1)
 
         self.nz, self.ny, self.nx = list_X[0].shape[:-1]
+
+        if pos_file is None:
+            self.xx, self.yy, self.zz = np.linspace(0, self.nx - 1, self.nx), np.linspace(0, self.ny - 1, self.ny), np.linspace(0, self.nz - 1, self.nz)
+        else:
+            grid_pos = np.load(pos_file)
+            self.xx, self.yy, self.zz = grid_pos['x']*10, grid_pos['y']*10, grid_pos['z']*10
+            self.zz = np.interp(np.linspace(0, len(self.zz), self.nz), np.arange(len(self.zz)), self.zz)
+        xgrid, ygrid, zgrid = np.meshgrid(self.zz, self.yy, self.xx, indexing='ij')
+        self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float)
         
         # This transform will be applied to each sample in __getitem__
         self.radius_transform = RadiusGraph(r=self.radius, loop=False)
@@ -164,7 +173,8 @@ class EfficientDataset(torch.utils.data.Dataset):
         # Add proper edge attributes if they don't exist
         if graph_data.edge_attr is None:
             row, col = graph_data.edge_index
-            edge_vectors = graph_data.pos[row] - graph_data.pos[col]
+            # edge_vectors = graph_data.pos[row] - graph_data.pos[col]
+            edge_vectors = self.grid_pos[row] - self.grid_pos[col]
             graph_data.edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
 
         # Add a place holder for the global attributes 'u' because the model needs it
