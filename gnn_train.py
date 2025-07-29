@@ -14,7 +14,7 @@ from scipy.interpolate import interpn
 import os
 
 # %%
-gpu = 2
+gpu = 1
 
 # Check if CUDA is available
 cuda_available = torch.cuda.is_available()
@@ -29,7 +29,7 @@ print(f"Using device: {device}")
 lr = 1e-3
 batch_size = 16
 n_epochs = 300
-savedir = 'checkpoints/cos_annealing_300/'
+savedir = 'checkpoints/multistep_300/'
 smooth = 0.1
 
 time_format = "%Y.%m.%d-%H:%M:%S"
@@ -189,9 +189,9 @@ if os.path.exists(savedir) == False:
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
 # Cosine annealing learning rate scheduler. This will reduce the learning rate with a cosing law
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
-# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True, threshold=1e-3)
-# scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 30, 45, 60, 100, 125, 145, 175, 200], gamma=0.5)
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True)
+scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[ 30, 60, 100, 150, 200, 250, 275], gamma=0.5)
 
 # %%
 loader_train = DataLoader( datast_train, batch_size=batch_size, shuffle=True)
