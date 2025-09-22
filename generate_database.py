@@ -43,7 +43,7 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
     # Set H and Ca to "active" i.e. NLTE, everything else participates as an
     # LTE background.
     # aSet.set_active('H', 'Ca')
-    aSet.set_active('Ca')
+    aSet.set_active('H', 'Ca', 'Mg', 'Na', 'Fe')
 
     # Compute the necessary wavelength dependent information (SpectrumConfiguration).
     spect = aSet.compute_wavelength_grid()
