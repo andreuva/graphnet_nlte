@@ -18,7 +18,7 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
     # Set H and Ca to "active" i.e. NLTE, everything else participates as an
     # LTE background.
     # aSet.set_active('H', 'Ca')
-    aSet.set_active('Ca')
+    aSet.set_active('H', 'Ca', 'Si')
 
     # Compute the necessary wavelength dependent information (SpectrumConfiguration).
     spect = aSet.compute_wavelength_grid()
@@ -34,39 +34,39 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
         ctx.depthData.fill = True
 
     # Iterate the Context to convergence
-    iterate_ctx_crd(ctx, prd=prd)
+    lw.iterate_ctx_se(ctx, prd=prd, quiet=True)
 
     # Update the background populations based on the converged solution and
     eqPops.update_lte_atoms_Hmin_pops(atmos, quiet=True)
     # compute the final solution for mu=1 on the provided wavelength grid.
-    ctx.formal_sol_gamma_matrices(printUpdate=False)
+    ctx.formal_sol_gamma_matrices()
     if prd:
-        ctx.prd_redistribute(printUpdate=False)
+        ctx.prd_redistribute()
     return ctx
 
-
+""" 
 def iterate_ctx_crd(ctx, prd=False, Nscatter=10, NmaxIter=500):
     '''
     Iterate a Context to convergence.
     '''
     for i in range(NmaxIter):
         # Compute the formal solution
-        dJ = ctx.formal_sol_gamma_matrices(printUpdate=False)
+        dJ = ctx.formal_sol_gamma_matrices()
         if prd:
-            ctx.prd_redistribute(printUpdate=False)
+            ctx.prd_redistribute()
         # Just update J for Nscatter iterations
         if i < Nscatter:
             continue
         # Update the active populations under statistical equilibrium,
         # conserving charge if this option was set on the Context.
-        delta = ctx.stat_equil(printUpdate=False)
+        delta = ctx.stat_equil()
 
         # If we are converged in both relative change of J and populations return
         if dJ < 3e-3 and delta < 1e-3:
             return
+ """
 
-
-bifrost = io.readsav('../data/models_atmos/snap385_rh.save')
+bifrost = io.readsav('../../data/models_atmos/snap385_rh.save')
 bifrost['tg'] = np.reshape(bifrost['tg'], (bifrost['tg'].shape[0], -1))
 bifrost['vlos'] = np.reshape(bifrost['vlos'], (bifrost['vlos'].shape[0], -1))
 bifrost['nel'] = np.reshape(bifrost['nel'], (bifrost['nel'].shape[0], -1))

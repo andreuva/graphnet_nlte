@@ -9,6 +9,7 @@ from glob import glob
 import os
 import pickle
 import time
+import sys
 from mpi4py import MPI
 import argparse
 from enum import IntEnum
@@ -43,7 +44,7 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
     # Set H and Ca to "active" i.e. NLTE, everything else participates as an
     # LTE background.
     # aSet.set_active('H', 'Ca')
-    aSet.set_active('H', 'Ca', 'Mg', 'Na', 'Fe')
+    aSet.set_active('H', 'Ca', 'Si')
 
     # Compute the necessary wavelength dependent information (SpectrumConfiguration).
     spect = aSet.compute_wavelength_grid()
@@ -59,7 +60,7 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
         ctx.depthData.fill = True
 
     # Iterate the Context to convergence
-    iterate_ctx_crd(ctx, prd=prd)
+    lw.iterate_ctx_se(ctx, prd=prd, quiet=True)
 
     # Update the background populations based on the converged solution and
     eqPops.update_lte_atoms_Hmin_pops(atmos, quiet=True)
@@ -69,7 +70,7 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
         ctx.prd_redistribute()
     return ctx
 
-
+""" 
 def iterate_ctx_crd(ctx, prd=False, Nscatter=10, NmaxIter=500):
     '''
     Iterate a Context to convergence.
@@ -89,7 +90,7 @@ def iterate_ctx_crd(ctx, prd=False, Nscatter=10, NmaxIter=500):
         # If we are converged in both relative change of J and populations return
         if dJ < 3e-3 and delta < 1e-3:
             return
-
+ """
 
 class Model_generator(object):
 
@@ -142,6 +143,9 @@ class Model_generator(object):
             # define it's length
             self.n_ref_atmos = len(self.atmosRef)
 
+            # Print completion message and flush to ensure it's seen immediately
+            print(f"Finished reading {self.n_ref_atmos} atmospheric models\n", flush=True)
+
             # Define the lists to store the arrays of taus, Temperatures, and other atmosphere variables
             # Log_10(tau) in the atmospheres
             self.ltau = [None] * self.n_ref_atmos
@@ -161,6 +165,8 @@ class Model_generator(object):
                 self.ntau[i] = len(self.ltau_nodes[i])
                 self.ind_ltau[i] = np.searchsorted(self.ltau[i], self.ltau_nodes[i]) - 1
                 self.logT[i] = np.log10(self.atmosRef[i].temperature)
+            
+            print(f"Finished Model generator initialization\n", flush=True)
 
     def new_model(self):
         """Method to read the parameters of an atmosphere based on 1 random refence atmosphere and perturbing it
@@ -204,6 +210,8 @@ class Model_generator(object):
             # interpolate the Temperature at the values of ltau and add a delta contribution
             f = interp.interp1d(self.ltau_nodes[i], deltas_smooth, kind='quadratic', bounds_error=False, fill_value="extrapolate")
             T_new = self.atmosRef[i].temperature + f(self.ltau[i])
+            # if T_new < 2500K set it to 2500K
+            T_new[T_new < 2500] = 2500
 
             # Perturb vturb by 20% of the current value
             std = 0.2*self.atmosRef[i].vturb[self.ind_ltau[i]]
@@ -250,17 +258,21 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
 
     tasks_status = [0] * nsamples
 
+    print("Master starting loop to distribute the work", flush=True)
+
     # loop to compute the nsamples pairs
-    with tqdm(total=nsamples, ncols=110) as pbar:
+    with tqdm(total=nsamples, ncols=110, disable=(rank != 0), file=sys.stdout) as pbar:
         # While we don't have more closed workers than total workers keep looping
         while closed_workers < num_workers:
             # Recieve the data from any process that says it's alive and get wich one is and it's status
             dataReceived = comm.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status)
             source = status.Get_source()
             tag = status.Get_tag()
+            # print(" * MASTER: received data from worker {0} with tag {1}.".format(source, tag), flush=True)
 
             # if the worker is ready to work send them a task
             if tag == tags.READY:
+                # print(" * MASTER: worker {0} is ready.".format(source), flush=True)
                 # Worker is ready, so send it a task
                 try:
                     # select the first index with status is 0
@@ -273,10 +285,14 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                                   'depth_scale': depth_scale, 'depth': depth, 'T': T, 'vlos': vlos, 'vturb': vturb}
 
                     # send the data of the task and put the status tu 1 (done)
+                    # print(f" * MASTER: sending task {task_index} to worker {source}.", flush=True)
                     comm.send(dataToSend, dest=source, tag=tags.START)
                     tasks_status[task_index] = 1
 
                 # If this not work set the tag of the worker to exit and kill it
+                except ValueError as e:
+                    # print(f"!!! MASTER: no more tasks to distribute, telling worker {source} to exit. !!!", flush=True)
+                    comm.send(None, dest=source, tag=tags.EXIT)
                 except Exception as e:
                     import traceback
                     print(f"!!! MASTER ERROR sending task to worker {source} !!!")
@@ -288,10 +304,12 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
             # If the tag it's Done, recieve the status, the index and all the data
             # and update the progress bar
             elif tag == tags.DONE:
+                # print(" * MASTER: worker {0} has completed task {1}.".format(source, dataReceived['index']), flush=True)
                 index = dataReceived['index']
                 success = dataReceived['success']
 
                 if (not success):
+                    # print(f"!!! MASTER: worker {source} failed to compute task {index}, rescheduling. !!!", flush=True)
                     tasks_status[index] = 0
 
                 else:
@@ -305,10 +323,13 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                     ne_list[index] = dataReceived['ne']
                     Iwave_list[index] = dataReceived['Iwave']
                     pbar.update(1)
+                    # pbar.refresh()
+                    # sys.stdout.flush()
+                    print(f" * MASTER: task {index} completed from worker {source} ({pbar.n}/{nsamples})", flush=True)
 
             # if the worker has the exit tag mark it as closed.
             elif tag == tags.EXIT:
-                print(" * MASTER : worker {0} exited.".format(source))
+                # print(" * MASTER : worker {0} exited.".format(source))
                 closed_workers += 1
 
             # If the number of itterations is multiple with the write frequency dump the data
@@ -381,6 +402,7 @@ def slave_work(rank):
         # recieve the data with the index of the task, the atmosphere parameters and/or the tag
         dataReceived = comm.recv(source=0, tag=MPI.ANY_TAG, status=status)
         tag = status.Get_tag()
+        # print(" * WORKER {0}: received data from master with tag {1}.".format(rank, tag), flush=True)
 
         if tag == tags.START:
             # Recieve the model atmosphere to solve the NLTE problem
@@ -401,12 +423,14 @@ def slave_work(rank):
             wave = np.linspace(853.9444, 854.9444, 1001)
             Iwave = wave*0
             success = 1
+            # print(f" * WORKER {rank}: starting task {task_index}.", flush=True)
 
             try:
                 # Compute the new atmosphere and solve the NLTE problem and retrieve the solved parameters
                 atmos = lw.Atmosphere.make_1d(scale=depth_scale, depthScale=depth, temperature=temperature,
                                               vlos=vlos, vturb=vturb, verbose=False, ne=ne)
                 ctx = synth_spectrum(atmos, depthData=True, conserveCharge=False, prd=prd_active)
+                # print(f" * WORKER {rank}: finished NLTE task {task_index}.", flush=True)
                 tau = atmos.tauRef
                 cmass = atmos.cmass
                 temperature = atmos.temperature
@@ -430,18 +454,26 @@ def slave_work(rank):
 
                 # If the coefficients are not converged set as failure
                 if np.isnan(np.sum(log_departure)):
+                    # print(f"!!! WORKER {rank}: task {task_index} did not converge !!!", flush=True)
                     success = 0
 
-            except:
+            except Exception as e:
+                import traceback
+                print(f"!!! WORKER {rank}: Exception in task {task_index} !!!", flush=True)
+                print(f"Exception Type: {type(e).__name__}, Message: {e}")
+                traceback.print_exc()
+                print(f"!!! WORKER {rank}: task {task_index} failed !!!", flush=True)
                 success = 0
 
             # Send the computed data
             dataToSend = {'index': task_index, 'T': temperature, 'log_departure': log_departure, 'n_Nat': n_Nat,
                           'tau': tau, 'cmass': cmass, 'vlos': vlos, 'vturb': vturb, 'ne': ne, 'success': success, 'Iwave': Iwave}
             comm.send(dataToSend, dest=0, tag=tags.DONE)
+            # print(f" * WORKER {rank}: finished task {task_index}.", flush=True)
 
         # If the tag is exit break the loop and kill the worker and send the EXIT tag to master
         elif tag == tags.EXIT:
+            # print(f" * WORKER {rank}: exiting.", flush=True)
             break
 
     comm.send(None, dest=0, tag=tags.EXIT)
@@ -485,7 +517,15 @@ if (__name__ == '__main__'):
         if parsed['prd']:
             print('with PRD')
 
+        # Wait for all processes to be ready before starting work
+        print("Master: Waiting for all workers to be ready...", flush=True)
+        comm.barrier()
+        print("Master: Starting work distribution...", flush=True)
+
         master_work(parsed['n'], parsed['train'], parsed['prd'], parsed['sav'], parsed['rd'], filename, write_frequency=parsed['f'])
     else:
+        # Worker processes wait for master to finish initialization
+        print(f"Worker {rank}: Waiting for master to finish initialization...", flush=True)
+        comm.barrier()
+        print(f"Worker {rank}: Starting slave work...", flush=True)
         slave_work(rank)
-        pass
