@@ -64,9 +64,9 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
     # Update the background populations based on the converged solution and
     eqPops.update_lte_atoms_Hmin_pops(atmos, quiet=True)
     # compute the final solution for mu=1 on the provided wavelength grid.
-    ctx.formal_sol_gamma_matrices(printUpdate=False)
+    ctx.formal_sol_gamma_matrices()
     if prd:
-        ctx.prd_redistribute(printUpdate=False)
+        ctx.prd_redistribute()
     return ctx
 
 
@@ -76,15 +76,15 @@ def iterate_ctx_crd(ctx, prd=False, Nscatter=10, NmaxIter=500):
     '''
     for i in range(NmaxIter):
         # Compute the formal solution
-        dJ = ctx.formal_sol_gamma_matrices(printUpdate=False)
+        dJ = ctx.formal_sol_gamma_matrices()
         if prd:
-            ctx.prd_redistribute(printUpdate=False)
+            ctx.prd_redistribute()
         # Just update J for Nscatter iterations
         if i < Nscatter:
             continue
         # Update the active populations under statistical equilibrium,
         # conserving charge if this option was set on the Context.
-        delta = ctx.stat_equil(printUpdate=False)
+        delta = ctx.stat_equil()
 
         # If we are converged in both relative change of J and populations return
         if dJ < 3e-3 and delta < 1e-3:
@@ -159,7 +159,7 @@ class Model_generator(object):
                 self.ltau[i] = np.log10(self.atmosRef[i].tauRef)
                 self.ltau_nodes[i] = np.array([np.min(self.ltau[i]), -5, -4, -3, -2, -1, 0, np.max(self.ltau[i])])
                 self.ntau[i] = len(self.ltau_nodes[i])
-                self.ind_ltau[i] = np.searchsorted(self.ltau[i], self.ltau_nodes[i])
+                self.ind_ltau[i] = np.searchsorted(self.ltau[i], self.ltau_nodes[i]) - 1
                 self.logT[i] = np.log10(self.atmosRef[i].temperature)
 
     def new_model(self):
@@ -277,7 +277,12 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                     tasks_status[task_index] = 1
 
                 # If this not work set the tag of the worker to exit and kill it
-                except:
+                except Exception as e:
+                    import traceback
+                    print(f"!!! MASTER ERROR sending task to worker {source} !!!")
+                    print(f"Exception Type: {type(e).__name__}, Message: {e}")
+                    traceback.print_exc()
+                    print("!!! Telling worker to exit. !!!")
                     comm.send(None, dest=source, tag=tags.EXIT)
 
             # If the tag it's Done, recieve the status, the index and all the data

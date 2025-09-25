@@ -1,0 +1,2 @@
+import lightweaver
+lightweaver.benchmark()
