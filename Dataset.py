@@ -53,12 +53,13 @@ class Dataset(torch.utils.data.Dataset):
 
         self.u = torch.zeros((1,1), dtype=torch.float)
 
-        print("  Calculating all the connections of the graph")
-        self.constructor_graph_radius = RadiusGraph(r=radius_neibourghs, num_workers=12)
+        print("  Storing radius for manual graph construction")
+        self.radius_neighbors = radius_neibourghs
         print("...")
-        self.graph = self.constructor_graph_radius(torch_geometric.data.Data(x=self.values_graph,
-                                                        pos=self.grid,
-                                                        y=self.targets_graph))
+        # Create initial graph structure - edges will be computed per subgraph
+        self.full_data = torch_geometric.data.Data(x=self.values_graph,
+                                                   pos=self.grid,
+                                                   y=self.targets_graph)
 
     def create_sample_indices(self, xpos, ypos, xdim=1, ydim=1):
         # Calculate the valid x and y ranges for the subgrid
@@ -76,13 +77,62 @@ class Dataset(torch.utils.data.Dataset):
 
         return np.array(subgrid_indices)
 
+    def grid_to_graph_manual(self, grid_points, values=None, targets=None, r=1.5, xpos=None, ypos=None):
+        """
+        Converts a set of 3D grid points to a PyTorch Geometric graph
+        by manually calculating edges between nodes closer than a given radius.
+        """
+        if values is None:
+            values = grid_points
+        if targets is None:
+            targets = grid_points
+
+        # --- MANUAL EDGE CONSTRUCTION ---
+        # 1. Calculate pairwise distances between all points
+        dist_matrix = torch.cdist(grid_points, grid_points)
+
+        # 2. Find pairs (i, j) where 0 < distance <= r
+        # We exclude 0 to avoid self-loops.
+        edge_indices_tuple = torch.where((dist_matrix > 0) & (dist_matrix <= r))
+
+        # 3. Stack the indices to create the edge_index tensor of shape [2, num_edges]
+        edge_index = torch.stack(edge_indices_tuple, dim=0)
+        # --- END OF MANUAL CONSTRUCTION ---
+
+        # Create a Data object with the manually computed edges
+        graph_data = Data(x=values, pos=grid_points, y=targets, edge_index=edge_index)
+
+        # Find and filter for central nodes (using the corrected logic from the previous answer)
+        if xpos is not None and ypos is not None:
+            central_nodes = torch.where(
+                (grid_points[:, 2] == xpos) & (grid_points[:, 1] == ypos)
+            )[0]
+
+            # Filter edges to keep only those connected to central nodes
+            if len(central_nodes) > 0:
+                edge_mask = torch.from_numpy(
+                    np.isin(graph_data.edge_index[0, :], central_nodes) |
+                    np.isin(graph_data.edge_index[1, :], central_nodes)
+                )
+                graph_data.edge_index = graph_data.edge_index[:, edge_mask]
+
+        return graph_data
+
     def __len__(self):
         return self.nx*self.ny
 
     def __call__(self):
         ix = np.random.randint(1, self.nx + 1)
         iy = np.random.randint(1, self.ny + 1)
-        subgraph = self.graph.subgraph(torch.tensor(self.create_sample_indices(ix, iy)))
+        indices = self.create_sample_indices(ix, iy)
+
+        # Get subgrid positions, features, and targets
+        sub_pos = self.grid[indices]
+        sub_features = self.values_graph[indices]
+        sub_targets = self.targets_graph[indices]
+
+        # Use manual graph construction
+        subgraph = self.grid_to_graph_manual(sub_pos, sub_features, sub_targets, r=self.radius_neighbors, xpos=ix, ypos=iy)
         subgraph.u = self.u
         return subgraph
 
@@ -90,7 +140,15 @@ class Dataset(torch.utils.data.Dataset):
         np.random.seed(index)
         ix = np.random.randint(1, self.nx + 1)
         iy = np.random.randint(1, self.ny + 1)
-        subgraph = self.graph.subgraph(torch.tensor(self.create_sample_indices(ix, iy)))
+        indices = self.create_sample_indices(ix, iy)
+
+        # Get subgrid positions, features, and targets
+        sub_pos = self.grid[indices]
+        sub_features = self.values_graph[indices]
+        sub_targets = self.targets_graph[indices]
+
+        # Use manual graph construction
+        subgraph = self.grid_to_graph_manual(sub_pos, sub_features, sub_targets, r=self.radius_neighbors, xpos=ix, ypos=iy)
         subgraph.u = self.u
         return subgraph
 
@@ -118,8 +176,8 @@ class EfficientDataset(torch.utils.data.Dataset):
         xgrid, ygrid, zgrid = np.meshgrid(self.zz, self.yy, self.xx, indexing='ij')
         self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float)
         
-        # This transform will be applied to each sample in __getitem__
-        self.radius_transform = RadiusGraph(r=self.radius, loop=False)
+        # Store radius for manual graph construction
+        # Note: RadiusGraph transform replaced with manual construction
 
         valid_ix = np.arange(xdim, self.nx - xdim)
         valid_iy = np.arange(ydim, self.ny - ydim)
@@ -143,6 +201,47 @@ class EfficientDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sample_centers)//10
 
+    def grid_to_graph_manual(self, grid_points, values=None, targets=None, r=1.5, xpos=None, ypos=None):
+        """
+        Converts a set of 3D grid points to a PyTorch Geometric graph
+        by manually calculating edges between nodes closer than a given radius.
+        """
+        if values is None:
+            values = grid_points
+        if targets is None:
+            targets = grid_points
+
+        # --- MANUAL EDGE CONSTRUCTION ---
+        # 1. Calculate pairwise distances between all points
+        dist_matrix = torch.cdist(grid_points, grid_points)
+
+        # 2. Find pairs (i, j) where 0 < distance <= r
+        # We exclude 0 to avoid self-loops.
+        edge_indices_tuple = torch.where((dist_matrix > 0) & (dist_matrix <= r))
+
+        # 3. Stack the indices to create the edge_index tensor of shape [2, num_edges]
+        edge_index = torch.stack(edge_indices_tuple, dim=0)
+        # --- END OF MANUAL CONSTRUCTION ---
+
+        # Create a Data object with the manually computed edges
+        graph_data = Data(x=values, pos=grid_points, y=targets, edge_index=edge_index)
+
+        # Find and filter for central nodes (using the corrected logic from the previous answer)
+        if xpos is not None and ypos is not None:
+            central_nodes = torch.where(
+                (grid_points[:, 2] == xpos) & (grid_points[:, 1] == ypos)
+            )[0]
+
+            # Filter edges to keep only those connected to central nodes
+            if len(central_nodes) > 0:
+                edge_mask = torch.from_numpy(
+                    np.isin(graph_data.edge_index[0, :], central_nodes) |
+                    np.isin(graph_data.edge_index[1, :], central_nodes)
+                )
+                graph_data.edge_index = graph_data.edge_index[:, edge_mask]
+
+        return graph_data
+
     def __getitem__(self, index):
         ix, iy = self.sample_centers[index]
 
@@ -152,29 +251,24 @@ class EfficientDataset(torch.utils.data.Dataset):
 
         # Create a grid of coordinates for the sub-volume
         kv, yv, xv = np.meshgrid(k_range, y_range, x_range, indexing='ij')
-        
+
         # Flatten and stack to get node positions
         node_pos = torch.tensor(np.stack([kv.ravel(), yv.ravel(), xv.ravel()], axis=1), dtype=torch.float)
 
         # Calculate flat indices from the coordinate grid to slice the original numpy arrays
         flat_indices = (kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel())
-        
+
         # 2. Get the features and targets for ONLY this sub-grid
         node_features = torch.tensor(self.features[flat_indices], dtype=torch.float)
         node_targets = torch.tensor(self.targets[flat_indices], dtype=torch.float)
 
-        # 3. Create a Data object for this small sample
-        # By construction, node_features and node_pos will have the same number of nodes
-        data = Data(x=node_features, pos=node_pos, y=node_targets)
-
-        # 4. Generate edges for this small graph ONLY
-        graph_data = self.radius_transform(data)
+        # 3. Use manual graph construction instead of RadiusGraph transform
+        graph_data = self.grid_to_graph_manual(node_pos, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy)
 
         # Add proper edge attributes if they don't exist
         if graph_data.edge_attr is None:
             row, col = graph_data.edge_index
-            # edge_vectors = graph_data.pos[row] - graph_data.pos[col]
-            edge_vectors = self.grid_pos[row] - self.grid_pos[col]
+            edge_vectors = graph_data.pos[row] - graph_data.pos[col]
             graph_data.edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
 
         # Add a place holder for the global attributes 'u' because the model needs it

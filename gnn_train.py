@@ -14,7 +14,7 @@ from scipy.interpolate import interpn
 import os
 
 # %%
-gpu = 2
+gpu = 3
 
 # Check if CUDA is available
 cuda_available = torch.cuda.is_available()
@@ -43,7 +43,9 @@ grid_file = '../en024048_hion/grid_bifrost.npz'
 nx = ny = 504
 nz = 476 - 52 + 1          # 425
 nlev = 6                   # caii[0] … caii[5]
-radius_neighbors = 1.77
+radius_neighbors = 4.01  # in grid points, for the graph construction
+x_range_graph = 2
+y_range_graph = 2
 interp_nz = 64
 
 
@@ -198,12 +200,14 @@ normalization_params = {
 datast_train = EfficientDataset(features_list,
                                 targets_list,
                                 radius_neighbors=radius_neighbors,
+                                xdim=x_range_graph, ydim=y_range_graph,
                                 pos_file=grid_file,
                                 split='train'
                                 )
 datast_test = EfficientDataset(features_list,
                                targets_list,
                                radius_neighbors=radius_neighbors,
+                               xdim=x_range_graph, ydim=y_range_graph,
                                pos_file=grid_file,
                                split='test'
                               )
