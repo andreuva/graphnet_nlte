@@ -27,9 +27,9 @@ print(f"CUDA available: {cuda_available}")
 print(f"Using device: {device}")
 # %%
 lr = 1e-3
-batch_size = 16
+batch_size = 10
 n_epochs = 300
-savedir = 'checkpoints/claud_norm/'
+savedir = 'checkpoints/new_graph/'
 smooth = 0.1
 
 time_format = "%Y.%m.%d-%H:%M:%S"
@@ -43,7 +43,7 @@ grid_file = '../en024048_hion/grid_bifrost.npz'
 nx = ny = 504
 nz = 476 - 52 + 1          # 425
 nlev = 6                   # caii[0] … caii[5]
-radius_neighbors = 4.01  # in grid points, for the graph construction
+radius_neighbors = 3.88  # in grid points, for the graph construction
 x_range_graph = 2
 y_range_graph = 2
 interp_nz = 64
