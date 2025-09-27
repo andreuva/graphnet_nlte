@@ -14,7 +14,7 @@ from scipy.interpolate import interpn
 import os
 
 # %%
-gpu = 1
+gpu = 2
 
 # Check if CUDA is available
 cuda_available = torch.cuda.is_available()
@@ -29,7 +29,7 @@ print(f"Using device: {device}")
 lr = 1e-3
 batch_size = 16
 n_epochs = 300
-savedir = 'checkpoints/multistep_300/'
+savedir = 'checkpoints/claud_norm/'
 smooth = 0.1
 
 time_format = "%Y.%m.%d-%H:%M:%S"
@@ -120,13 +120,80 @@ print('N. total trainable parameters : {0}'.format(sum(p.numel() for p in model.
 
 # %%
 
-# Normalize features and targets as done during training
-features_list = [(vel - vel.mean())/vel.std(),
-                 np.sign((b_xyz-b_xyz.mean())/b_xyz.std())*abs((b_xyz-b_xyz.mean())/b_xyz.std())**(1/4), 
-                 np.log10(temp/temp.mean()),
-                 np.log10(1/(n_h/n_h.mean()))/10, np.log10(1/(n_e/n_e.mean()))/10, np.log10(1/(n_p/n_p.mean()))/10]
+# Apply robust normalization to features using percentile-based scaling
+def robust_normalize(data, axis=(0,1,2)):
+    """
+    Apply robust normalization using percentiles instead of mean/std
+    """
+    # Calculate percentiles
+    q25 = np.percentile(data, 25, axis=axis, keepdims=True)
+    q75 = np.percentile(data, 75, axis=axis, keepdims=True)
+    median = np.percentile(data, 50, axis=axis, keepdims=True)
+    iqr = q75 - q25
+
+    # Apply robust scaling: (x - median) / IQR
+    normalized = (data - median) / (iqr + 1e-12)  # Add small epsilon to avoid division by zero
+
+    return normalized, {'median': median, 'iqr': iqr}
+
+# Apply robust normalization to velocity
+vel_norm, vel_params = robust_normalize(vel)
+
+# Apply robust normalization to magnetic field (without the complex transformation)
+b_norm, b_params = robust_normalize(b_xyz)
+
+# For temperature, use log-transform then robust scaling
+temp_log = np.log10(temp + 1e-12)
+temp_norm, temp_params = robust_normalize(temp_log)
+
+# For densities, use log-transform then robust scaling
+nh_log = np.log10(n_h + 1e-12)
+nh_norm, nh_params = robust_normalize(nh_log)
+
+ne_log = np.log10(n_e + 1e-12)
+ne_norm, ne_params = robust_normalize(ne_log)
+
+np_log = np.log10(n_p + 1e-12)
+np_norm, np_params = robust_normalize(np_log)
+
+# Create the normalized features list
+features_list = [vel_norm, b_norm, temp_norm, nh_norm, ne_norm, np_norm]
+
+# Store normalization parameters for all features
+feature_norm_params = {
+    'vel': vel_params,
+    'b_xyz': b_params,
+    'temp': temp_params,
+    'nh': nh_params,
+    'ne': ne_params,
+    'np': np_params
+}
+
 features_labels = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'nh', 'ne', 'np']
-targets_list = [np.log10(1/(pops/pops.sum(axis=-1, keepdims=True)))**(1/4)]
+
+# Store the original departure coefficients for later comparison
+departure_coeffs_orig = pops/pops.sum(axis=-1, keepdims=True)
+
+# Improved normalization: Apply log-transform and robust scaling
+# Use robust scaling with percentiles to handle outliers better
+departure_coeffs_log = np.log10(departure_coeffs_orig + 1e-12)  # Add small epsilon to avoid log(0)
+
+# Robust scaling using percentiles instead of mean/std
+q25, q75 = np.percentile(departure_coeffs_log, [25, 75], axis=(0,1,2), keepdims=True)
+iqr = q75 - q25
+median = np.percentile(departure_coeffs_log, 50, axis=(0,1,2), keepdims=True)
+
+# Apply robust scaling: (x - median) / IQR
+departure_coeffs_normalized = (departure_coeffs_log - median) / (iqr + 1e-12)
+
+targets_list = [departure_coeffs_normalized]
+
+# Store normalization parameters for denormalization
+normalization_params = {
+    'median': median,
+    'iqr': iqr,
+    'log_offset': 1e-12
+}
 
 datast_train = EfficientDataset(features_list,
                                 targets_list,
@@ -308,6 +375,8 @@ for epoch in range(1, n_epochs + 1):
             'optimizer': optimizer.state_dict(),
             'lr': scheduler.get_last_lr(),
             'dataset_params': datast_prms,
+            'feature_norm_params': feature_norm_params,
+            'normalization_params': normalization_params,
         }
 
         print("Saving best model...")
