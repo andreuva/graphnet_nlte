@@ -83,9 +83,9 @@ class Formal(object):
         self.validation_sampler = torch.utils.data.sampler.SubsetRandomSampler(self.validation_index)
 
         # Define the data loaders
-        self.train_loader = torch_geometric.data.DataLoader(
+        self.train_loader = torch_geometric.loader.DataLoader(
             self.dataset, sampler=self.train_sampler, batch_size=self.batch_size, shuffle=False, **self.kwargs)
-        self.validation_loader = torch_geometric.data.DataLoader(
+        self.validation_loader = torch_geometric.loader.DataLoader(
             self.dataset, sampler=self.validation_sampler, batch_size=self.batch_size, shuffle=False, **self.kwargs)
 
         self.lr = lr
@@ -247,16 +247,16 @@ class Formal(object):
 
         print("=> loading checkpoint '{}'".format(self.checkpoint))
         if (self.cuda):
-            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage)
+            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage, weights_only=False)
         else:
-            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage)
+            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage, weights_only=False)
 
         self.hyperameters = checkpoint['hyperparameters']
         self.test_model = graphnet.EncodeProcessDecode(**self.hyperameters).to(self.device)
         self.test_model.load_state_dict(checkpoint['state_dict'])
         self.test_dataset = dtst(self.hyperameters, self.datadir, dtst_type)
 
-        self.test_loader = torch_geometric.data.DataLoader(
+        self.test_loader = torch_geometric.loader.DataLoader(
             self.test_dataset, batch_size=self.batch_size, shuffle=False, **self.kwargs)
 
         # Loss function
@@ -332,9 +332,9 @@ class Formal(object):
 
         print("=> loading checkpoint '{}'".format(self.checkpoint))
         if (self.cuda):
-            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage)
+            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage, weights_only=False)
         else:
-            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage)
+            checkpoint = torch.load(self.checkpoint, map_location=lambda storage, loc: storage, weights_only=False)
 
         self.hyperameters = checkpoint['hyperparameters']
         self.predict_model = graphnet.EncodeProcessDecode(**self.hyperameters).to(self.device)
@@ -380,7 +380,7 @@ class Formal(object):
         [os.remove(file) for file in glob.glob(directory + '*')]
         os.rmdir(directory)
 
-        self.pred_loader = torch_geometric.data.DataLoader(
+        self.pred_loader = torch_geometric.loader.DataLoader(
             self.pred_dataset, batch_size=1, shuffle=False, **self.kwargs)
 
         # Loss function

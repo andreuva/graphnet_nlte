@@ -15,7 +15,7 @@ from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_ato
 
 test = []
 
-files = sorted(glob('../test/*/*.pkl'))
+files = sorted(glob('../data/tests/1D_multiatom/validation_checkpoint_20251006-132410_at_20251006-134426.pkl'))
 type_dtst = ['validation', 'test']
 dirs = [os.path.split(files[i])[0] for i in range(len(files))]
 plotdirs = [dirs[i] + '/plots/' for i in range(len(files))]
@@ -42,25 +42,25 @@ for j, file in enumerate(files):
     if not os.path.exists(plotdirs[j]):
         os.makedirs(plotdirs[j])
 
-# plt.figure(figsize=(10, 10), dpi=180)
-# plt.scatter(msn, loss, s=list(latdim**2/8), alpha=0.5)
-# plt.xlabel('Number of message passsing steps')
-# plt.ylabel('loss (MSE)')
-# plt.title('loss vs msn with size as function of latent dimension')
-# plt.savefig('msn_loss.png')
-# plt.show()
-# plt.close()
+plt.figure(figsize=(10, 10), dpi=180)
+plt.scatter(msn, loss, s=list(latdim**2/8), alpha=0.5)
+plt.xlabel('Number of message passsing steps')
+plt.ylabel('loss (MSE)')
+plt.title('loss vs msn with size as function of latent dimension')
+plt.savefig('msn_loss.png')
+plt.show()
+plt.close()
 
-# plt.figure(figsize=(10, 10), dpi=180)
-# plt.scatter(msn, loss, s=list(latdim**2/8), alpha=0.5)
-# plt.xlabel('Number of message passsing steps')
-# plt.ylabel('loss (MSE)')
-# plt.title('loss vs msn with size as function of latent dimension')
-# plt.xscale('log')
-# plt.yscale('log')
-# plt.savefig('log_msn_loss.png')
-# plt.show()
-# plt.close()
+plt.figure(figsize=(10, 10), dpi=180)
+plt.scatter(msn, loss, s=list(latdim**2/8), alpha=0.5)
+plt.xlabel('Number of message passsing steps')
+plt.ylabel('loss (MSE)')
+plt.title('loss vs msn with size as function of latent dimension')
+plt.xscale('log')
+plt.yscale('log')
+plt.savefig('log_msn_loss.png')
+plt.show()
+plt.close()
 # exit()
 
 for j, file in enumerate(files):
@@ -99,7 +99,7 @@ for j, file in enumerate(files):
                                     Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
         aSet_pre.set_active('Ca')
         if log_dep_comp.shape[0] > 6:
-            aSet_pre.set_active('H', 'Ca', 'Mg')
+            aSet_pre.set_active('H', 'Ca', 'Si')
         spect_pre = aSet_pre.compute_wavelength_grid()
 
         eqPops_pre = aSet_pre.compute_eq_pops(atmos_pre)
@@ -111,7 +111,7 @@ for j, file in enumerate(files):
         nstar = eqPops_pre.atomicPops['Ca'].nStar
         if log_dep_comp.shape[0] > 6:
             nstar = eqPops_pre.atomicPops['H'].nStar
-            nstar = np.append(nstar, eqPops_pre.atomicPops['Mg'].nStar, axis=0)
+            nstar = np.append(nstar, eqPops_pre.atomicPops['Si'].nStar, axis=0)
             nstar = np.append(nstar, eqPops_pre.atomicPops['Ca'].nStar, axis=0)
 
         pops_true = 10**log_dep_true * nstar
@@ -120,7 +120,7 @@ for j, file in enumerate(files):
         dep_lte = np.log10(eqPops_pre.atomicPops['Ca'].n / eqPops_pre.atomicPops['Ca'].nStar)
         if log_dep_comp.shape[0] > 6:
             dep_lte = np.log10(eqPops_pre.atomicPops['H'].n / eqPops_pre.atomicPops['H'].nStar)
-            dep_lte = np.append(dep_lte, np.log10(eqPops_pre.atomicPops['Mg'].n / eqPops_pre.atomicPops['Mg'].nStar), axis=0)
+            dep_lte = np.append(dep_lte, np.log10(eqPops_pre.atomicPops['Si'].n / eqPops_pre.atomicPops['Si'].nStar), axis=0)
             dep_lte = np.append(dep_lte, np.log10(eqPops_pre.atomicPops['Ca'].n / eqPops_pre.atomicPops['Ca'].nStar), axis=0)
 
         lte_pops.append(np.moveaxis(dep_lte, 0, -1))
@@ -131,14 +131,14 @@ for j, file in enumerate(files):
                                 Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
         aSet.set_active('Ca')
         if log_dep_comp.shape[0] > 6:
-            aSet.set_active('H', 'Ca', 'Mg')
+            aSet.set_active('H', 'Ca', 'Si')
         spect = aSet.compute_wavelength_grid()
 
         # Compute the intensity with the target populations
         eqPops = aSet.compute_eq_pops(atmos)
         if log_dep_comp.shape[0] > 6:
             eqPops.atomicPops['H'].n = pops_true[:6, :]
-            eqPops.atomicPops['Mg'].n = pops_true[6:-6, :]
+            eqPops.atomicPops['Si'].n = pops_true[6:-6, :]
             eqPops.atomicPops['Ca'].n = pops_true[-6:, :]
         else:
             eqPops.atomicPops['Ca'].n = pops_true
@@ -148,7 +148,7 @@ for j, file in enumerate(files):
         # Compute the intensity with the output populations
         if log_dep_comp.shape[0] > 6:
             eqPops.atomicPops['H'].n = pops_comp[:6, :]
-            eqPops.atomicPops['Mg'].n = pops_comp[6:-6, :]
+            eqPops.atomicPops['Si'].n = pops_comp[6:-6, :]
             eqPops.atomicPops['Ca'].n = pops_comp[-6:, :]
         else:
             eqPops.atomicPops['Ca'].n = pops_comp
