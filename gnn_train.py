@@ -7,6 +7,7 @@ from tqdm import tqdm
 from graphnet import *
 from configobj import ConfigObj
 from Dataset import *
+from normalization import normalize_pops, denormalize_pops, normalize_features, denormalize_features
 import matplotlib.pyplot as plt
 import time
 from datetime import datetime
@@ -42,11 +43,17 @@ grid_file = '../en024048_hion/grid_bifrost.npz'
 # ---- grid dimensions taken from the C code ----
 nx = ny = 504
 nz = 476 - 52 + 1          # 425
+nz_linear = 30
+nz_log = 25
+new_nz = nz_linear + nz_log # Interpolated z dimension = 55
+logspace_fraction = 0.4   # Fraction of points in z to be log-spaced
 nlev = 6                   # caii[0] … caii[5]
 radius_neighbors = 3.88  # in grid points, for the graph construction
 x_range_graph = 2
 y_range_graph = 2
-interp_nz = 64
+interp_nz = new_nz  # Use the linear+log sampling
+log_offset = 1e-12  # Offset to avoid log(0) in populations normalization
+# %%
 
 
 # ---- memory–mapped array: reads only the chunks you touch ----
@@ -67,12 +74,20 @@ print('N_elec shape:\t\t', n_e.shape)
 print('N_nh shape:\t\t', n_h.shape)
 print('N_p shape:\t\t', n_p.shape)
 
-# Define a new, higher-resolution grid
+# Define a new grid with linear + logarithmic sampling in z
 z, y, x = (np.arange(d) for d in (nz, ny, nx))
 
-new_nz, new_ny, new_nx = interp_nz, nx, ny
-new_z, new_y, new_x = (np.linspace(0, d-1, new_d) for d, new_d in zip((nz,ny,nx), (new_nz,new_ny,new_nx)))
+# Create hybrid z-grid: linear for first portion, then logarithmic
+new_z_log = np.concatenate([
+    np.linspace(0, nz*logspace_fraction, nz_linear, endpoint=False),
+    np.logspace(np.log10(nz*logspace_fraction), np.log10(nz-1), nz_log)
+])
+new_z = np.clip(new_z_log, 0, nz - 1)  # Ensure we stay within bounds
+new_y, new_x = (np.linspace(0, d-1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
+
+print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
+print(f"Z range: [{new_z.min():.2f}, {new_z.max():.2f}] (should be [0, {nz-1}])")
 
 # Interpolate data onto the new grid
 new_points = (new_zv, new_yv, new_xv)
@@ -122,80 +137,23 @@ print('N. total trainable parameters : {0}'.format(sum(p.numel() for p in model.
 
 # %%
 
-# Apply robust normalization to features using percentile-based scaling
-def robust_normalize(data, axis=(0,1,2)):
-    """
-    Apply robust normalization using percentiles instead of mean/std
-    """
-    # Calculate percentiles
-    q25 = np.percentile(data, 25, axis=axis, keepdims=True)
-    q75 = np.percentile(data, 75, axis=axis, keepdims=True)
-    median = np.percentile(data, 50, axis=axis, keepdims=True)
-    iqr = q75 - q25
+# Apply normalization using functions from normalization.py
+features_labels = ['vel', 'b', 'temp', 'n_h', 'n_e', 'n_p']
+features_data = [vel, b_xyz, temp, n_h, n_e, n_p]
 
-    # Apply robust scaling: (x - median) / IQR
-    normalized = (data - median) / (iqr + 1e-12)  # Add small epsilon to avoid division by zero
-
-    return normalized, {'median': median, 'iqr': iqr}
-
-# Apply robust normalization to velocity
-vel_norm, vel_params = robust_normalize(vel)
-
-# Apply robust normalization to magnetic field (without the complex transformation)
-b_norm, b_params = robust_normalize(b_xyz)
-
-# For temperature, use log-transform then robust scaling
-temp_log = np.log10(temp + 1e-12)
-temp_norm, temp_params = robust_normalize(temp_log)
-
-# For densities, use log-transform then robust scaling
-nh_log = np.log10(n_h + 1e-12)
-nh_norm, nh_params = robust_normalize(nh_log)
-
-ne_log = np.log10(n_e + 1e-12)
-ne_norm, ne_params = robust_normalize(ne_log)
-
-np_log = np.log10(n_p + 1e-12)
-np_norm, np_params = robust_normalize(np_log)
+# Normalize features (returns norm_params dict with means, stds, scale_factors, log_offset)
+normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset)
+vel_norm, b_norm, temp_norm, n_h_norm, n_e_norm, n_p_norm = normalized_features
 
 # Create the normalized features list
-features_list = [vel_norm, b_norm, temp_norm, nh_norm, ne_norm, np_norm]
+features_list = [vel_norm, b_norm, temp_norm, n_h_norm, n_e_norm, n_p_norm]
 
-# Store normalization parameters for all features
-feature_norm_params = {
-    'vel': vel_params,
-    'b_xyz': b_params,
-    'temp': temp_params,
-    'nh': nh_params,
-    'ne': ne_params,
-    'np': np_params
-}
+features_labels_expanded = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'n_h', 'n_e', 'n_p', 'z_pos']
 
-features_labels = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'nh', 'ne', 'np']
+# Normalize populations (returns norm_params dict with means, totals, factor, log_offset)
+pops_normalized, normalization_params = normalize_pops(pops, factor=4., log_offset=log_offset)
 
-# Store the original departure coefficients for later comparison
-departure_coeffs_orig = pops/pops.sum(axis=-1, keepdims=True)
-
-# Improved normalization: Apply log-transform and robust scaling
-# Use robust scaling with percentiles to handle outliers better
-departure_coeffs_log = np.log10(departure_coeffs_orig + 1e-12)  # Add small epsilon to avoid log(0)
-
-# Robust scaling using percentiles instead of mean/std
-q25, q75 = np.percentile(departure_coeffs_log, [25, 75], axis=(0,1,2), keepdims=True)
-iqr = q75 - q25
-median = np.percentile(departure_coeffs_log, 50, axis=(0,1,2), keepdims=True)
-
-# Apply robust scaling: (x - median) / IQR
-departure_coeffs_normalized = (departure_coeffs_log - median) / (iqr + 1e-12)
-
-targets_list = [departure_coeffs_normalized]
-
-# Store normalization parameters for denormalization
-normalization_params = {
-    'median': median,
-    'iqr': iqr,
-    'log_offset': 1e-12
-}
+targets_list = [pops_normalized]
 
 datast_train = EfficientDataset(features_list,
                                 targets_list,
@@ -214,8 +172,8 @@ datast_test = EfficientDataset(features_list,
 
 datast_prms = {'radius_neighbors': radius_neighbors,
                'pos_file': grid_file,
-               'nx': new_nx,
-               'ny': new_ny,
+               'nx': nx,
+               'ny': ny,
                'nz': new_nz,
               }
 
@@ -379,6 +337,8 @@ for epoch in range(1, n_epochs + 1):
             'optimizer': optimizer.state_dict(),
             'lr': scheduler.get_last_lr(),
             'dataset_params': datast_prms,
+            'features_labels': features_labels_expanded,
+            'nlev': nlev,
             'feature_norm_params': feature_norm_params,
             'normalization_params': normalization_params,
         }

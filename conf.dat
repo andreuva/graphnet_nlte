@@ -1,4 +1,4 @@
-node_input_size = 10
+node_input_size = 11
 edge_input_size = 1
 global_input_size = 1
 latent_size = 64
