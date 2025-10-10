@@ -22,7 +22,7 @@ gpu = config['system']['gpu']
 cuda_available = torch.cuda.is_available()
 device = torch.device(f"cuda:{gpu}" if cuda_available else "cpu")
 print(f"CUDA available: {cuda_available}")
-print(f"Using device: {device}")
+print(f"Using device: {device}\n")
 
 lr = config['training']['lr']
 batch_size = config['training']['batch_size']
@@ -95,7 +95,7 @@ print('#'*60+'\n')
 
 model_params = config['model']
 model = EncodeProcessDecode(**model_params).to(device)
-print('N. total trainable parameters : {0}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
 # ---- Normalization ----
 features_labels = ['vel', 'b', 'temp', 'n_h', 'n_e', 'n_p']
@@ -135,6 +135,7 @@ sample_graph = datast_train[0].to(device)
 # Now, provide the input as a tuple of tensors
 batch_tensor = torch.zeros(sample_graph.num_nodes, dtype=torch.long).to(device)
 
+print('\n'+'#'*60)
 print("Model device:", next(model.parameters()).device)
 print("sample_graph.x device:", sample_graph.x.device)
 print("sample_graph.edge_attr device:", sample_graph.edge_attr.device)

@@ -9,6 +9,7 @@ class EfficientDataset(torch.utils.data.Dataset):
     def __init__(self, list_X: list, list_Y: list, radius_neighbors, xdim, ydim, pos_file=None, seed=777, train_ratio=0.75, split='train', device='cpu', 
                  logspace_fraction=0.4, nz_linear=30, nz_log=25):
         super(EfficientDataset, self).__init__()
+        print(f'Dataset.py: Initializing {split} dataset...')
         self.device = device
         self.radius = radius_neighbors
         self.xdim = xdim
@@ -56,11 +57,11 @@ class EfficientDataset(torch.utils.data.Dataset):
         else:
             raise ValueError("split must be 'train' or 'test'")
 
-        print(f'{split.capitalize()} dataset created. Total samples: {len(self.sample_centers)}')
-        print(f'Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
+        print(f'Dataset.py:  {split.capitalize()} dataset created. Total samples: {len(self.sample_centers)}')
+        print(f'Dataset.py:  Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
         if split == 'test':
-            print(f'Test region: x ∈ [{x_threshold}, {self.nx - xdim}), y ∈ [{y_threshold}, {self.ny - ydim})')
-        print(f'Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
+            print(f'Dataset.py:  Test region: x ∈ [{x_threshold}, {self.nx - xdim}), y ∈ [{y_threshold}, {self.ny - ydim})')
+        print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
 
     def __len__(self):
         return len(self.sample_centers)//10
