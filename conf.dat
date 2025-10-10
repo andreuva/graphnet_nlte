@@ -1,8 +1,60 @@
+# conf.dat
+
+# ===================================================================
+# Master Configuration for GNN Training and Inference
+# This file is the single source of truth for all parameters.
+# ===================================================================
+
+[system]
+gpu = 0
+seed = 777
+
+[data]
+datadir = '../data_porta'
+grid_file = '../en024048_hion/grid_bifrost.npz'
+nx = 504
+ny = 504
+# Original nz after slicing (476 - 52 + 1)
+nz_orig = 425
+nlev = 6
+
+[dataset]
+# Z-axis interpolation settings
+nz_linear = 30
+nz_log = 25
+logspace_fraction = 0.4
+# Graph construction settings (in grid points)
+radius_neighbors = 3.88
+x_range_graph = 2
+y_range_graph = 2
+# Data split for train/test
+train_ratio = 0.75
+
+[training]
+lr = 5e-4
+batch_size = 16
+n_epochs = 350
+savedir = 'checkpoints/physical_z/'
+# Smoothed loss factor
+smooth = 0.05
+# Scheduler milestones for learning rate reduction
+milestones = 30, 60, 100, 150, 200, 250, 275, 300
+# Scheduler reduction factor
+gamma = 0.66
+
+[model]
+# Input size is 10 physical features + 1 z-position feature
 node_input_size = 11
 edge_input_size = 1
 global_input_size = 1
-latent_size = 64
-mlp_hidden_size = 64
-mlp_n_hidden_layers = 2
-n_message_passing_steps = 100
+latent_size = 128
+mlp_hidden_size = 128
+mlp_n_hidden_layers = 3
+n_message_passing_steps = 30
+# Output size is 6 CaII levels
 output_size = 6
+
+[normalization]
+# For population normalization
+factor = 4.0
+log_offset = 1e-12
