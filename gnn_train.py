@@ -48,7 +48,7 @@ nz_log = 25
 new_nz = nz_linear + nz_log # Interpolated z dimension = 55
 logspace_fraction = 0.4   # Fraction of points in z to be log-spaced
 nlev = 6                   # caii[0] … caii[5]
-radius_neighbors = 3.88  # in grid points, for the graph construction
+radius_neighbors = 0.25  # in grid points, for the graph construction
 x_range_graph = 2
 y_range_graph = 2
 interp_nz = new_nz  # Use the linear+log sampling
