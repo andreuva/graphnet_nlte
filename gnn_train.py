@@ -15,7 +15,7 @@ from scipy.interpolate import interpn
 import os
 
 # %%
-gpu = 3
+gpu = 0
 
 # Check if CUDA is available
 cuda_available = torch.cuda.is_available()
@@ -28,10 +28,10 @@ print(f"CUDA available: {cuda_available}")
 print(f"Using device: {device}")
 # %%
 lr = 1e-3
-batch_size = 10
-n_epochs = 300
-savedir = 'checkpoints/new_graph/'
-smooth = 0.1
+batch_size = 16
+n_epochs = 350
+savedir = 'checkpoints/physical_z/'
+smooth = 0.05
 
 time_format = "%Y.%m.%d-%H:%M:%S"
 
@@ -48,7 +48,7 @@ nz_log = 25
 new_nz = nz_linear + nz_log # Interpolated z dimension = 55
 logspace_fraction = 0.4   # Fraction of points in z to be log-spaced
 nlev = 6                   # caii[0] … caii[5]
-radius_neighbors = 0.25  # in grid points, for the graph construction
+radius_neighbors = 4.01  # in grid points, for the graph construction
 x_range_graph = 2
 y_range_graph = 2
 interp_nz = new_nz  # Use the linear+log sampling
