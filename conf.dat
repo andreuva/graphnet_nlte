@@ -28,11 +28,11 @@ radius_neighbors = 3.88
 x_range_graph = 2
 y_range_graph = 2
 # Data split for train/test
-train_ratio = 0.75
+train_ratio = 0.7
 
 [training]
 lr = 5e-4
-batch_size = 16
+batch_size = 12
 n_epochs = 350
 savedir = 'checkpoints/physical_z/'
 # Smoothed loss factor
