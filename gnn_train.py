@@ -168,10 +168,11 @@ for epoch in range(1, n_epochs + 1):
     for data in tqdm(loader_train, desc="Training"):
         node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
         u, batch, target = data.u.to(device), data.batch.to(device), data.y.to(device)
+        central_mask = data.central_mask.to(device)
 
         optimizer.zero_grad()
         out = model(node, edge_attr, edge_index, u, batch)
-        loss = loss_fn(out.squeeze(), target.squeeze())
+        loss = loss_fn(out.squeeze()[central_mask], target.squeeze()[central_mask])
         loss.backward()
         optimizer.step()
 
@@ -179,15 +180,16 @@ for epoch in range(1, n_epochs + 1):
 
     train_loss.append(loss_avg)
 
-    # ---- Validation ----
+    # ------------------- VALIDATION -------------------
     model.eval()
     loss_avg = 0.0
     with torch.no_grad():
         for data in tqdm(loader_test, desc="Validating"):
             node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
             u, batch, target = data.u.to(device), data.batch.to(device), data.y.to(device)
+            central_mask = data.central_mask.to(device)
             out = model(node, edge_attr, edge_index, u, batch)
-            loss = loss_fn(out.squeeze(), target.squeeze())
+            loss = loss_fn(out.squeeze()[central_mask], target.squeeze()[central_mask])
             loss_avg = smooth * loss.item() + (1.0 - smooth) * loss_avg if loss_avg != 0.0 else loss.item()
 
     valid_loss.append(loss_avg)

@@ -64,7 +64,7 @@ class EfficientDataset(torch.utils.data.Dataset):
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
 
     def __len__(self):
-        return len(self.sample_centers)//10
+        return len(self.sample_centers)
 
     def grid_to_graph_manual(self, grid_points, values=None, targets=None, r=1.5, xpos=None, ypos=None):
         if values is None:
@@ -107,7 +107,11 @@ class EfficientDataset(torch.utils.data.Dataset):
         # Calculate flat indices from the coordinate grid to slice the full data arrays
         flat_indices = (kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel())
 
-        # Get the physical positions for this sub-grid
+        # === NEW: Create a boolean mask to identify central column nodes ===
+        # The mask is True for nodes where the (y, x) coordinates match the center (iy, ix)
+        central_mask = (node_pos_indices[:, 1] == iy) & (node_pos_indices[:, 2] == ix)
+
+        # Get physical positions, features, targets, and add z-position feature
         sub_physical_pos = self.grid_pos[flat_indices]
 
         # Get the features and targets for this sub-grid
@@ -122,6 +126,9 @@ class EfficientDataset(torch.utils.data.Dataset):
         graph_data = self.grid_to_graph_manual(
             node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
         )
+
+        # === NEW: Add the central node mask to the graph data object ===
+        graph_data.central_mask = central_mask
 
         # Calculate edge attributes using PHYSICAL distances
         if graph_data.edge_index.numel() > 0:
