@@ -7,10 +7,11 @@ from torch_geometric.transforms import RadiusGraph
 
 class EfficientDataset(torch.utils.data.Dataset):
     def __init__(self, list_X: list, list_Y: list, radius_neighbors, xdim, ydim, pos_file=None, seed=777, train_ratio=0.75, split='train', device='cpu', 
-                 logspace_fraction=0.4, nz_linear=30, nz_log=25):
+                 logspace_fraction=0.4, nz_linear=30, nz_log=25, epoch_size_fraction=0.1):
         super(EfficientDataset, self).__init__()
         print(f'Dataset.py: Initializing {split} dataset...')
         self.device = device
+        self.epoch_size_fraction = epoch_size_fraction
         self.radius = radius_neighbors
         self.xdim = xdim
         self.ydim = ydim
@@ -38,6 +39,9 @@ class EfficientDataset(torch.utils.data.Dataset):
         xgrid, ygrid, zgrid = xgrid.T, ygrid.T, zgrid.T
         self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float)
 
+        # This transform will be applied to each sample in __getitem__
+        self.radius_transform = RadiusGraph(r=self.radius, loop=False, num_workers=4)
+
         valid_ix = np.arange(xdim, self.nx - xdim)
         valid_iy = np.arange(ydim, self.ny - ydim)
         all_indices = [(x, y) for x in valid_ix for y in valid_iy]
@@ -64,7 +68,7 @@ class EfficientDataset(torch.utils.data.Dataset):
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
 
     def __len__(self):
-        return len(self.sample_centers)
+        return int(len(self.sample_centers)*self.epoch_size_fraction)
 
     def grid_to_graph_manual(self, grid_points, values=None, targets=None, r=1.5, xpos=None, ypos=None):
         if values is None:
@@ -123,9 +127,13 @@ class EfficientDataset(torch.utils.data.Dataset):
         node_features = torch.cat([node_features, z_coords], dim=1)
 
         # Create graph using INDEX positions for connectivity
-        graph_data = self.grid_to_graph_manual(
-            node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
-        )
+        # graph_data = self.grid_to_graph_manual(
+        #     node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
+        # )
+        data = Data(x=node_features, pos=node_pos_indices, y=node_targets)
+
+        # 4. Generate edges for this small graph ONLY
+        graph_data = self.radius_transform(data)
 
         # === NEW: Add the central node mask to the graph data object ===
         graph_data.central_mask = central_mask

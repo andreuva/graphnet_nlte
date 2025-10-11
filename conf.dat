@@ -6,7 +6,7 @@
 # ===================================================================
 
 [system]
-gpu = 1
+gpu = 2
 seed = 777
 
 [data]
@@ -24,21 +24,22 @@ nz_linear = 30
 nz_log = 25
 logspace_fraction = 0.33
 # Graph construction settings (in grid points)
-radius_neighbors = 3.01
-x_range_graph = 2
-y_range_graph = 2
+radius_neighbors = 1.9
+x_range_graph = 1
+y_range_graph = 1
 # Data split for train/test
 train_ratio = 0.7
 
 [training]
 lr = 5e-4
-batch_size = 16
-n_epochs = 33
-savedir = 'checkpoints/physical_z_fullepoch/'
+batch_size = 24
+epoch_size_fraction = 0.1
+n_epochs = 330
+savedir = 'checkpoints/physicalz_fullyconnected/'
 # Smoothed loss factor
 smooth = 0.05
 # Scheduler milestones for learning rate reduction
-milestones = 3, 6, 10, 15, 20, 25, 27, 30
+milestones = 30, 60, 100, 150, 200, 250, 270, 300
 # Scheduler reduction factor
 gamma = 0.66
 
@@ -50,7 +51,7 @@ global_input_size = 1
 latent_size = 128
 mlp_hidden_size = 128
 mlp_n_hidden_layers = 3
-n_message_passing_steps = 33
+n_message_passing_steps = 35
 # Output size is 6 CaII levels
 output_size = 6
 

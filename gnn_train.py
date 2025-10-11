@@ -120,7 +120,8 @@ dataset_params = {
     'train_ratio': config['dataset']['train_ratio'],
     'nz_linear': nz_linear,
     'nz_log': nz_log,
-    'logspace_fraction': logspace_fraction
+    'logspace_fraction': logspace_fraction,
+    'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1)
 }
 
 datast_train = EfficientDataset(**dataset_params, split='train')
