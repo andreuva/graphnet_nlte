@@ -8,7 +8,7 @@ from tqdm import tqdm
 from graphnet import *
 from configobj import ConfigObj
 from Dataset import *
-from normalization import normalize_pops, denormalize_pops, normalize_features, denormalize_features
+from normalization import normalize_pops_original, denormalize_pops_original, normalize_features_original, denormalize_features_original
 import matplotlib.pyplot as plt
 import time
 from datetime import datetime
@@ -101,8 +101,8 @@ print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in mode
 features_labels = ['vel', 'b', 'temp', 'n_h', 'n_e', 'n_p']
 features_data = [vel, b_xyz, temp, n_h, n_e, n_p]
 
-normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset)
-pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset)
+normalized_features, feature_norm_params = normalize_features_original(features_data, features_labels, log_offset)
+pops_normalized, pop_norm_params = normalize_pops_original(pops, factor=config['normalization']['factor'], log_offset=log_offset)
 
 features_list = normalized_features
 targets_list = [pops_normalized]
