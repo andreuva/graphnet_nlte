@@ -230,7 +230,7 @@ plt.close()
 # %%
 
 plt.figure(0, (10,15), dpi=100)
-plt.plot(lr, label='Learning rate')
+plt.plot(lrs, label='Learning rate')
 plt.xlabel('Itteration')
 plt.legend()
 plt.savefig(savedir + 'lr.pdf')
