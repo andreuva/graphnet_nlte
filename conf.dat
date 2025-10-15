@@ -24,25 +24,25 @@ nz_linear = 30
 nz_log = 20
 logspace_fraction = 0.33
 # Graph construction settings (in grid points)
-radius_neighbors = 2.83
-x_range_graph = 2
-y_range_graph = 2
-fully_connected = True
+radius_neighbors = 4.5
+x_range_graph = 3
+y_range_graph = 3
+fully_connected = False
 # Data split for train/test
 train_ratio = 0.7
 
 [training]
-lr = 1e-3
-batch_size = 8
-epoch_size_fraction = 0.1
-n_epochs = 330
-savedir = 'checkpoints/widegraph_fully_connected_3x3/'
+lr = 3e-4
+batch_size = 12
+epoch_size_fraction = 0.25
+n_epochs = 160
+savedir = 'checkpoints/widegraph_newlr/'
 # Smoothed loss factor
 smooth = 0.1
 # Scheduler milestones for learning rate reduction
-milestones = 5, 10, 20, 40, 80, 100, 160, 200, 260, 320
+milestones = 35, 75, 120
 # Scheduler reduction factor
-gamma = 0.66
+gamma = 0.5
 
 [model]
 # Input size is 10 physical features + 1 z-position feature
@@ -52,7 +52,7 @@ global_input_size = 1
 latent_size = 128
 mlp_hidden_size = 128
 mlp_n_hidden_layers = 3
-n_message_passing_steps = 25
+n_message_passing_steps = 20
 # Output size is 6 CaII levels
 output_size = 6
 
