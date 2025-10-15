@@ -6,14 +6,17 @@ from torch_geometric.data import Data
 from torch_geometric.transforms import RadiusGraph
 
 class EfficientDataset(torch.utils.data.Dataset):
-    def __init__(self, list_X: list, list_Y: list, radius_neighbors, xdim, ydim, pos_file=None, seed=777, train_ratio=0.75, split='train', device='cpu', 
-                 logspace_fraction=0.4, nz_linear=30, nz_log=25):
+    def __init__(self, list_X: list, list_Y: list, radius_neighbors: float, xdim: int, ydim: int,
+                 fully_connected: bool = False, pos_file: str = None, split: str = 'train', train_ratio: float = 0.75,
+                 logspace_fraction: float = 0.4, nz_linear: int = 30, nz_log: int = 25, epoch_size_fraction: float = 0.2, seed: int = 777, device: str = 'cpu'):
         super(EfficientDataset, self).__init__()
         print(f'Dataset.py: Initializing {split} dataset...')
         self.device = device
+        self.epoch_size_fraction = epoch_size_fraction
         self.radius = radius_neighbors
         self.xdim = xdim
         self.ydim = ydim
+        self.fully_connected = fully_connected
 
         # Store data as numpy arrays to keep them on CPU until needed
         self.features = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_X], axis=1)
@@ -37,6 +40,11 @@ class EfficientDataset(torch.utils.data.Dataset):
         # We need to transpose to match the (z, y, x) structure of the data cubes
         xgrid, ygrid, zgrid = xgrid.T, ygrid.T, zgrid.T
         self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float)
+
+        # If fully connected, create the transform here
+        if self.fully_connected:
+            print("Warning: Fully connected graphs can be very large and may lead to memory issues.")
+            self.radius_transform = RadiusGraph(r=self.radius, loop=False, num_workers=4)
 
         valid_ix = np.arange(xdim, self.nx - xdim)
         valid_iy = np.arange(ydim, self.ny - ydim)
@@ -64,7 +72,7 @@ class EfficientDataset(torch.utils.data.Dataset):
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
 
     def __len__(self):
-        return len(self.sample_centers)
+        return int(len(self.sample_centers)*self.epoch_size_fraction)
 
     def grid_to_graph_manual(self, grid_points, values=None, targets=None, r=1.5, xpos=None, ypos=None):
         if values is None:
@@ -122,10 +130,13 @@ class EfficientDataset(torch.utils.data.Dataset):
         z_coords = sub_physical_pos[:, 2].unsqueeze(1)
         node_features = torch.cat([node_features, z_coords], dim=1)
 
-        # Create graph using INDEX positions for connectivity
-        graph_data = self.grid_to_graph_manual(
-            node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
-        )
+        if self.fully_connected:
+            data = Data(x=node_features, pos=node_pos_indices, y=node_targets)
+            graph_data = self.radius_transform(data)
+        else:
+            graph_data = self.grid_to_graph_manual(
+                node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
+            )
 
         # === NEW: Add the central node mask to the graph data object ===
         graph_data.central_mask = central_mask

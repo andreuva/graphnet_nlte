@@ -43,6 +43,7 @@ nz_log = config['dataset']['nz_log']
 new_nz = nz_linear + nz_log
 logspace_fraction = config['dataset']['logspace_fraction']
 log_offset = config['normalization']['log_offset']
+normalization_type = config['normalization'].get('type', 'log')
 
 # ---- memory–mapped arrays ----
 pops = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
@@ -101,8 +102,8 @@ print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in mode
 features_labels = ['vel', 'b', 'temp', 'n_h', 'n_e', 'n_p']
 features_data = [vel, b_xyz, temp, n_h, n_e, n_p]
 
-normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset)
-pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset)
+normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=normalization_type)
+pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
 
 features_list = normalized_features
 targets_list = [pops_normalized]
@@ -115,12 +116,14 @@ dataset_params = {
     'radius_neighbors': config['dataset']['radius_neighbors'],
     'xdim': config['dataset']['x_range_graph'],
     'ydim': config['dataset']['y_range_graph'],
+    'fully_connected': config['dataset']['fully_connected'],
     'pos_file': grid_file,
     'seed': config['system']['seed'],
     'train_ratio': config['dataset']['train_ratio'],
     'nz_linear': nz_linear,
     'nz_log': nz_log,
-    'logspace_fraction': logspace_fraction
+    'logspace_fraction': logspace_fraction,
+    'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1)
 }
 
 datast_train = EfficientDataset(**dataset_params, split='train')
