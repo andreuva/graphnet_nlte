@@ -7,7 +7,9 @@ to ensure consistency across training and inference scripts.
 
 import numpy as np
 
-# BAD NORMALIZATION OF THE POPULATIONS
+# ===================================================================
+# ORIGINAL 'POW' NORMALIZATION
+# ===================================================================
 def normalize_pops_pow(pops, factor=4., log_offset=1e-12):
     """
     Normalize populations using logarithmic transformation with height-stratified statistics.
@@ -55,7 +57,9 @@ def denormalize_pops_pow(normalized_pops, norm_params):
 
     return reconstructed_pops
 
-# LOG NORMALIZATION OF THE POPULATIONS
+# ===================================================================
+# ORIGINAL 'LOG' NORMALIZATION
+# ===================================================================
 def normalize_pops_log(pops, factor=4., log_offset=1e-12):
     """
     Normalize populations using logarithmic transformation with height-stratified statistics.
@@ -138,7 +142,9 @@ def calculate_mean_std(features, labels):
             stds.append(np.std(feature, axis=(1, 2, 3)))
     return means, stds
 
-# BAD NORMALIZATION OF THE PHYSICAL FEATURES
+# ===================================================================
+# ORIGINAL 'POW' NORMALIZATION
+# ===================================================================
 def normalize_features_pow(features, labels, log_offset=1e-12):
     """
     Normalize physical features using height-stratified statistics and scale to [-1, 1] range.
@@ -222,8 +228,8 @@ def denormalize_features_pow(normalized_features, labels, norm_params):
             denormalized.append(mean_broadcast * 10**(feature * scale_factor))
 
     return denormalized
-   
-# LOG NORMALIZATION OF THE PHYSICAL FEATURES
+
+
 def normalize_features_log(features, labels, log_offset=1e-12):
     """
     Normalize physical features using height-stratified statistics and scale to [-1, 1] range.
@@ -311,35 +317,41 @@ def denormalize_features_log(normalized_features, labels, norm_params):
 
     return denormalized
 
-# NOW WE JOIN THE EVERYTHING WITH THE INTERFACE USED:
+# ===================================================================
+# UNIFIED INTERFACE
+# ===================================================================
 def normalize_features(features, labels, log_offset=1e-12, type='log'):
+    print(f"Nomalaizing features with {type}")
     if type == 'log':
         return normalize_features_log(features, labels, log_offset)
     elif type == 'pow':
         return normalize_features_pow(features, labels, log_offset)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log' or 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log' 'pow'.")
 
 def denormalize_features(normalized_features, labels, norm_params, type='log'):
+    print(f"Denomalaizing features with {type}")
     if type == 'log':
         return denormalize_features_log(normalized_features, labels, norm_params)
     elif type == 'pow':
         return denormalize_features_pow(normalized_features, labels, norm_params)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log' or 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log' 'pow'.")
 
 def normalize_pops(pops, factor=4., log_offset=1e-12, type='log'):
+    print(f"Nomalaizing populations with {type}")
     if type == 'log':
         return normalize_pops_log(pops, factor, log_offset)
     elif type == 'pow':
         return normalize_pops_pow(pops, factor, log_offset)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log' or 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
 
 def denormalize_pops(normalized_pops, norm_params, type='log'):
+    print(f"Denomalaizing populations with {type}")
     if type == 'log':
         return denormalize_pops_log(normalized_pops, norm_params)
     elif type == 'pow':
         return denormalize_pops_pow(normalized_pops, norm_params)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log' or 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
