@@ -218,20 +218,20 @@ for epoch in range(1, n_epochs + 1):
     lrs.append(scheduler.get_last_lr())
     scheduler.step()
 
-# %%
-plt.figure(0, (10,15), dpi=100)
-plt.plot(train_loss, label='train loss')
-plt.plot(valid_loss, label='Validation loss')
-plt.xlabel('Itteration')
-plt.legend()
-plt.savefig(savedir + 'loss.pdf')
-plt.close()
+    # %%
+    plt.figure(0, (10,15), dpi=100)
+    plt.plot(train_loss, label='train loss')
+    plt.plot(valid_loss, label='Validation loss')
+    plt.xlabel('Itteration')
+    plt.legend()
+    plt.savefig(savedir + 'loss.pdf')
+    plt.close()
 
-# %%
+    # %%
 
-plt.figure(0, (10,15), dpi=100)
-plt.plot(lrs, label='Learning rate')
-plt.xlabel('Itteration')
-plt.legend()
-plt.savefig(savedir + 'lr.pdf')
-plt.close()
+    plt.figure(0, (10,15), dpi=100)
+    plt.plot(lrs, label='Learning rate')
+    plt.xlabel('Itteration')
+    plt.legend()
+    plt.savefig(savedir + 'lr.pdf')
+    plt.close()
