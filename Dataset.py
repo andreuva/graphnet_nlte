@@ -8,7 +8,11 @@ from torch_geometric.transforms import RadiusGraph
 class EfficientDataset(torch.utils.data.Dataset):
     def __init__(self, list_X: list, list_Y: list, radius_neighbors: float, xdim: int, ydim: int,
                  fully_connected: bool = False, pos_file: str = None, split: str = 'train', train_ratio: float = 0.75,
-                 logspace_fraction: float = 0.4, nz_linear: int = 30, nz_log: int = 25, epoch_size_fraction: float = 0.2, seed: int = 777, device: str = 'cpu'):
+                 logspace_fraction: float = 0.4, nz_linear: int = 30, nz_log: int = 25, epoch_size_fraction: float = 0.2,
+                 max_stride: int = 1,
+                 random_stride: bool = False,
+                 seed: int = 777,
+                 device: str = 'cpu'):
         super(EfficientDataset, self).__init__()
         print(f'Dataset.py: Initializing {split} dataset...')
         self.device = device
@@ -17,6 +21,8 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.xdim = xdim
         self.ydim = ydim
         self.fully_connected = fully_connected
+        self.max_stride = max_stride
+        self.random_stride = random_stride
 
         # Store data as numpy arrays to keep them on CPU until needed
         self.features = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_X], axis=1)
@@ -46,8 +52,8 @@ class EfficientDataset(torch.utils.data.Dataset):
             print("Warning: Fully connected graphs can be very large and may lead to memory issues.")
             self.radius_transform = RadiusGraph(r=self.radius, loop=False, num_workers=4)
 
-        valid_ix = np.arange(xdim, self.nx - xdim)
-        valid_iy = np.arange(ydim, self.ny - ydim)
+        valid_ix = np.arange(xdim * self.max_stride, self.nx - xdim * self.max_stride)
+        valid_iy = np.arange(ydim * self.max_stride, self.ny - ydim * self.max_stride)
         all_indices = [(x, y) for x in valid_ix for y in valid_iy]
 
         # Shuffle
@@ -55,20 +61,21 @@ class EfficientDataset(torch.utils.data.Dataset):
         np.random.shuffle(all_indices)
 
         # split into train and test
-        x_threshold = int((self.nx - xdim) * train_ratio) + xdim
-        y_threshold = int((self.ny - ydim) * train_ratio) + ydim
+        x_threshold = int((self.nx - (xdim * self.max_stride)) * train_ratio) + (xdim * self.max_stride)
+        y_threshold = int((self.ny - (ydim * self.max_stride)) * train_ratio) + (ydim * self.max_stride)
 
         if split == 'test':
             self.sample_centers = [(x, y) for x, y in all_indices if x >= x_threshold and y >= y_threshold]
         elif split == 'train':
             self.sample_centers = [(x, y) for x, y in all_indices if x < x_threshold or y < y_threshold]
+        elif split == 'full':
+            self.sample_centers = [(x, y) for x, y in all_indices]
         else:
             raise ValueError("split must be 'train' or 'test'")
 
         print(f'Dataset.py:  {split.capitalize()} dataset created. Total samples: {len(self.sample_centers)}')
         print(f'Dataset.py:  Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
-        if split == 'test':
-            print(f'Dataset.py:  Test region: x ∈ [{x_threshold}, {self.nx - xdim}), y ∈ [{y_threshold}, {self.ny - ydim})')
+        print(f'Dataset.py:  Test region: x ∈ [{x_threshold}, {self.nx - xdim * self.max_stride}), y ∈ [{y_threshold}, {self.ny - ydim * self.max_stride})')
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
 
     def __len__(self):
@@ -103,8 +110,22 @@ class EfficientDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         ix, iy = self.sample_centers[index]
 
-        y_range = np.arange(iy - self.ydim, iy + self.ydim + 1)
-        x_range = np.arange(ix - self.xdim, ix + self.xdim + 1)
+        # A stride of 1 is the original contiguous block.
+        if self.random_stride:
+            x_stride = np.random.randint(1, self.max_stride + 1)
+            y_stride = np.random.randint(1, self.max_stride + 1)
+        else:
+            x_stride = self.max_stride
+            y_stride = self.max_stride
+
+        # Create offsets from the center, multiply by stride
+        x_offsets = np.arange(-self.xdim, self.xdim + 1) * x_stride
+        y_offsets = np.arange(-self.ydim, self.ydim + 1) * y_stride
+
+        # Create the new sparse ranges, ensuring they don't go out of bounds
+        x_range = np.clip(ix + x_offsets, 0, self.nx - 1)
+        y_range = np.clip(iy + y_offsets, 0, self.ny - 1)
+
         k_range = np.arange(self.nz)
 
         # Create a grid of coordinates for the sub-volume (as indices)
@@ -115,7 +136,6 @@ class EfficientDataset(torch.utils.data.Dataset):
         # Calculate flat indices from the coordinate grid to slice the full data arrays
         flat_indices = (kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel())
 
-        # === NEW: Create a boolean mask to identify central column nodes ===
         # The mask is True for nodes where the (y, x) coordinates match the center (iy, ix)
         central_mask = (node_pos_indices[:, 1] == iy) & (node_pos_indices[:, 2] == ix)
 
@@ -138,7 +158,6 @@ class EfficientDataset(torch.utils.data.Dataset):
                 node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
             )
 
-        # === NEW: Add the central node mask to the graph data object ===
         graph_data.central_mask = central_mask
 
         # Calculate edge attributes using PHYSICAL distances

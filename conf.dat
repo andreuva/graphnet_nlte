@@ -27,6 +27,8 @@ logspace_fraction = 0.33
 radius_neighbors = 5.75
 x_range_graph = 4
 y_range_graph = 4
+max_stride = 1
+random_stride = False
 fully_connected = False
 # Data split for train/test
 train_ratio = 0.7

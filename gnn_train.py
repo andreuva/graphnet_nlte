@@ -123,7 +123,8 @@ dataset_params = {
     'nz_linear': nz_linear,
     'nz_log': nz_log,
     'logspace_fraction': logspace_fraction,
-    'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1)
+    'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1),
+    "max_stride": config["dataset"].get("max_stride", 1),
 }
 
 datast_train = EfficientDataset(**dataset_params, split='train')

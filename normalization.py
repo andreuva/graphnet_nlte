@@ -74,6 +74,8 @@ def normalize_pops_log(pops, factor=4., log_offset=1e-12):
         norm_params: Dictionary with normalization parameters for denormalization
     """
     total_pops_all = np.sum(pops, axis=3)
+    # total_pops_mean = np.mean(total_pops_all, axis=(1,2))
+    # fractional_pops = pops / (total_pops_mean[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
     fractional_pops = pops / (total_pops_all[:, :, :, np.newaxis] + log_offset)
     mean_populations = np.mean(fractional_pops, axis=(1, 2))
 
@@ -83,6 +85,7 @@ def normalize_pops_log(pops, factor=4., log_offset=1e-12):
     norm_params = {
         'means': mean_populations,
         'totals': total_pops_all,
+        # 'totals': total_pops_mean,
         'factor': factor,
         'log_offset': log_offset
     }
@@ -102,6 +105,7 @@ def denormalize_pops_log(normalized_pops, norm_params):
     """
     mean_populations = norm_params['means']
     total_pops_all = norm_params['totals']
+    # total_pops_all = norm_params['totals'][:, ::2, ::2]
     factor = norm_params['factor']
     log_offset = norm_params['log_offset']
 
@@ -113,6 +117,7 @@ def denormalize_pops_log(normalized_pops, norm_params):
 
     reconstructed_pops = reconstructed_fractional_pops * \
         (total_pops_all[:, :, :, np.newaxis] + log_offset)
+        # (total_pops_all[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
 
     return reconstructed_pops
 
