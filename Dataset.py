@@ -155,7 +155,8 @@ class EfficientDataset(torch.utils.data.Dataset):
             graph_data = self.radius_transform(data)
         else:
             graph_data = self.grid_to_graph_manual(
-                node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
+                # node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
+                node_pos_indices, node_features, node_targets, r=self.radius*(x_stride + y_stride)/3, xpos=ix, ypos=iy
             )
 
         graph_data.central_mask = central_mask

@@ -6,7 +6,7 @@
 # ===================================================================
 
 [system]
-gpu = 1
+gpu = 0
 seed = 777
 
 [data]
@@ -24,27 +24,28 @@ nz_linear = 30
 nz_log = 20
 logspace_fraction = 0.33
 # Graph construction settings (in grid points)
-radius_neighbors = 5.75
-x_range_graph = 4
-y_range_graph = 4
-max_stride = 1
-random_stride = False
+radius_neighbors = 5.01
+x_range_graph = 3
+y_range_graph = 3
+max_stride = 3
+random_stride = True
 fully_connected = False
 # Data split for train/test
 train_ratio = 0.7
 
 [training]
-lr = 1e-3
+lr = 3e-4
 batch_size = 8
 epoch_size_fraction = 0.2
-n_epochs = 120
-savedir = 'checkpoints/widest_fewmp/'
+n_epochs = 130
+savedir = 'checkpoints/multistride_adaptive_connections_smaller/'
+load_checkpoint = False
 # Smoothed loss factor
 smooth = 0.05
 # Scheduler milestones for learning rate reduction
-milestones = 5, 10, 20, 50, 100
+milestones = 40, 80, 100, 115
 # Scheduler reduction factor
-gamma = 0.55
+gamma = 0.5
 
 [model]
 # Input size is 10 physical features + 1 z-position feature
@@ -52,14 +53,14 @@ node_input_size = 11
 edge_input_size = 1
 global_input_size = 1
 latent_size = 128
-mlp_hidden_size = 128
+mlp_hidden_size = 64
 mlp_n_hidden_layers = 3
-n_message_passing_steps = 13
+n_message_passing_steps = 16
 # Output size is 6 CaII levels
 output_size = 6
 
 [normalization]
 # For population normalization
 type = 'log'
-factor = 4.0
+factor = -4.5
 log_offset = 1e-12

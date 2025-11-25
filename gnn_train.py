@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from scipy.interpolate import interpn
 import os
+from glob import glob
 
 # Use unrepr=True to automatically convert strings to int, float, lists, etc.
 config = ConfigObj('conf.dat', unrepr=True)
@@ -28,6 +29,7 @@ lr = config['training']['lr']
 batch_size = config['training']['batch_size']
 n_epochs = config['training']['n_epochs']
 savedir = config['training']['savedir']
+load_checkpoint = config['training']['load_checkpoint']
 smooth = config['training']['smooth']
 time_format = "%Y.%m.%d-%H:%M:%S"
 
@@ -125,6 +127,7 @@ dataset_params = {
     'logspace_fraction': logspace_fraction,
     'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1),
     "max_stride": config["dataset"].get("max_stride", 1),
+    "random_stride": config["dataset"].get("random_stride", False),
 }
 
 datast_train = EfficientDataset(**dataset_params, split='train')
@@ -133,36 +136,67 @@ datast_test = EfficientDataset(**dataset_params, split='test')
 loader_train = DataLoader(datast_train, batch_size=batch_size, shuffle=True)
 loader_test = DataLoader(datast_test, batch_size=batch_size, shuffle=False)
 
-# Get a single sample graph
-sample_graph = datast_train[0].to(device)
-
-# Now, provide the input as a tuple of tensors
-batch_tensor = torch.zeros(sample_graph.num_nodes, dtype=torch.long).to(device)
-
 print('\n'+'#'*60)
 print("Model device:", next(model.parameters()).device)
-print("sample_graph.x device:", sample_graph.x.device)
-print("sample_graph.edge_attr device:", sample_graph.edge_attr.device)
-print("sample_graph.edge_index device:", sample_graph.edge_index.device)
-print("sample_graph.u device:", sample_graph.u.device)
-print("batch_tensor device:", batch_tensor.device)
 print('#'*60+'\n')
 
-if not os.path.exists(savedir):
-    os.makedirs(savedir)
-
+# ---- Initialize Optimizer, Scheduler, and Loss ----
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer,
     milestones=config['training']['milestones'],
     gamma=config['training']['gamma']
 )
-
 loss_fn = nn.MSELoss()
-train_loss, valid_loss, lrs = [], [], []
-best_loss = float('inf')
 
-for epoch in range(1, n_epochs + 1):
+# ---- Initialize Training State Variables ----
+start_epoch = 1
+best_loss = float('inf')
+train_loss, valid_loss, lrs = [], [], []
+
+# ---- Load Checkpoint if configured ----
+if not os.path.exists(savedir):
+    os.makedirs(savedir)
+    if load_checkpoint:
+        print(f"WARNING: Checkpoint loading enabled, but save directory '{savedir}' not found. Starting fresh.")
+
+if load_checkpoint:
+    checkpoints = glob(os.path.join(savedir, "*.pth"))
+    if checkpoints:
+        # Find the most recent checkpoint
+        latest_checkpoint_path = max(checkpoints, key=os.path.getctime)
+        try:
+            print(f"Loading checkpoint: {latest_checkpoint_path}")
+            checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
+
+            # Load model state
+            model.load_state_dict(checkpoint['state_dict'])
+            
+            # Load optimizer and scheduler states
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+
+            # Load training progress
+            start_epoch = checkpoint['epoch'] + 1
+            best_loss = checkpoint['best_loss']
+            train_loss = checkpoint.get('train_loss_history', []) # Use .get for backward compatibility
+            valid_loss = checkpoint.get('valid_loss_history', []) # Use .get for backward compatibility
+            
+            # Restore other saved parameters
+            config = checkpoint['config']
+            feature_norm_params = checkpoint['feature_norm_params']
+            pop_norm_params = checkpoint['normalization_params']
+            
+            print(f"Successfully loaded checkpoint. Resuming training from epoch {start_epoch}.")
+            print(f"Previous best validation loss was: {best_loss:.6f}")
+
+        except Exception as e:
+            print(f"ERROR: Could not load checkpoint from {latest_checkpoint_path}: {e}. Starting from scratch.")
+    else:
+        print(f"INFO: No checkpoint found in '{savedir}'. Starting training from scratch.")
+
+# ---- Main Training Loop ----
+for epoch in range(start_epoch, n_epochs + 1):
     filename = time.strftime(time_format)
     model.train()
     print("\n" + "#" * 80)
@@ -186,7 +220,7 @@ for epoch in range(1, n_epochs + 1):
 
     # ------------------- VALIDATION -------------------
     model.eval()
-    loss_avg = 0.0
+    val_loss_avg = 0.0
     with torch.no_grad():
         for data in tqdm(loader_test, desc="Validating"):
             node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
@@ -194,10 +228,10 @@ for epoch in range(1, n_epochs + 1):
             central_mask = data.central_mask.to(device)
             out = model(node, edge_attr, edge_index, u, batch)
             loss = loss_fn(out.squeeze()[central_mask], target.squeeze()[central_mask])
-            loss_avg = smooth * loss.item() + (1.0 - smooth) * loss_avg if loss_avg != 0.0 else loss.item()
+            val_loss_avg = smooth * loss.item() + (1.0 - smooth) * val_loss_avg if val_loss_avg != 0.0 else loss.item()
 
-    valid_loss.append(loss_avg)
-    print(f"Epoch {epoch} finished with validation loss: {loss_avg:.6f}")
+    valid_loss.append(val_loss_avg)
+    print(f"Epoch {epoch} finished with validation loss: {val_loss_avg:.6f}")
 
     if valid_loss[-1] < best_loss:
         best_loss = valid_loss[-1]
@@ -208,31 +242,37 @@ for epoch in range(1, n_epochs + 1):
             'best_loss': best_loss,
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'config': config,  # <--- SAVE THE ENTIRE CONFIGURATION
+            'config': config,
             'feature_norm_params': feature_norm_params,
             'normalization_params': pop_norm_params,
+            'train_loss_history': train_loss,
+            'valid_loss_history': valid_loss,
         }
 
-        print("Saving best model...")
+        print(f"New best validation loss: {best_loss:.6f}. Saving model...")
         torch.save(checkpoint, os.path.join(savedir, f'{filename}_best.pth'))
     
     lrs.append(scheduler.get_last_lr())
     scheduler.step()
 
-    # %%
-    plt.figure(0, (10,15), dpi=100)
-    plt.plot(train_loss, label='train loss')
-    plt.plot(valid_loss, label='Validation loss')
-    plt.xlabel('Itteration')
+    # ---- Plotting ----
+    plt.figure(figsize=(10, 7))
+    plt.plot(train_loss, label='Training Loss')
+    plt.plot(valid_loss, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
     plt.legend()
-    plt.savefig(savedir + 'loss.pdf')
+    plt.grid(True)
+    plt.savefig(os.path.join(savedir, 'loss.pdf'))
     plt.close()
 
-    # %%
-
-    plt.figure(0, (10,15), dpi=100)
-    plt.plot(lrs, label='Learning rate')
-    plt.xlabel('Itteration')
+    plt.figure(figsize=(10, 7))
+    plt.plot(lrs, label='Learning Rate')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title('Learning Rate Schedule')
     plt.legend()
-    plt.savefig(savedir + 'lr.pdf')
+    plt.grid(True)
+    plt.savefig(os.path.join(savedir, 'lr.pdf'))
     plt.close()
