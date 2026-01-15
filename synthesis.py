@@ -29,8 +29,8 @@ print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 # %%
 datadir = config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
-nx_patch = 250
-ny_patch = 250
+nx_patch = 25
+ny_patch = 25
 nlev = config['data']['nlev']
 
 nz_linear = config['dataset']['nz_linear']
@@ -60,8 +60,16 @@ new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, 
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
 print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
+
+# Define shifted points for the populations (Shifted by 1.5)
+# We clip to ensure we don't go out of bounds of the original z grid (0 to nz-1)
+z_shift = 79
+new_zv_shifted = np.clip(new_zv - z_shift, 0, nz - 1)
+new_points_pops = (new_zv_shifted, new_yv, new_xv)
+pops = interpn((z, y, x), pops_orig, new_points_pops)
+
 new_points = (new_zv, new_yv, new_xv)
-pops = interpn((z, y, x), pops_orig, new_points)
+# pops = interpn((z, y, x), pops_orig, new_points)
 temp = interpn((z, y, x), temp_orig, new_points)
 b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
 vel = interpn((z, y, x), vel_orig, new_points)
@@ -98,51 +106,121 @@ plt.close()
 # %%
 # convert zz_grid to meters
 zz_grid_m = (zz_grid-1.5) * 1e6  # Mm to m
+zz_grid_m = (zz_grid) * 1e6  # Mm to m
 
 # %%
 # Load the saved predictions and targets from the GNN inference step.
-predictions_denorm = np.load(f'{config['training']['savedir']}predictions_denorm.npy')
-targets_denorm = np.load(f'{config['training']['savedir']}targets_denorm.npy')
+predictions_denorm = np.load(f'{config['training']['savedir']}predictions_stride_3.npy')
+targets_denorm = np.load(f'{config['training']['savedir']}targets_stride_3.npy')
 
 print(f"Predictions shape: {predictions_denorm.shape}")
 print(f"Targets shape: {targets_denorm.shape}")
 
 # %%
+from scipy.interpolate import interp1d
+
+def shift_prediction(prediction, grid_z, shift=79, nz_orig=None):
+    """
+    Shifts the prediction array by `shift` indices in the original z-space.
+    
+    Parameters:
+    -----------
+    prediction : np.ndarray
+        The data inferred on the unshifted grid. Shape: (new_nz, ...)
+    grid_z : np.ndarray
+        The z-coordinates (indices) of the grid where prediction is defined.
+        (This is 'new_z' from Cell 20)
+    shift : float
+        The shift amount. 1.5 means pulling data from 1.5 indices deeper.
+    nz_orig : int, optional
+        The maximum index of the original grid (to clip correctly). 
+        If None, uses grid_z.max().
+        
+    Returns:
+    --------
+    pred_shifted : np.ndarray
+        The shifted prediction array.
+    """
+    # 1. Create an interpolator mapping: Original_Z_Index -> Prediction_Value
+    # We interpolate along axis 0 (height)
+    f_interp = interp1d(grid_z, prediction, axis=0, kind='linear', 
+                        fill_value="extrapolate", bounds_error=False)
+    
+    # 2. Define the target "shifted" coordinates
+    # We want to sample the prediction at (z - shift)
+    target_z = grid_z - shift
+    
+    # 3. Clip to stay within bounds
+    # (prevents sampling beyond the bottom of the atmosphere)
+    max_limit = nz_orig - 1 if nz_orig else grid_z.max()
+    target_z = np.clip(target_z, 0, max_limit)
+    
+    # 4. Evaluate
+    return f_interp(target_z)
+
+# --- Usage Example ---
+# Assuming 'prediction_atm' is your variable (e.g. predictions_denorm)
+# and 'new_z' is the grid from Cell 20.
+# nz is the original number of depth points (e.g. 82 or similar)
+
+# prediction_shifted = shift_prediction(prediction_atm, new_z, shift=1.5, nz_orig=nz)
+
+# print("Shift complete.")
+# print(f"Original shape: {prediction_atm.shape}")
+# print(f"Shifted shape:  {prediction_shifted.shape}")
+
+# %%
+from joblib import Parallel, delayed
+import lightweaver as lw
+import numpy as np
+import time
+
+# --- Setup Constants ---
 nwave = 1001
 wave = np.linspace(853.9444, 854.9444, nwave)
-Iwave_lte, Iwave_target, Iwave_predicted = np.zeros((nx_patch, ny_patch, nwave)), np.zeros((nx_patch, ny_patch, nwave)), np.zeros((nx_patch, ny_patch, nwave))
-lte_pops = []
 
-print('Computing Intensities based on test the populations')
-start_time = time.time()
-for row_pix in range(nx_patch):
+# We wrap the inner loop logic in a function
+def process_single_row(row_idx, ny_patch, nx_patch, nz, z_shift, 
+                       temp, b_xyz, vel, n_e, n_h, n_p, pops, 
+                       predictions_denorm, targets_denorm, new_z, zz_grid_m, wave):
+    
+    # Pre-allocate arrays for this specific row to store results
+    # Shape: (ny_patch, nwave)
+    row_lte = np.zeros((ny_patch, len(wave)))
+    row_target = np.zeros((ny_patch, len(wave)))
+    row_pred = np.zeros((ny_patch, len(wave)))
+    
+    # Iterate over columns in this row
     for col_pix in range(ny_patch):
         
-        print(f'Processing pixel ({row_pix+1}/{nx_patch}, {col_pix+1}/{ny_patch}). Progress: {((row_pix*ny_patch + col_pix +1)/(nx_patch*ny_patch))*100:.2f} %.'+
-              f' Time elapsed since start: {(time.time() - start_time) / 60:.2f} minutes.'+
-              f' Estimated time to finish: {((time.time() - start_time) / ((row_pix*ny_patch + col_pix +1)) * (nx_patch*ny_patch - (row_pix*ny_patch + col_pix +1))) / 60:.2f} minutes.', end='\r')
+        # --- 1. Extract Data (Slicing logic from original code) ---
+        # Note: We slice at [row_idx] fixed, iterating [col_pix]
+        temp_atm = np.ascontiguousarray(temp[-1:1:-1, col_pix, row_idx, 0])
+        b_xyz_atm = np.ascontiguousarray(b_xyz[-1:1:-1, col_pix, row_idx, 2])
+        vel_atm = np.ascontiguousarray(vel[-1:1:-1, col_pix, row_idx, 2])/1e2
+        n_e_atm = np.ascontiguousarray(n_e[-1:1:-1, col_pix, row_idx, 0])*1e6
+        n_h_atm = np.ascontiguousarray(n_h[-1:1:-1, col_pix, row_idx, 0])*1e6
+        n_p_atm = np.ascontiguousarray(n_p[-1:1:-1, col_pix, row_idx, 0])*1e6
+        pops_atm = np.ascontiguousarray(pops[-1:1:-1, col_pix, row_idx, :])*1e6
+        
+        prediction_atm = np.ascontiguousarray(predictions_denorm[-1:1:-1, col_pix, row_idx, :])*1e6
+        target_atm = np.ascontiguousarray(targets_denorm[-1:1:-1, col_pix, row_idx, :])*1e6
 
-        temp_atm = np.ascontiguousarray(temp[-1:1:-1, col_pix, row_pix, 0])                     # Assumed to be in K
-        b_xyz_atm = np.ascontiguousarray(b_xyz[-1:1:-1, col_pix, row_pix, 2])                   # Assumed to be in G
-        vel_atm = np.ascontiguousarray(vel[-1:1:-1, col_pix, row_pix, 2])/1e2                   # Assumed to be in cm/s to m/s
-        n_e_atm = np.ascontiguousarray(n_e[-1:1:-1, col_pix, row_pix, 0])*1e6                   # Assumed to be in cm^-3 to m^-3
-        n_h_atm = np.ascontiguousarray(n_h[-1:1:-1, col_pix, row_pix, 0])*1e6                   # Assumed to be in cm^-3 to m^-3
-        n_p_atm = np.ascontiguousarray(n_p[-1:1:-1, col_pix, row_pix, 0])*1e6                   # Assumed to be in cm^-3 to m^-3
-        pops_atm = np.ascontiguousarray(pops[-1:1:-1, col_pix, row_pix, :])*1e6                 # Assumed to be in cm^-3 to m^-3
-        prediction_atm = np.ascontiguousarray(predictions_denorm[-1:1:-1, col_pix, row_pix, :])*1e6  # Assumed to be in cm^-3 to m^-3
-        target_atm = np.ascontiguousarray(targets_denorm[-1:1:-1, col_pix, row_pix, :])*1e6     # Assumed to be in cm^-3 to m^-3
+        # --- 2. Shift Predictions ---
+        # Ensure shift_prediction is defined in the worker scope or imported
+        prediction_shifted = shift_prediction(prediction_atm, new_z[-1:1:-1], shift=z_shift, nz_orig=nz)
+        target_shifted = shift_prediction(target_atm, new_z[-1:1:-1], shift=z_shift, nz_orig=nz)
 
-        # print(f"Ranges and means for pixel ({row_pix}, {col_pix}):")
-        # print(f"  Temperature: min={temp_atm.min():.2f}, max={temp_atm.max():.2f}, mean={temp_atm.mean():.2f}")
-        # print(f"  Electron Density: min={n_e_atm.min():.2e}, max={n_e_atm.max():.2e}, mean={n_e_atm.mean():.2e}")
-        # print(f"  Hydrogen Density: min={n_h_atm.min():.2e}, max={n_h_atm.max():.2e}, mean={n_h_atm.mean():.2e}")
-        # print(f"  Velocity: min={vel_atm.min():.2f}, max={vel_atm.max():.2f}, mean={vel_atm.mean():.2f}")
-
-        atmos_pre = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]), temperature=temp_atm,
+        # --- 3. Lightweaver Setup (Pre/LTE) ---
+        atmos_pre = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
+                                          depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]), 
+                                          temperature=temp_atm,
                                           nHTot=n_h_atm, ne=n_e_atm,
                                           vturb=1e4*np.ones_like(temp_atm),
                                           vlos=vel_atm)
         atmos_pre.quadrature(5)
+        
+        # Re-instantiate atoms inside the worker to avoid pickling issues with C++ objects
         aSet_pre = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
                                     Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
         aSet_pre.set_active('H', 'Ca')
@@ -151,11 +229,13 @@ for row_pix in range(nx_patch):
         eqPops_pre = aSet_pre.compute_eq_pops(atmos_pre)
         ctx_pre = lw.Context(atmos_pre, spect_pre, eqPops_pre, Nthreads=1, conserveCharge=False)
 
-        # Compute the intensity with the LTE populations
-        Iwave_target[row_pix, col_pix, :] = ctx_pre.compute_rays(wave, [atmos_pre.muz[-1]], stokes=False)
+        # Compute LTE intensity
+        row_lte[col_pix, :] = ctx_pre.compute_rays(wave, [atmos_pre.muz[-1]], stokes=False)
 
-        # ============================ NLTE ============================
-        atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]), temperature=temp_atm,
+        # --- 4. NLTE Computations ---
+        atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
+                                      depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]), 
+                                      temperature=temp_atm,
                                       nHTot=n_h_atm, ne=n_e_atm,
                                       vturb=1e4*np.ones_like(temp_atm),
                                       vlos=vel_atm)
@@ -166,15 +246,48 @@ for row_pix in range(nx_patch):
         spect = aSet.compute_wavelength_grid()
         eqPops = aSet.compute_eq_pops(atmos)
 
-        # Compute the intensity with the target populations
-        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(pops_atm, 1, 0))
+        # Target Populations
+        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(target_shifted, 1, 0))
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
-        Iwave_target[row_pix, col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
+        row_target[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
 
-        # Compute the intensity with the output populations
-        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(prediction_atm, 1, 0))
+        # Predicted Populations
+        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(prediction_shifted, 1, 0))
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
-        Iwave_predicted[row_pix, col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
+        row_pred[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
+        
+    return row_idx, row_lte, row_target, row_pred
+
+# --- Execute Parallel Loop ---
+print(f'Starting parallel synthesis on grid: {nx_patch}x{ny_patch}...')
+start_time = time.time()
+
+# n_jobs=-1 uses all available cores. 
+# verbose=5 provides progress updates.
+results = Parallel(n_jobs=64, verbose=5)(
+    delayed(process_single_row)(
+        row, ny_patch, nx_patch, nz, z_shift, 
+        temp, b_xyz, vel, n_e, n_h, n_p, pops, 
+        predictions_denorm, targets_denorm, new_z, zz_grid_m, wave
+    ) for row in range(nx_patch)
+)
+
+print(f"Calculation finished in {(time.time() - start_time)/60:.2f} minutes.")
+
+# --- Reassemble Results ---
+# Initialize final arrays
+Iwave_lte = np.zeros((nx_patch, ny_patch, nwave))
+Iwave_target = np.zeros((nx_patch, ny_patch, nwave))
+Iwave_predicted = np.zeros((nx_patch, ny_patch, nwave))
+
+print("Reassembling arrays...")
+for res in results:
+    r_idx, r_lte, r_tgt, r_pred = res
+    Iwave_lte[r_idx, :, :] = r_lte
+    Iwave_target[r_idx, :, :] = r_tgt
+    Iwave_predicted[r_idx, :, :] = r_pred
+
+print("Done.")
 
 # %%
 # Save the results
@@ -183,7 +296,7 @@ np.save(f'{config["training"]["savedir"]}Iwave_target_big.npy', Iwave_target)
 np.save(f'{config["training"]["savedir"]}Iwave_predicted_big.npy', Iwave_predicted)
 
 # %%
-eqPops.atomicPops['Ca'].n.shape
+# eqPops.atomicPops['Ca'].n.shape
 
 # %%
 # plot the atmosRef and atmos_pre stratification in all the quantities to compare
@@ -271,6 +384,71 @@ plt.savefig(save_path_dist, dpi=300)
 plt.close()
 
 # %%
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+# --- Configuration ---
+shift_val = 75           # The shift amount in z-index
+pixel_x, pixel_y = nx//2, ny//2  # Select center pixel
+level_idx = 0             # Select level index to plot (e.g., 0 for ground state)
+
+# --- 1. Extract Data for a Single Pixel ---
+# pops_orig is (nz, ny, nx, nlev). We take a slice: (nz, nlev)
+# We use .copy() to ensure we have a clean array if it's memory-mapped
+pop_col_orig = pops_orig[:, pixel_y, pixel_x, level_idx]
+
+# --- 2. Interpolate 1D Profiles ---
+# Create an interpolator for the original z-grid (indices 0 to nz-1)
+# We use 'extrapolate' to handle edge cases, though clipping usually prevents this.
+f_pop = interp1d(z, pop_col_orig, kind='linear', fill_value="extrapolate")
+
+# Calculate the profiles on the new grid
+# Unshifted: Evaluated at new_z
+pop_unshifted_1d = f_pop(new_z)
+
+# Shifted: Evaluated at new_z + shift (pulling data from higher indices)
+# We clip to ensure we don't go out of the original z bounds
+z_shifted_coords = np.clip(new_z + shift_val, 0, nz - 1)
+pop_shifted_1d = f_pop(z_shifted_coords)
+
+# --- 3. Calculate Physical Shift (Height) ---
+# Determine the effective height shift in km at each point
+# geometry_grid is the height in Mm corresponding to integer z indices
+f_height = interp1d(z, geometry_grid, kind='linear', fill_value="extrapolate")
+h_orig = zz_grid # Height at new_z
+h_shifted_source = f_height(z_shifted_coords) # Height at the shifted index
+delta_h_km = (h_shifted_source - h_orig) * 1000 # Convert Mm to km
+
+# --- 4. Plotting ---
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Plot 1: Populations vs Height
+ax1.plot(zz_grid, pop_unshifted_1d, 'k--', label='Original (Unshifted)', linewidth=2)
+ax1.plot(zz_grid, pop_shifted_1d, 'r-', label=f'Shifted (z_index += {shift_val})')
+ax1.set_yscale('log')
+ax1.set_xlabel('Height [Mm]')
+ax1.set_ylabel(f'Population Density [cm$^{{-3}}$] (Level {level_idx})')
+ax1.set_title(f'Effect of Shift on Populations (Pixel {pixel_x}, {pixel_y})')
+ax1.legend()
+ax1.grid(True, which="both", ls="-", alpha=0.3)
+
+# Plot 2: Effective Spatial Shift
+ax2.plot(zz_grid, delta_h_km, 'b-')
+ax2.set_xlabel('Height [Mm]')
+ax2.set_ylabel('Vertical Displacement [km]')
+ax2.set_title(f'Physical Displacement for $\Delta z = {shift_val}$')
+ax2.grid(True)
+ax2.text(0.05, 0.95, 'Positive means data is pulled\nfrom higher up (atmosphere moves down)', 
+         transform=ax2.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+plt.tight_layout()
+plt.savefig(save_path_dist, dpi=300)
+save_path_dist = os.path.join(config['training']['savedir'], 'geometry_shift_effect_pixel_'
+                              f'{pixel_x}_{pixel_y}.png')
+# plt.show()
+plt.close()
+
+# %%
 print(f"Shape of the synthesized intensities: {Iwave_predicted.shape}, {Iwave_target.shape}, {Iwave_lte.shape}")
 
 # %%
@@ -343,11 +521,8 @@ plt.tight_layout()
 save_path = os.path.join(config['training']['savedir'], 'synthesis_comparison.png')
 # Ensure directory exists just in case
 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-plt.savefig(save_path, dpi=300)
-
-save_path_dist = os.path.join(config['training']['savedir'], 'comparison_maps.png')
 print(f"Figure saved to: {save_path}")
-plt.savefig(save_path_dist, dpi=300)
+plt.savefig(save_path, dpi=300)
 # plt.show()
 plt.close()
 
@@ -384,7 +559,7 @@ sel_x, sel_y = nx_patch // 2, ny_patch // 2
 
 # ================= Setup Figure =================
 # We use a constrained layout for better spacing
-fig = plt.figure(figsize=(18, 6))
+fig = plt.figure(figsize=(12, 6))
 gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.5])
 
 ax_orig = fig.add_subplot(gs[0, 0])
@@ -521,7 +696,7 @@ mape_map = np.mean(np.abs(rel_error), axis=2)
 # PLOTTING
 # ==============================================================================
 
-fig = plt.figure(figsize=(20, 12))
+fig = plt.figure(figsize=(12, 8))
 gs = fig.add_gridspec(2, 2, height_ratios=[1, 1])
 
 # --- Plot 1: Error Distribution vs Wavelength ---

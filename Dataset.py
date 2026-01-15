@@ -69,13 +69,15 @@ class EfficientDataset(torch.utils.data.Dataset):
         elif split == 'train':
             self.sample_centers = [(x, y) for x, y in all_indices if x < x_threshold or y < y_threshold]
         elif split == 'full':
+            x_threshold = xdim * self.max_stride
+            y_threshold = ydim * self.max_stride
             self.sample_centers = [(x, y) for x, y in all_indices]
         else:
             raise ValueError("split must be 'train' or 'test'")
 
         print(f'Dataset.py:  {split.capitalize()} dataset created. Total samples: {len(self.sample_centers)}')
         print(f'Dataset.py:  Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
-        print(f'Dataset.py:  Test region: x ∈ [{x_threshold}, {self.nx - xdim * self.max_stride}), y ∈ [{y_threshold}, {self.ny - ydim * self.max_stride})')
+        print(f'Dataset.py:  Region: x ∈ [{x_threshold}, {self.nx - xdim * self.max_stride}), y ∈ [{y_threshold}, {self.ny - ydim * self.max_stride})')
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
 
     def __len__(self):
