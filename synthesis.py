@@ -17,7 +17,7 @@ import time
 
 # %%
 # Load the saved predictions and targets from the GNN inference step.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_adaptive_connections_smaller/2025.10.27-07:48:32_best.pth'
+checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_adaptive_connections_newz/2026.01.16-09:02:13_best.pth'
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -29,8 +29,8 @@ print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 # %%
 datadir = config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
-nx_patch = 25
-ny_patch = 25
+nx_patch = 490
+ny_patch = 490
 nlev = config['data']['nlev']
 
 nz_linear = config['dataset']['nz_linear']
@@ -59,17 +59,20 @@ new_z = np.clip(new_z_log, 0, nz - 1)
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
-print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
-
+# %%
 # Define shifted points for the populations (Shifted by 1.5)
 # We clip to ensure we don't go out of bounds of the original z grid (0 to nz-1)
-z_shift = 79
+z_shift = 51
 new_zv_shifted = np.clip(new_zv - z_shift, 0, nz - 1)
 new_points_pops = (new_zv_shifted, new_yv, new_xv)
 pops = interpn((z, y, x), pops_orig, new_points_pops)
 
+# %%
+print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
+
+z_shift = 51
 new_points = (new_zv, new_yv, new_xv)
-# pops = interpn((z, y, x), pops_orig, new_points)
+pops = interpn((z, y, x), pops_orig, new_points)
 temp = interpn((z, y, x), temp_orig, new_points)
 b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
 vel = interpn((z, y, x), vel_orig, new_points)
@@ -85,11 +88,11 @@ atmosRef = Falc82()
 
 # %%
 # load geometry grid
-geometry_grid = np.load(config["data"]["grid_file"])["z"]
+geometry_file = config["data"]["grid_file"]
+geometry_grid = np.load(geometry_file)["z"]
 zz_grid = np.interp(new_z, z, geometry_grid)
 
-print(f"Loaded geometry grid from {config['data']['grid_file']} with shape {zz_grid.shape}.")
-
+print(f"Loaded geometry grid from {geometry_file} with shape {zz_grid.shape}.")
 plt.figure(figsize=(20, 2))
 plt.plot(zz_grid, zz_grid * 0, '|', markersize=20, label='Interpolated grid')
 plt.plot(geometry_grid, geometry_grid * 0, '|', label='Original grid')
@@ -110,8 +113,8 @@ zz_grid_m = (zz_grid) * 1e6  # Mm to m
 
 # %%
 # Load the saved predictions and targets from the GNN inference step.
-predictions_denorm = np.load(f'{config['training']['savedir']}predictions_stride_3.npy')
-targets_denorm = np.load(f'{config['training']['savedir']}targets_stride_3.npy')
+predictions_denorm = np.load(f'{config['training']['savedir']}predictions_stride_1_full.npy')
+targets_denorm = np.load(f'{config['training']['savedir']}targets_stride_1_full.npy')
 
 print(f"Predictions shape: {predictions_denorm.shape}")
 print(f"Targets shape: {targets_denorm.shape}")
@@ -215,8 +218,9 @@ def process_single_row(row_idx, ny_patch, nx_patch, nz, z_shift,
         atmos_pre = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
                                           depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]), 
                                           temperature=temp_atm,
-                                          nHTot=n_h_atm, ne=n_e_atm,
-                                          vturb=1e4*np.ones_like(temp_atm),
+                                          nHTot=n_h_atm,
+                                          ne=n_e_atm,
+                                          vturb=0e4*np.ones_like(temp_atm),
                                           vlos=vel_atm)
         atmos_pre.quadrature(5)
         
@@ -236,8 +240,9 @@ def process_single_row(row_idx, ny_patch, nx_patch, nz, z_shift,
         atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
                                       depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]), 
                                       temperature=temp_atm,
-                                      nHTot=n_h_atm, ne=n_e_atm,
-                                      vturb=1e4*np.ones_like(temp_atm),
+                                      nHTot=n_h_atm,
+                                      ne=n_e_atm,
+                                      vturb=0e4*np.ones_like(temp_atm),
                                       vlos=vel_atm)
         atmos.quadrature(5)
         aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
@@ -291,9 +296,9 @@ print("Done.")
 
 # %%
 # Save the results
-np.save(f'{config["training"]["savedir"]}Iwave_lte_big.npy', Iwave_lte)
-np.save(f'{config["training"]["savedir"]}Iwave_target_big.npy', Iwave_target)
-np.save(f'{config["training"]["savedir"]}Iwave_predicted_big.npy', Iwave_predicted)
+np.save(f'{config["training"]["savedir"]}Iwave_lte_stride_1_full.npy', Iwave_lte)
+np.save(f'{config["training"]["savedir"]}Iwave_target_stride_1_full.npy', Iwave_target)
+np.save(f'{config["training"]["savedir"]}Iwave_predicted_stride_1_full.npy', Iwave_predicted)
 
 # %%
 # eqPops.atomicPops['Ca'].n.shape
@@ -322,7 +327,7 @@ atmos_pre_plot = lw.Atmosphere.make_1d(
     temperature=temp_atm_slice,
     nHTot=n_h_atm_slice, 
     ne=n_e_atm_slice, 
-    vturb=5e3*np.ones_like(temp_atm_slice),
+    vturb=0e3*np.ones_like(temp_atm_slice),
     vlos=vel_atm_slice, 
     verbose=True
 )
@@ -388,7 +393,7 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 
 # --- Configuration ---
-shift_val = 75           # The shift amount in z-index
+shift_val = 51           # The shift amount in z-index
 pixel_x, pixel_y = nx//2, ny//2  # Select center pixel
 level_idx = 0             # Select level index to plot (e.g., 0 for ground state)
 
@@ -436,7 +441,7 @@ ax1.grid(True, which="both", ls="-", alpha=0.3)
 ax2.plot(zz_grid, delta_h_km, 'b-')
 ax2.set_xlabel('Height [Mm]')
 ax2.set_ylabel('Vertical Displacement [km]')
-ax2.set_title(f'Physical Displacement for $\Delta z = {shift_val}$')
+# ax2.set_title(f'Physical Displacement for $\Delta z = {shift_val}$')
 ax2.grid(True)
 ax2.text(0.05, 0.95, 'Positive means data is pulled\nfrom higher up (atmosphere moves down)', 
          transform=ax2.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -614,7 +619,7 @@ def update_maps(wave_idx):
 def update_spectrum(x, y):
     """Updates the line plot based on clicked pixel."""
     # Bounds check
-    if x < 0 or x >= nx_patch or y < 0 or y >= ny_patch:
+    if x < 5 or x >= nx_patch or y < 5 or y >= ny_patch:
         return
 
     # Update line data

@@ -38,7 +38,7 @@ lr = 3e-4
 batch_size = 8
 epoch_size_fraction = 0.2
 n_epochs = 130
-savedir = 'checkpoints/multistride_adaptive_connections_smaller/'
+savedir = 'checkpoints/multistride_adaptive_connections_newz/'
 load_checkpoint = False
 # Smoothed loss factor
 smooth = 0.05
