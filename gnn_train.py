@@ -10,11 +10,11 @@ from configobj import ConfigObj
 from Dataset import *
 from normalization import normalize_pops, denormalize_pops, normalize_features, denormalize_features
 import matplotlib.pyplot as plt
-import time
+import os, time, shutil
 from datetime import datetime
 from scipy.interpolate import interpn
-import os
 from glob import glob
+import multiprocessing
 
 # Use unrepr=True to automatically convert strings to int, float, lists, etc.
 config = ConfigObj('conf.dat', unrepr=True)
@@ -53,16 +53,20 @@ b_xyz = np.memmap(f'{datadir}/AR_385_B.dat',dtype='<f4',mode='r',shape=(nz, ny, 
 temp = np.memmap(f'{datadir}/AR_385_temp.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 1))
 vel = np.memmap(f'{datadir}/AR_385_veloc.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 3))
 n_e = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-n_p = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
-n_h = np.memmap(f'{datadir}/AR_385_nh.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+# n_p = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
+# n_h = np.memmap(f'{datadir}/AR_385_nh.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+rho = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
+press = np.memmap(f'{datadir}/AR_385_press.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 
 print('Populations shape:\t', pops.shape)
 print('Temperature shape:\t', temp.shape)
 print('Mag, field shape:\t', b_xyz.shape)
 print('Velocity shape:\t\t', vel.shape)
 print('N_elec shape:\t\t', n_e.shape)
-print('N_nh shape:\t\t', n_h.shape)
-print('N_p shape:\t\t', n_p.shape)
+# print('N_nh shape:\t\t', n_h.shape)
+# print('N_p shape:\t\t', n_p.shape)
+print('Rho shape:\t\t', rho.shape)
+print('Press shape:\t\t', press.shape)
 print('#'*60+'\n')
 
 # ---- Interpolate data to the new grid ----
@@ -82,8 +86,10 @@ temp = interpn((z, y, x), temp, new_points)
 b_xyz = interpn((z, y, x), b_xyz, new_points)
 vel = interpn((z, y, x), vel, new_points)
 n_e = interpn((z, y, x), n_e, new_points)
-n_h = interpn((z, y, x), n_h, new_points)
-n_p = interpn((z, y, x), n_p, new_points)
+# n_h = interpn((z, y, x), n_h, new_points)
+# n_p = interpn((z, y, x), n_p, new_points)
+rho = interpn((z, y, x), rho, new_points)
+press = interpn((z, y, x), press, new_points)
 
 print("Interpolation complete.")
 print('\n'+'#'*60)
@@ -92,8 +98,10 @@ print('Temperature shape INTERPOLATED:\t', temp.shape)
 print('Mag, field shape INTERPOLATED:\t', b_xyz.shape)
 print('Velocity shape INTERPOLATED:\t', vel.shape)
 print('N_elec shape INTERPOLATED:\t', n_e.shape)
-print('N_nh shape INTERPOLATED:\t', n_h.shape)
-print('N_p shape INTERPOLATED:\t\t', n_p.shape)
+# print('N_nh shape INTERPOLATED:\t', n_h.shape)
+# print('N_p shape INTERPOLATED:\t\t', n_p.shape)
+print('Rho shape INTERPOLATED:\t\t', rho.shape)
+print('Press shape INTERPOLATED:\t\t', press.shape)
 print('#'*60+'\n')
 
 model_params = config['model']
@@ -101,15 +109,22 @@ model = EncodeProcessDecode(**model_params).to(device)
 print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
 # ---- Normalization ----
-features_labels = ['vel', 'b', 'temp', 'n_h', 'n_e', 'n_p']
-features_data = [vel, b_xyz, temp, n_h, n_e, n_p]
+features_labels = ['vel', 'b', 'temp', 'n_e',
+                #    'n_h', 'n_p']
+                   'rho', 'press']
+features_data = [vel, b_xyz, temp, n_e,
+                #  n_h,  n_p]
+                 rho, press]
 
 normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=normalization_type)
 pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
 
 features_list = normalized_features
 targets_list = [pops_normalized]
-features_labels_expanded = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'n_h', 'n_e', 'n_p', 'z_pos']
+features_labels_expanded = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'n_e', 
+                            # 'n_h', 'n_p',
+                            'rho', 'press',
+                            'z_pos']
 
 # ---- Create Datasets ----
 dataset_params = {
@@ -133,8 +148,26 @@ dataset_params = {
 datast_train = EfficientDataset(**dataset_params, split='train')
 datast_test = EfficientDataset(**dataset_params, split='test')
 
-loader_train = DataLoader(datast_train, batch_size=batch_size, shuffle=True)
-loader_test = DataLoader(datast_test, batch_size=batch_size, shuffle=False)
+# loader_train = DataLoader(datast_train, batch_size=batch_size, shuffle=True)
+# loader_test = DataLoader(datast_test, batch_size=batch_size, shuffle=False)
+
+num_workers = min(12, multiprocessing.cpu_count())
+loader_train = DataLoader(
+    datast_train, 
+    batch_size=batch_size, 
+    shuffle=True, 
+    num_workers=num_workers,
+    pin_memory=cuda_available, 
+    persistent_workers=True
+)
+loader_test = DataLoader(
+    datast_test, 
+    batch_size=batch_size, 
+    shuffle=False, 
+    num_workers=num_workers,
+    pin_memory=cuda_available,
+    persistent_workers=True
+)
 
 print('\n'+'#'*60)
 print("Model device:", next(model.parameters()).device)
@@ -147,7 +180,7 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(
     milestones=config['training']['milestones'],
     gamma=config['training']['gamma']
 )
-loss_fn = nn.MSELoss()
+loss_fn = nn.SmoothL1Loss(beta=1.0) # beta acts as the threshold between L1 and L2 behavior
 
 # ---- Initialize Training State Variables ----
 start_epoch = 1
@@ -194,6 +227,15 @@ if load_checkpoint:
             print(f"ERROR: Could not load checkpoint from {latest_checkpoint_path}: {e}. Starting from scratch.")
     else:
         print(f"INFO: No checkpoint found in '{savedir}'. Starting training from scratch.")
+else:
+    print("Checkpoint loading not enabled. Starting training from scratch.")
+    print(f"Saving runned code, checkpoint, and config to {savedir}")
+    # save a copy of the current code and config for reference
+    shutil.copy(f'{__file__}', os.path.join(savedir, f'gnn_train_{time.strftime(time_format)}.py'))
+    shutil.copy('conf.dat', os.path.join(savedir, f'conf_{time.strftime(time_format)}.dat'))
+    shutil.copy('Dataset.py', os.path.join(savedir, f'Dataset_{time.strftime(time_format)}.py'))
+    shutil.copy('normalization.py', os.path.join(savedir, f'normalization_{time.strftime(time_format)}.py'))
+    shutil.copy('graphnet.py', os.path.join(savedir, f'graphnet_{time.strftime(time_format)}.py'))
 
 # ---- Main Training Loop ----
 for epoch in range(start_epoch, n_epochs + 1):
@@ -259,6 +301,7 @@ for epoch in range(start_epoch, n_epochs + 1):
     plt.figure(figsize=(10, 7))
     plt.plot(train_loss, label='Training Loss')
     plt.plot(valid_loss, label='Validation Loss')
+    plt.yscale('log')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Training and Validation Loss')
@@ -269,6 +312,7 @@ for epoch in range(start_epoch, n_epochs + 1):
 
     plt.figure(figsize=(10, 7))
     plt.plot(lrs, label='Learning Rate')
+    # plt.yscale('log')
     plt.xlabel('Epoch')
     plt.ylabel('Learning Rate')
     plt.title('Learning Rate Schedule')

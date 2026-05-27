@@ -52,7 +52,8 @@ class GraphIndependent(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_size, n_hidden_layers, output_size, activation='relu', layernorm=False):
+    def __init__(self, input_size, hidden_size, n_hidden_layers, output_size,
+                 activation='relu', layernorm=False, dropout=None):
         """
         Generic MLP
 
@@ -70,6 +71,8 @@ class MLP(nn.Module):
             Activation function to be used in the neural network, by default 'relu' (for the moment only ReLU and LeakyReLU are allowed)
         layernorm : bool, optional
             Whether to add a LayerNorm layer at the end of the MLP, by default False
+        dropout:
+            Dropout to be added to the intermidiate layers of the MLP.
         """
         super(MLP, self).__init__()
 
@@ -90,6 +93,8 @@ class MLP(nn.Module):
         for i in range(n_hidden_layers-1):
             self.layers.append(nn.Linear(hidden_size, hidden_size))
             self.layers.append(self.activation)
+            if dropout:
+                self.layers.append(nn.Dropout(p=dropout))
 
         self.layers.append(nn.Linear(hidden_size, output_size))
         if (layernorm):
@@ -109,7 +114,8 @@ class MLP(nn.Module):
 
 class EdgeModel(torch.nn.Module):
     def __init__(self, node_latent_size, edge_latent_size, global_input_size,
-                 mlp_hidden_size, mlp_n_hidden_layers, latent_size, activation='relu', layernorm=True):
+                 mlp_hidden_size, mlp_n_hidden_layers, latent_size,
+                 activation='relu', layernorm=True, dropout=None):
         """
         Model that update the information in the edges of the graph. It uses a standard MLP to this end.
 
@@ -131,6 +137,8 @@ class EdgeModel(torch.nn.Module):
             Activaction function, by default 'relu'
         layernorm : bool, optional
             Whether to use LayerNorm, by default True
+        dropout : float, optional
+            Whether to use dropout for the MLP, and how much, default None
         """
         super(EdgeModel, self).__init__()
 
@@ -140,7 +148,8 @@ class EdgeModel(torch.nn.Module):
             mlp_n_hidden_layers,
             latent_size,
             activation=activation,
-            layernorm=layernorm)
+            layernorm=layernorm,
+            dropout=dropout)
 
     def forward(self, src, dest, edge_attr, u, batch):
         # src, dest: [E, F_x], where E is the number of edges.
@@ -153,7 +162,8 @@ class EdgeModel(torch.nn.Module):
 
 class NodeModel(torch.nn.Module):
     def __init__(self, node_latent_size, edge_latent_size, global_input_size,
-                 mlp_hidden_size, mlp_n_hidden_layers, latent_size, activation='relu', layernorm=True):
+                 mlp_hidden_size, mlp_n_hidden_layers, latent_size,
+                 activation='relu', layernorm=True, dropout=None):
         """
         Model that update the information in the edges of the graph. It uses a standard MLP to this end.
 
@@ -175,6 +185,8 @@ class NodeModel(torch.nn.Module):
             Activaction function, by default 'relu'
         layernorm : bool, optional
             Whether to use LayerNorm, by default True
+        dropout : float, optional
+            Whether to use dropout for the MLP, and how much, default None
         """
         super(NodeModel, self).__init__()
 
@@ -184,7 +196,8 @@ class NodeModel(torch.nn.Module):
             mlp_n_hidden_layers,
             latent_size,
             activation=activation,
-            layernorm=layernorm)
+            layernorm=layernorm,
+            dropout=dropout)
 
         self.node_mlp_2 = MLP(
             node_latent_size + latent_size + global_input_size,
@@ -192,7 +205,8 @@ class NodeModel(torch.nn.Module):
             mlp_n_hidden_layers,
             latent_size,
             activation=activation,
-            layernorm=layernorm)
+            layernorm=layernorm,
+            dropout=dropout)
 
     def forward(self, x, edge_index, edge_attr, u, batch):
         # x: [N, F_x], where N is the number of nodes.
@@ -209,8 +223,10 @@ class NodeModel(torch.nn.Module):
 
 
 class EncodeProcessDecode(nn.Module):
-    def __init__(self, node_input_size, edge_input_size, global_input_size, latent_size,
-                 mlp_hidden_size, mlp_n_hidden_layers, n_message_passing_steps, output_size):
+    def __init__(self, node_input_size, edge_input_size, global_input_size, 
+                 latent_size, mlp_hidden_size, mlp_n_hidden_layers,
+                 n_message_passing_steps,output_size,
+                 dropout=None):
         """
         Encode-Process-Decode Network (https://arxiv.org/abs/2010.03409)
 
@@ -243,6 +259,7 @@ class EncodeProcessDecode(nn.Module):
         self.mlp_n_hidden_layers = mlp_n_hidden_layers
         self.n_message_passing_steps = n_message_passing_steps
         self.output_size = output_size
+        self.dropout = dropout
 
         # ---------------------
         # ENCODER
@@ -290,7 +307,8 @@ class EncodeProcessDecode(nn.Module):
                 mlp_n_hidden_layers=self.mlp_n_hidden_layers,
                 latent_size=self.latent_size,
                 activation='elu',
-                layernorm=True)
+                layernorm=True,
+                dropout=self.dropout)
 
             node_model_fn = NodeModel(
                 node_latent_size=self.latent_size,
@@ -300,7 +318,8 @@ class EncodeProcessDecode(nn.Module):
                 mlp_n_hidden_layers=self.mlp_n_hidden_layers,
                 latent_size=self.latent_size,
                 activation='elu',
-                layernorm=True)
+                layernorm=True,
+                dropout=self.dropout)
 
             self.processor_network.append(
                 MetaLayer(edge_model_fn, node_model_fn, None))

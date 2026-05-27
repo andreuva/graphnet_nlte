@@ -24,9 +24,9 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.max_stride = max_stride
         self.random_stride = random_stride
 
-        # Store data as numpy arrays to keep them on CPU until needed
-        self.features = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_X], axis=1)
-        self.targets = np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_Y], axis=1)
+        # Convert everything directly to PyTorch tensors to avoid runtime conversions
+        self.features = torch.tensor(np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_X], axis=1), dtype=torch.float32)
+        self.targets = torch.tensor(np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_Y], axis=1), dtype=torch.float32)
 
         self.nz, self.ny, self.nx = list_X[0].shape[:-1]
 
@@ -45,7 +45,7 @@ class EfficientDataset(torch.utils.data.Dataset):
         xgrid, ygrid, zgrid = np.meshgrid(self.xx, self.yy, self.zz, indexing='xy')
         # We need to transpose to match the (z, y, x) structure of the data cubes
         xgrid, ygrid, zgrid = xgrid.T, ygrid.T, zgrid.T
-        self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float)
+        self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float32)
 
         # If fully connected, create the transform here
         if self.fully_connected:
@@ -65,49 +65,75 @@ class EfficientDataset(torch.utils.data.Dataset):
         y_threshold = int((self.ny - (ydim * self.max_stride)) * train_ratio) + (ydim * self.max_stride)
 
         if split == 'test':
+            self.x0, self.y0 = x_threshold, y_threshold
+            self.x1, self.y1 = self.nx - xdim * self.max_stride, self.ny - ydim * self.max_stride
             self.sample_centers = [(x, y) for x, y in all_indices if x >= x_threshold and y >= y_threshold]
         elif split == 'train':
+            self.x0, self.y0 = xdim * self.max_stride, ydim * self.max_stride
+            self.x1, self.y1 = x_threshold, y_threshold
             self.sample_centers = [(x, y) for x, y in all_indices if x < x_threshold or y < y_threshold]
         elif split == 'full':
-            x_threshold = xdim * self.max_stride
-            y_threshold = ydim * self.max_stride
+            self.x0, self.y0 = xdim * self.max_stride, ydim * self.max_stride
+            self.x1, self.y1 = self.nx - xdim * self.max_stride, self.ny - ydim * self.max_stride
             self.sample_centers = [(x, y) for x, y in all_indices]
         else:
             raise ValueError("split must be 'train' or 'test'")
 
+        # PRE-ALLOCATIONS to save CPU cycles
+        self.static_u = torch.zeros((1, 1), dtype=torch.float32)
+        self._precompute_graph_templates()
+
         print(f'Dataset.py:  {split.capitalize()} dataset created. Total samples: {len(self.sample_centers)}')
         print(f'Dataset.py:  Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
-        print(f'Dataset.py:  Region: x ∈ [{x_threshold}, {self.nx - xdim * self.max_stride}), y ∈ [{y_threshold}, {self.ny - ydim * self.max_stride})')
+        print(f'Dataset.py:  Region: x ∈ [{self.x0}, {self.x1}), y ∈ [{self.y0}, {self.y1})')
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
+        print(f'Dataset.py:  Using max stride: {self.max_stride}, Random stride: {self.random_stride}')
+
+    def _precompute_graph_templates(self):
+        """
+        Calculates all possible edge connections and flat index offsets ONCE.
+        This removes O(N^2) cdist calculations from the __getitem__ loop.
+        """
+        self.templates = {}
+        k_range = np.arange(self.nz)
+        
+        for xs in range(1, self.max_stride + 1):
+            for ys in range(1, self.max_stride + 1):
+                x_offs = np.arange(-self.xdim, self.xdim + 1) * xs
+                y_offs = np.arange(-self.ydim, self.ydim + 1) * ys
+                
+                kv, yv, xv = np.meshgrid(k_range, y_offs, x_offs, indexing='ij')
+                
+                # Precompute the relative flatten offset for 1D slicing
+                relative_flat = kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel()
+                
+                # Mock indices to calculate fixed graph topology
+                node_pos_mock = torch.tensor(np.stack([kv.ravel(), yv.ravel(), xv.ravel()], axis=1), dtype=torch.float32)
+                
+                central_mask = (yv.ravel() == 0) & (xv.ravel() == 0)
+                
+                if not self.fully_connected:
+                    r_eff = self.radius * (xs + ys) / 3
+                    dist_matrix = torch.cdist(node_pos_mock, node_pos_mock)
+                    edge_indices_tuple = torch.where((dist_matrix > 0) & (dist_matrix <= r_eff))
+                    edge_index = torch.stack(edge_indices_tuple, dim=0)
+                    
+                    central_nodes = torch.where(torch.tensor(central_mask))[0]
+                    if len(central_nodes) > 0:
+                        edge_mask = torch.isin(edge_index[0], central_nodes) | torch.isin(edge_index[1], central_nodes)
+                        edge_index = edge_index[:, edge_mask]
+                else:
+                    edge_index = None # Will be handled by RadiusGraph on the fly
+                    
+                self.templates[(xs, ys)] = {
+                    'relative_flat': torch.tensor(relative_flat, dtype=torch.long),
+                    'edge_index': edge_index,
+                    'central_mask': torch.tensor(central_mask, dtype=torch.bool),
+                    'relative_pos': node_pos_mock
+                }
 
     def __len__(self):
         return int(len(self.sample_centers)*self.epoch_size_fraction)
-
-    def grid_to_graph_manual(self, grid_points, values=None, targets=None, r=1.5, xpos=None, ypos=None):
-        if values is None:
-            values = grid_points
-        if targets is None:
-            targets = grid_points
-
-        dist_matrix = torch.cdist(grid_points, grid_points)
-        edge_indices_tuple = torch.where((dist_matrix > 0) & (dist_matrix <= r))
-        edge_index = torch.stack(edge_indices_tuple, dim=0)
-
-        graph_data = Data(x=values, pos=grid_points, y=targets, edge_index=edge_index)
-
-        if xpos is not None and ypos is not None:
-            central_nodes = torch.where(
-                (grid_points[:, 2] == xpos) & (grid_points[:, 1] == ypos)
-            )[0]
-
-            if len(central_nodes) > 0:
-                edge_mask = torch.from_numpy(
-                    np.isin(graph_data.edge_index[0, :], central_nodes) |
-                    np.isin(graph_data.edge_index[1, :], central_nodes)
-                )
-                graph_data.edge_index = graph_data.edge_index[:, edge_mask]
-
-        return graph_data
 
     def __getitem__(self, index):
         ix, iy = self.sample_centers[index]
@@ -120,58 +146,42 @@ class EfficientDataset(torch.utils.data.Dataset):
             x_stride = self.max_stride
             y_stride = self.max_stride
 
-        # Create offsets from the center, multiply by stride
-        x_offsets = np.arange(-self.xdim, self.xdim + 1) * x_stride
-        y_offsets = np.arange(-self.ydim, self.ydim + 1) * y_stride
+        # Fetch the precomputed topology template
+        template = self.templates[(x_stride, y_stride)]
+        
+        # Shift the precomputed flattened indices to the target absolute center
+        center_flat = iy * self.nx + ix
+        flat_indices = template['relative_flat'] + center_flat
 
-        # Create the new sparse ranges, ensuring they don't go out of bounds
-        x_range = np.clip(ix + x_offsets, 0, self.nx - 1)
-        y_range = np.clip(iy + y_offsets, 0, self.ny - 1)
+        # Direct tensor indexing (avoids data copies and from_numpy conversions)
+        node_features = self.features[flat_indices]
+        node_targets = self.targets[flat_indices]
 
-        k_range = np.arange(self.nz)
-
-        # Create a grid of coordinates for the sub-volume (as indices)
-        kv, yv, xv = np.meshgrid(k_range, y_range, x_range, indexing='ij')
-
-        # Flatten and stack to get node positions (indices), used for connectivity
-        node_pos_indices = torch.tensor(np.stack([kv.ravel(), yv.ravel(), xv.ravel()], axis=1), dtype=torch.float)
-        # Calculate flat indices from the coordinate grid to slice the full data arrays
-        flat_indices = (kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel())
-
-        # The mask is True for nodes where the (y, x) coordinates match the center (iy, ix)
-        central_mask = (node_pos_indices[:, 1] == iy) & (node_pos_indices[:, 2] == ix)
-
-        # Get physical positions, features, targets, and add z-position feature
         sub_physical_pos = self.grid_pos[flat_indices]
-
-        # Get the features and targets for this sub-grid
-        node_features = torch.tensor(self.features[flat_indices], dtype=torch.float)
-        node_targets = torch.tensor(self.targets[flat_indices], dtype=torch.float)
-
-        # self.grid_pos is (x, y, z), so z is at index 2
         z_coords = sub_physical_pos[:, 2].unsqueeze(1)
         node_features = torch.cat([node_features, z_coords], dim=1)
 
         if self.fully_connected:
-            data = Data(x=node_features, pos=node_pos_indices, y=node_targets)
+            node_pos_abs = template['relative_pos'] + torch.tensor([0.0, float(iy), float(ix)])
+            data = Data(x=node_features, pos=node_pos_abs, y=node_targets)
             graph_data = self.radius_transform(data)
         else:
-            graph_data = self.grid_to_graph_manual(
-                # node_pos_indices, node_features, node_targets, r=self.radius, xpos=ix, ypos=iy
-                node_pos_indices, node_features, node_targets, r=self.radius*(x_stride + y_stride)/3, xpos=ix, ypos=iy
+            edge_index = template['edge_index']
+            if edge_index.numel() > 0:
+                row, col = edge_index
+                edge_vectors = sub_physical_pos[row] - sub_physical_pos[col]
+                edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
+            else:
+                edge_attr = torch.empty((0, 1), dtype=torch.float32)
+
+            graph_data = Data(
+                x=node_features, 
+                edge_index=edge_index, 
+                edge_attr=edge_attr, 
+                y=node_targets
             )
 
-        graph_data.central_mask = central_mask
+        graph_data.central_mask = template['central_mask']
+        graph_data.u = self.static_u
 
-        # Calculate edge attributes using PHYSICAL distances
-        if graph_data.edge_index.numel() > 0:
-            row, col = graph_data.edge_index
-            # Calculate Euclidean distance based on physical positions
-            edge_vectors_physical = sub_physical_pos[row] - sub_physical_pos[col]
-            graph_data.edge_attr = edge_vectors_physical.norm(dim=1).unsqueeze(1)
-        else:
-            # Handle the case of no edges
-            graph_data.edge_attr = torch.empty((0, 1), dtype=torch.float)
-
-        graph_data.u = torch.zeros((1, 1), dtype=torch.float)
         return graph_data
