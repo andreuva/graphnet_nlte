@@ -343,6 +343,101 @@ def denormalize_features(normalized_features, labels, norm_params, type='log'):
     else:
         raise ValueError("Normalization type not implemented. Choose 'log' 'pow'.")
 
+# ===================================================================
+# PRE-COMPUTED PARAMETER NORMALIZATION (FOR PURE INFERENCE)
+# ===================================================================
+def normalize_features_log_with_params(features, labels, norm_params):
+    """
+    Normalize physical features using pre-computed log statistics.
+
+    Args:
+        features: List of feature arrays
+        labels: List of feature labels
+        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
+
+    Returns:
+        normalized: List of normalized feature arrays
+    """
+    means = norm_params['means']
+    stds = norm_params['stds']
+    scale_factors = norm_params['scale_factors']
+    log_offset = norm_params.get('log_offset', 1e-12)
+
+    normalized = []
+    for feature, label, mean, std, scale_factor in zip(features, labels, means, stds, scale_factors):
+        if feature.ndim == 3:
+            feature = feature[:, :, :, np.newaxis]
+        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis]
+        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
+
+        if 'vel' in label or 'b' in label:
+            normed = feature / (std_broadcast + log_offset)
+        elif 'n_' in label:
+            normed = np.log10(feature / (mean_broadcast + log_offset))
+        else:
+            normed = (feature - mean_broadcast) / (std_broadcast + log_offset)
+
+        normed_scaled = normed / scale_factor
+        normalized.append(normed_scaled)
+
+    return normalized
+
+def normalize_features_pow_with_params(features, labels, norm_params):
+    """
+    Normalize physical features using pre-computed pow statistics.
+
+    Args:
+        features: List of feature arrays
+        labels: List of feature labels
+        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
+
+    Returns:
+        normalized: List of normalized feature arrays
+    """
+    means = norm_params['means']
+    stds = norm_params['stds']
+    scale_factors = norm_params['scale_factors']
+
+    normalized = []
+    for feature, label, mean, std, scale_factor in zip(features, labels, means, stds, scale_factors):
+        if feature.ndim == 3:
+            feature = feature[:, :, :, np.newaxis]
+        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis]
+        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
+
+        if 'vel' in label or 'b' in label:
+            z = (feature - mean_broadcast) / std_broadcast
+            normed = np.sign(z) * np.abs(z)**(1 / scale_factor)
+        elif 'n_' in label:
+            normed = np.log10(feature / mean_broadcast) / scale_factor
+        else:
+            normed = np.log10(feature / mean_broadcast) / scale_factor
+
+        normalized.append(normed)
+
+    return normalized
+
+def normalize_features_with_params(features, labels, norm_params, type='log'):
+    """
+    Normalize features using pre-computed statistics from training.
+
+    Args:
+        features: List of feature arrays
+        labels: List of feature labels
+        norm_params: Pre-computed normalization parameters dictionary
+        type: Normalization type ('log' or 'pow')
+
+    Returns:
+        normalized: List of normalized feature arrays
+    """
+    print(f"Normalizing features with pre-computed parameters using {type}")
+    if type == 'log':
+        return normalize_features_log_with_params(features, labels, norm_params)
+    elif type == 'pow':
+        return normalize_features_pow_with_params(features, labels, norm_params)
+    else:
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
+
 def normalize_pops(pops, factor=4., log_offset=1e-12, type='log'):
     print(f"Nomalaizing populations with {type}")
     if type == 'log':
