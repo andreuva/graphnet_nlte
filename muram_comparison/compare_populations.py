@@ -81,6 +81,17 @@ print(f"   Keeping {len(zz_gnn_clipped)} GNN heights out of 50.")
 # Load GNN predictions
 pred_path = 'muram_predictions_stride_4_full.npy'
 if not os.path.exists(pred_path):
+    # Try parent directory
+    pred_path_parent = os.path.join('..', 'muram_predictions_stride_4_full.npy')
+    if os.path.exists(pred_path_parent):
+        pred_path = pred_path_parent
+    else:
+        # Try absolute path
+        pred_path_abs = '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy'
+        if os.path.exists(pred_path_abs):
+            pred_path = pred_path_abs
+
+if not os.path.exists(pred_path):
     print(f"Error: GNN predictions not found at {pred_path}")
     sys.exit(1)
 print(f"Loading GNN predictions from {pred_path}...")
@@ -174,8 +185,8 @@ for idx in selected_indices:
     h = zz_gnn_clipped[idx]
     print(f"   Plotting comparison maps at height: {h:.4f} Mm...")
     
-    fig, axes = plt.subplots(len(levels_to_compare), 2, figsize=(12, 14), dpi=150)
-    fig.suptitle(f"$z = {h:.4f}$ Mm\n(Left: GNN | Right: 1.5D NLTE)")
+    fig, axes = plt.subplots(len(levels_to_compare), 3, figsize=(18, 14), dpi=150)
+    fig.suptitle(f"$z = {h:.4f}$ Mm\n(Left: GNN | Middle: 1.5D NLTE | Right: Difference)", y=0.98)
     
     for row_idx, lvl in enumerate(levels_to_compare):
         g_slice = pred_aligned[:, :, lvl, idx]
@@ -196,15 +207,31 @@ for idx in selected_indices:
         ax_f = axes[row_idx, 1]
         im_f = ax_f.imshow(f_slice.T, origin='lower', cmap='magma', norm=colors.LogNorm(vmin=vmin, vmax=vmax))
         ax_f.set_title(f"1.5D NLTE - {levels_labels[lvl]}", fontsize=11)
-        # ax_f.set_xlabel("x pixel", fontsize=9)
-        # ax_f.set_ylabel("y pixel", fontsize=9)
+        ax_f.set_xlabel("x pixel", fontsize=9)
+        ax_f.set_ylabel("y pixel", fontsize=9)
         
-        # Add colorbar for each level row
-        cbar = fig.colorbar(im_f, ax=[ax_g, ax_f], location='right', pad=0.03, aspect=20)
-        cbar.set_label(r"Population density [$cm^{-3}$]", fontsize=10)
+        # Plot Difference slice: log10(GNN / 1.5D NLTE)
+        ax_d = axes[row_idx, 2]
+        diff_slice = np.log10(np.clip(g_slice, 1e-32, None)) - np.log10(np.clip(f_slice, 1e-32, None))
         
-    # plt.subplots_adjust(hspace=0.25, wspace=0.15)
-    # plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # leave room for suptitle
+        # Find symmetric color scale based on 99th percentile of absolute differences
+        vlim = max(0.1, np.percentile(np.abs(diff_slice), 99))
+        im_d = ax_d.imshow(diff_slice.T, origin='lower', cmap='RdBu_r', vmin=-vlim, vmax=vlim)
+        ax_d.set_title(f"Difference (dex) - {levels_labels[lvl]}", fontsize=11)
+        ax_d.set_xlabel("x pixel", fontsize=9)
+        ax_d.set_ylabel("y pixel", fontsize=9)
+        
+        # Add colorbar for each subplot to keep spacing perfectly consistent and symmetric
+        cbar_g = fig.colorbar(im_g, ax=ax_g, fraction=0.046, pad=0.04)
+        cbar_g.set_label(r"Population density [$cm^{-3}$]", fontsize=9)
+        
+        cbar_f = fig.colorbar(im_f, ax=ax_f, fraction=0.046, pad=0.04)
+        cbar_f.set_label(r"Population density [$cm^{-3}$]", fontsize=9)
+        
+        cbar_d = fig.colorbar(im_d, ax=ax_d, fraction=0.046, pad=0.04)
+        cbar_d.set_label(r"$\log_{10}(\mathrm{GNN} / \mathrm{NLTE})$ [dex]", fontsize=9)
+        
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # leave room for suptitle
     save_plot_path = os.path.join(plot_dir, f"population_comparison_z_{h:.2f}Mm.png")
     plt.savefig(save_plot_path, bbox_inches='tight', dpi=200)
     plt.close()
