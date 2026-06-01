@@ -3,7 +3,10 @@
 
 import numpy as np
 import os
+import sys
 import matplotlib.pyplot as plt
+import scipy.interpolate as interp
+from astropy.io import fits
 import muram as mio
 
 # Configure matplotlib for premium, publication-quality plots
@@ -265,6 +268,197 @@ def main():
     plt.close()
     print(f"\nSuccessfully generated and saved comparison plot to: {plot_save_path}")
     print("==================================================================")
+
+    # ===================================================================
+    # 4. POPULATION STRATIFICATION
+    # ===================================================================
+    plot_population_stratification(
+        bifrost_z_grid=bifrost_z_grid,
+        muram_z_grid=muram_z_grid,
+        nx_b=nx_b, ny_b=ny_b, nz_b=nz_b,
+        datadir_bifrost=datadir_bifrost,
+    )
+
+
+def plot_population_stratification(bifrost_z_grid, muram_z_grid,
+                                   nx_b, ny_b, nz_b, datadir_bifrost):
+    """
+    Plot the mean height stratification of Ca II level populations for:
+      - Bifrost original NLTE populations (training data)
+      - GNN predicted populations (on the interpolated MURaM grid)
+      - MURaM 1.5D NLTE populations (from FITS file)
+
+    Each dataset lives on its own native height grid, so no cross-interpolation
+    is performed — they are all overplotted together for a direct visual
+    comparison of the mean horizontal-average profiles.
+    """
+    print("\n" + "="*68)
+    print("SECTION 4: Level Population Height Stratification")
+    print("="*68)
+
+    nlev = 6  # Ca II 5-level + ion (6 populations)
+    level_labels = [
+        "Ca II Ground (lvl 0)",
+        "Ca II 1st excited (lvl 1)",
+        "Ca II 2nd excited (lvl 2)",
+        "Ca II Metastable (lvl 3)",
+        "Ca II 4th excited (lvl 4)",
+        "Ca III Ion (lvl 5)",
+    ]
+
+    # ------------------------------------------------------------------
+    # A. BIFROST populations  shape: (nz_b, ny_b, nx_b, nlev)
+    #    Native grid: bifrost_z_grid  (nz_b,)
+    # ------------------------------------------------------------------
+    print("\n--- Loading Bifrost populations ---")
+    pops_b_path = f'{datadir_bifrost}/AR_385_CaII_5L_pops.dat'
+    if not os.path.exists(pops_b_path):
+        print(f"  ERROR: Bifrost populations file not found: {pops_b_path}")
+        sys.exit(1)
+    pops_b = np.memmap(pops_b_path, dtype='<f4', mode='r',
+                       shape=(nz_b, ny_b, nx_b, nlev))
+    # Mean over horizontal axes (1, 2) -> shape (nz_b, nlev)
+    print("  Computing Bifrost mean population profiles...")
+    mean_pops_bifrost = np.mean(pops_b, axis=(1, 2))  # (nz_b, nlev)
+    print(f"  Bifrost mean pops shape: {mean_pops_bifrost.shape}")
+
+    # ------------------------------------------------------------------
+    # B. MURaM 1.5D NLTE populations  (FITS file)
+    #    FITS shape in Python: (1024, 1024, nlev, 401) = (x, y, level, z)
+    #    Native grid: muram_z_grid[15:416]  (401,)
+    # ------------------------------------------------------------------
+    print("\n--- Loading MURaM 1.5D NLTE populations from FITS ---")
+    fits_path = "/dat/milic/MURaM_enhanced_network/che_full_499000_lwsynth_200.0.fits"
+    if not os.path.exists(fits_path):
+        print(f"  ERROR: FITS file not found: {fits_path}")
+        sys.exit(1)
+
+    fits_heights = muram_z_grid[15:416]  # shape (401,)
+
+    print("  Memory-mapping FITS file and cropping horizontal domain...")
+    with fits.open(fits_path, memmap=True) as hdul:
+        # hdul[2].data shape: (1024, 1024, nlev, 401)
+        fits_cropped = hdul[2].data[16:-16, 16:-16, :, :]  # (992, 992, nlev, 401)
+
+    # Reverse vertical axis so height increases from photosphere to chromosphere
+    fits_cropped = fits_cropped[..., ::-1]  # still (992, 992, nlev, 401)
+
+    # Unit conversion: FITS is in m^-3 (SI); convert to cm^-3 (CGS) to match Bifrost
+    print("  Converting FITS populations from SI to CGS (m^-3 -> cm^-3)...")
+    fits_cropped = fits_cropped * 1e-6  # (992, 992, nlev, 401)
+
+    # Mean over horizontal axes (0, 1) -> shape (nlev, 401)
+    print("  Computing MURaM mean population profiles...")
+    mean_pops_muram = np.mean(fits_cropped, axis=(0, 1))  # (nlev, 401)
+    print(f"  MURaM mean pops shape: {mean_pops_muram.shape}")
+
+    # ------------------------------------------------------------------
+    # C. GNN predicted populations  shape: (50, 992, 992, nlev)
+    #    Native grid: zz_grid_muram  (50,) -- subset clipped to FITS range
+    # ------------------------------------------------------------------
+    print("\n--- Loading GNN predictions ---")
+    # Re-build the interpolated GNN height grid (same logic as compare_populations.py)
+    nz_b_orig = nz_b
+    logspace_fraction = 0.33
+    nz_linear = 30
+    nz_log = 20
+
+    z_b_idx = np.arange(nz_b_orig)
+    new_z_b_log = np.concatenate([
+        np.linspace(0, nz_b_orig * logspace_fraction, nz_linear, endpoint=False),
+        np.logspace(np.log10(nz_b_orig * logspace_fraction),
+                    np.log10(nz_b_orig - 1), nz_log)
+    ])
+    new_z_b = np.clip(new_z_b_log, 0, nz_b_orig - 1)
+    zz_grid_bifrost_interp = np.interp(new_z_b, z_b_idx, bifrost_z_grid)
+
+    # Map to MURaM height coordinate
+    nz_m = len(muram_z_grid)
+    z_m_idx = np.arange(nz_m)
+    new_z_m = np.interp(zz_grid_bifrost_interp, muram_z_grid, z_m_idx)
+    new_z_m = np.clip(new_z_m, 0, nz_m - 1)
+    zz_grid_muram_interp = np.interp(new_z_m, z_m_idx, muram_z_grid)  # (50,)
+
+    # Clip to the FITS vertical range
+    valid_mask = ((zz_grid_muram_interp >= fits_heights.min()) &
+                  (zz_grid_muram_interp <= fits_heights.max()))
+    zz_gnn_clipped = zz_grid_muram_interp[valid_mask]  # subset of 50 heights
+
+    pred_path_candidates = [
+        'muram_predictions_stride_4_full.npy',
+        '../muram_predictions_stride_4_full.npy',
+        '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy',
+    ]
+    pred_path = None
+    for p in pred_path_candidates:
+        if os.path.exists(p):
+            pred_path = p
+            break
+    if pred_path is None:
+        print("  ERROR: GNN predictions file not found.")
+        sys.exit(1)
+
+    print(f"  Loading GNN predictions from: {pred_path}")
+    pred = np.load(pred_path)   # shape (50, 992, 992, nlev)  in cm^-3
+
+    # Clip to valid heights
+    pred_cgs_clipped = pred[valid_mask, :, :, :]  # (n_valid, 992, 992, nlev)
+
+    # Mean over horizontal axes (1, 2) -> shape (n_valid, nlev)
+    print("  Computing GNN mean population profiles...")
+    mean_pops_gnn = np.mean(pred_cgs_clipped, axis=(1, 2))  # (n_valid, nlev)
+    print(f"  GNN mean pops shape: {mean_pops_gnn.shape}")
+
+    # ------------------------------------------------------------------
+    # D. PLOT
+    # ------------------------------------------------------------------
+    print("\n--- Generating population stratification plots ---")
+
+    color_b   = '#1f77b4'   # Royal blue  -- Bifrost
+    color_g   = '#2ca02c'   # Forest green -- GNN
+    color_m   = '#d62728'   # Crimson      -- MURaM NLTE
+
+    ncols = 3
+    nrows = 2  # 6 levels -> 2x3 grid
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 10), dpi=150)
+    fig.suptitle(
+        "Mean Level Population Height Stratification\n"
+        "Ca\u202fII 5-level + ion (horizontal averages over x-y planes)",
+        fontsize=16, y=0.99
+    )
+
+    for lvl in range(nlev):
+        row, col = divmod(lvl, ncols)
+        ax = axes[row, col]
+
+        # --- Bifrost (full original grid, all 425 heights) ---
+        ax.plot(bifrost_z_grid, mean_pops_bifrost[:, lvl],
+                label='Bifrost', color=color_b, linewidth=2.0, zorder=3)
+
+        # --- MURaM 1.5D NLTE (401 heights in the FITS range) ---
+        ax.plot(fits_heights, mean_pops_muram[lvl, :],
+                label='MURaM NLTE', color=color_m, linewidth=2.0, zorder=2)
+
+        # --- GNN predicted (50 heights, clipped to FITS range) ---
+        ax.plot(zz_gnn_clipped, mean_pops_gnn[:, lvl],
+                label='GNN predicted', color=color_g,
+                linewidth=2.0, linestyle='--', zorder=4)
+
+        ax.set_yscale('log')
+        ax.set_xlabel("Height $z$ [Mm]")
+        ax.set_ylabel("Population density [cm$^{-3}$]")
+        ax.set_title(level_labels[lvl])
+        ax.axvline(0, color='gray', linestyle=':', alpha=0.6, linewidth=1.2)
+        ax.grid(True, which='both', alpha=0.25, linestyle='--')
+        ax.legend(fontsize=9)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    pop_plot_path = 'compare_population_stratification.png'
+    plt.savefig(pop_plot_path, dpi=300)
+    plt.close()
+    print(f"\nSuccessfully saved population stratification plot to: {pop_plot_path}")
+    print("="*68 + "\n")
+
 
 if __name__ == "__main__":
     main()
