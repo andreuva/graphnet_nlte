@@ -3,6 +3,8 @@ import numpy as np
 import torch, os
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from scipy.interpolate import interpn
@@ -29,14 +31,20 @@ plt.rcParams.update({
 # %%
 # Check if CUDA is available and set the device
 # Set device
-gpu = 0
+gpu = 1
 cuda_available = torch.cuda.is_available()
 device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}\n")
 
 # %%
 # The ONLY parameter you need to set manually is the path to the checkpoint.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+from glob import glob
+import os
+checkpoint_dir = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/beta_train/'
+checkpoint_files = glob(os.path.join(checkpoint_dir, '*_best.pth'))
+if not checkpoint_files:
+    raise ValueError(f"No checkpoint files found in {checkpoint_dir}")
+checkpoint_path = max(checkpoint_files, key=os.path.getctime)
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -58,7 +66,12 @@ print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
 # %%
 # ---- memory–mapped arrays ----
-pops_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
+if normalization_type == 'beta':
+    print("Loading Departure Coefficients (beta) as GNN target variables...")
+    pops_orig = np.load(f'{datadir}/AR_385_CaII_5L_beta.npy', mmap_mode='r')
+    pops_nlte_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
+else:
+    pops_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
 b_xyz_orig = np.memmap(f'{datadir}/AR_385_B.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 temp_orig = np.memmap(f'{datadir}/AR_385_temp.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 vel_orig = np.memmap(f'{datadir}/AR_385_veloc.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
@@ -101,6 +114,11 @@ plt.close()
 print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
 new_points = (new_zv, new_yv, new_xv)
 pops = interpn((z, y, x), pops_orig, new_points)
+if normalization_type == 'beta':
+    pops_nlte = interpn((z, y, x), pops_nlte_orig, new_points)
+    pops_lte = pops_nlte / (pops + 1e-30)
+else:
+    pops_lte = None
 temp = interpn((z, y, x), temp_orig, new_points)
 b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
 vel = interpn((z, y, x), vel_orig, new_points)
@@ -117,6 +135,9 @@ print(f"New shape: {pops.shape}")
 # IMPORTANT: Use the normalization parameters saved from the training run
 feature_norm_params = checkpoint['feature_norm_params']
 pop_norm_params = checkpoint['normalization_params']
+if 'pops_lte' not in pop_norm_params and pops_lte is not None:
+    print("pops_lte not found in checkpoint pop_norm_params. Injecting computed pops_lte.")
+    pop_norm_params['pops_lte'] = pops_lte
 
 features_labels = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'ne',
                 #    'n_h', 'n_p']
@@ -131,7 +152,8 @@ features_data = [vel, b_xyz, temp, n_e,
 # We need to re-run the normalization to get the features for the dataset
 # Note: For a true inference-only script, you would apply the saved means/stds,
 # but since we're using the full dataset here, re-calculating is equivalent.
-normalized_features, _ = normalize_features(features_data, features_labels_simple, log_offset, normalization_type)
+feature_norm_type = 'log' if normalization_type == 'beta' else normalization_type
+normalized_features, _ = normalize_features(features_data, features_labels_simple, log_offset, feature_norm_type)
 pops_normalized, _ = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
 
 # ---- Create Test Dataset ----
@@ -149,13 +171,16 @@ dataset_params = {
     'nz_linear': config['dataset']['nz_linear'],
     'nz_log': config['dataset']['nz_log'],
     'logspace_fraction': config['dataset']['logspace_fraction'],
-    'epoch_size_fraction': 1.0,  # Use full dataset for testing
-    'max_stride': 5, # config["dataset"].get("max_stride", 2),
+    'epoch_size_fraction': 1.0,  # Use full dataset for testing/evaluation
+    'max_stride': 4, # config["dataset"].get("max_stride", 2),
     'random_stride': False, #config["dataset"].get("random_stride", False),
     'split': 'full'
 }
 
 datast_test = EfficientDataset(**dataset_params)
+# test_x_min, test_y_min = datast_test.x0, datast_test.y0
+# datast_test.sample_centers = [(x, y) for x, y in datast_test.sample_centers if x < test_x_min + 4 and y < test_y_min + 4]
+# print(f"Reduced test sample centers to: {datast_test.sample_centers}")
 # loader_test = DataLoader(datast_test, batch_size=config['training']['batch_size']*6, shuffle=False)
 
 num_workers = min(12, multiprocessing.cpu_count())
@@ -286,7 +311,10 @@ k_indices_flat = np.concatenate(k_indices_central_flat, axis=0)
 
 # %%
 predictions_spatial.shape
-pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.x0:datast_test.x1, datast_test.y0:datast_test.y1]
+if 'totals' in pop_norm_params:
+    pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1]
+if 'pops_lte' in pop_norm_params:
+    pop_norm_params['pops_lte'] = pop_norm_params['pops_lte'][:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1, :]
 
 # %%
 # --- Denormalized Analysis ---
@@ -324,8 +352,8 @@ print(f"predictions_denorm.shape: {predictions_denorm.shape}, targets_denorm.sha
 
 # %%
 # Save both populations for further synthesis
-np.save(f'{config['training']['savedir']}predictions_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy', predictions_denorm)
-np.save(f'{config['training']['savedir']}targets_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy', targets_denorm)
+np.save(f"{config['training']['savedir']}predictions_patch_stride_{dataset_params['max_stride']}_{dataset_params['split']}.npy", predictions_denorm)
+np.save(f"{config['training']['savedir']}targets_patch_stride_{dataset_params['max_stride']}_{dataset_params['split']}.npy", targets_denorm)
 
 # %%
 # 1. Configuration
@@ -688,14 +716,15 @@ for i in range(nlev):
     if i == nlev-1: ax3.set_xlabel('Population', fontsize=14)
     
     ax3.set_xscale('log')
+    ax3.set_yscale('log')
     ax3.grid(True, linestyle='--', alpha=0.5)
 
     # --- COMPACT FORMATTING FOR COLUMN 3 ---
     # Force scientific notation for large numbers (10000 -> 1e4)
-    # Note: If yscale was 'log', this is handled differently, but for linear y-scale:
-    ax3.ticklabel_format(axis='y', style='sci', scilimits=(0,0), useMathText=True)
-    # Limit number of ticks to keep it compact
-    ax3.locator_params(axis='y', nbins=5)
+    # Only if yscale is not log
+    if ax3.get_yscale() != 'log':
+        ax3.ticklabel_format(axis='y', style='sci', scilimits=(0,0), useMathText=True)
+        ax3.locator_params(axis='y', nbins=5)
     # ---------------------------------------
 
 plt.tight_layout()

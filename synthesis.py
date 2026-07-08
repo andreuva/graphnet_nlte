@@ -12,13 +12,21 @@ import numpy as np
 from scipy.interpolate import interpn, interp1d
 import os, time
 import torch
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from joblib import Parallel, delayed
 
 # %%
 # Load the saved predictions and targets from the GNN inference step.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+from glob import glob
+import os
+checkpoint_dir = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/beta_train/'
+checkpoint_files = glob(os.path.join(checkpoint_dir, '*_best.pth'))
+if not checkpoint_files:
+    raise ValueError(f"No checkpoint files found in {checkpoint_dir}")
+checkpoint_path = max(checkpoint_files, key=os.path.getctime)
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -39,12 +47,17 @@ print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
 # %%
 # Load the saved predictions and targets from the GNN inference step.
-stride = 3
-dataset_type = 'full'
-predictions_denorm = np.load(f'{config['training']['savedir']}predictions_patch_stride_{stride}_{dataset_type}.npy')
-targets_denorm = np.load(f'{config['training']['savedir']}targets_patch_stride_{stride}_{dataset_type}.npy')
+stride = 4
+dataset_type = "full"
+predictions_denorm = np.load(f"{config['training']['savedir']}predictions_patch_stride_{stride}_{dataset_type}.npy")
+targets_denorm = np.load(f"{config['training']['savedir']}targets_patch_stride_{stride}_{dataset_type}.npy")
 
 _, ny_patch, nx_patch, _ = predictions_denorm.shape
+
+# Check if the loaded files are departure coefficients (beta) instead of populations
+is_beta = (normalization_type == 'beta' and np.mean(targets_denorm[0, :, :, :]) < 1e5)
+if is_beta:
+    print("Detected departure coefficients (beta) in loaded files. Reconstructing populations on the fly...")
 
 print(f"Predictions shape: {predictions_denorm.shape}")
 print(f"Targets shape: {targets_denorm.shape}")
@@ -62,11 +75,13 @@ new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=
 # %%
 # ---- memory–mapped arrays ----
 pops_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
+if normalization_type == 'beta':
+    beta_orig = np.load(f'{datadir}/AR_385_CaII_5L_beta.npy', mmap_mode='r')
 b_xyz_orig = np.memmap(f'{datadir}/AR_385_B.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 temp_orig = np.memmap(f'{datadir}/AR_385_temp.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 vel_orig = np.memmap(f'{datadir}/AR_385_veloc.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 n_e_orig = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-# n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 # n_p_orig = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 rho_orig = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 press_orig = np.memmap(f'{datadir}/AR_385_press.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
@@ -89,11 +104,16 @@ print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
 
 new_points = (new_zv, new_yv, new_xv)
 pops = interpn((z, y, x), pops_orig, new_points)
+if normalization_type == 'beta':
+    pops_beta = interpn((z, y, x), beta_orig, new_points)
+    pops_lte = pops / (pops_beta + 1e-30)
+else:
+    pops_lte = None
 temp = interpn((z, y, x), temp_orig, new_points)
 b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
 vel = interpn((z, y, x), vel_orig, new_points)
 n_e = interpn((z, y, x), n_e_orig, new_points)
-# n_h = interpn((z, y, x), n_h_orig, new_points)
+n_h = interpn((z, y, x), n_h_orig, new_points)
 # n_p = interpn((z, y, x), n_p_orig, new_points)
 rho = interpn((z, y, x), rho_orig, new_points)
 press = interpn((z, y, x), press_orig, new_points)
@@ -137,7 +157,8 @@ def process_single_row(row_idx, ny_patch,
                       # pops, 
                        predictions_denorm, targets_denorm,
                       #  new_z,
-                       zz_grid_m, wave):
+                       zz_grid_m, wave, normalization_type,
+                       pops_lte=None, is_beta=False):
     
     # Pre-allocate arrays for this specific row to store results
     # Shape: (ny_patch, nwave)
@@ -163,6 +184,10 @@ def process_single_row(row_idx, ny_patch,
         
         prediction_atm = np.ascontiguousarray(predictions_denorm[-1:1:-1, col_pix, row_idx, :])*1e6
         target_atm = np.ascontiguousarray(targets_denorm[-1:1:-1, col_pix, row_idx, :])*1e6
+        if is_beta and pops_lte is not None:
+            pops_lte_slice = np.ascontiguousarray(pops_lte[-1:1:-1, col_pix, row_idx, :])
+            prediction_atm = prediction_atm * pops_lte_slice
+            target_atm = target_atm * pops_lte_slice
 
         # --- 3. Lightweaver Setup (Pre/LTE) ---
         atmos_pre = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
@@ -217,13 +242,16 @@ def process_single_row(row_idx, ny_patch,
         spect = aSet.compute_wavelength_grid()
         eqPops = aSet.compute_eq_pops(atmos)
 
+        pred_pop = np.ascontiguousarray(np.moveaxis(prediction_atm, 1, 0))
+        targ_pop = np.ascontiguousarray(np.moveaxis(target_atm, 1, 0))
+
         # Target Populations
-        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(prediction_atm, 1, 0))
+        eqPops.atomicPops['Ca'].n = targ_pop
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
         row_target[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
 
         # Predicted Populations
-        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(target_atm, 1, 0))
+        eqPops.atomicPops['Ca'].n = pred_pop
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
         row_pred[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
 
@@ -255,7 +283,8 @@ results = Parallel(n_jobs=100, verbose=5)(
         # pops, 
         predictions_denorm, targets_denorm,
         # new_z,
-        zz_grid_m, wave
+        zz_grid_m, wave, normalization_type,
+        pops_lte, is_beta
     ) for row in range(nx_patch)
 )
 
@@ -289,8 +318,8 @@ np.save(f'{config["training"]["savedir"]}Iwave_predicted_stride_{stride}_{datase
 # %%
 # plot the atmosRef and atmos_pre stratification in all the quantities to compare
 # 1. Select a pixel to compare (e.g., the center of the patch)
-r_idx = 75
-c_idx = 175
+r_idx = min(2, nx_patch - 1)
+c_idx = min(2, ny_patch - 1)
 
 print(f"Plotting comparison for pixel coordinates: ({r_idx}, {c_idx})")
 
@@ -298,7 +327,7 @@ print(f"Plotting comparison for pixel coordinates: ({r_idx}, {c_idx})")
 # Note: applying the [-1:1:-1] slicing as done in the loop
 temp_atm_slice = np.ascontiguousarray(temp[-1:1:-1, c_idx, r_idx, 0]) 
 vel_atm_slice = np.ascontiguousarray(vel[-1:1:-1, c_idx, r_idx, 2])/1e2 
-# n_e_atm_slice = np.ascontiguousarray(n_e[-1:1:-1, c_idx, r_idx, 0])*1e6 
+# n_e_atm_slice = np.ascontiguousarray(n_e[-1:1:-1, c_idx, r_idx, 0])*1e6
 # n_h_atm_slice = np.ascontiguousarray(n_h[-1:1:-1, c_idx, r_idx, 0])*1e6
 rho = np.ascontiguousarray(rho[-1:1:-1, c_idx, r_idx, 0])
 press = np.ascontiguousarray(press[-1:1:-1, c_idx, r_idx, 0])
@@ -760,10 +789,16 @@ ax2 = fig.add_subplot(gs[1, 0])
 
 # Flatten the relative error array to get global statistics
 flat_rel_error = rel_error.flatten()
+# Filter out non-finite values (NaN and Inf)
+flat_rel_error = flat_rel_error[np.isfinite(flat_rel_error)]
+if len(flat_rel_error) == 0:
+    flat_rel_error = np.array([0.0])
 
 # Remove extreme outliers for the histogram visualization (plotting range only)
 # We keep the data, just clip the view
 viz_range = np.percentile(flat_rel_error, [0.5, 99.5])
+if not np.all(np.isfinite(viz_range)) or viz_range[0] == viz_range[1]:
+    viz_range = (-1.0, 1.0)
 
 bins = 100
 n, bins, patches = ax2.hist(flat_rel_error, bins=bins, range=viz_range, 
@@ -785,7 +820,10 @@ ax2.set_ylabel('Probability Density', fontsize=16)
 ax3 = fig.add_subplot(gs[1, 1])
 
 # Use a colormap that highlights high error (Reds or Magma)
-im3 = ax3.imshow(mape_map.T, origin='lower', cmap='inferno', vmin=0, vmax=np.percentile(mape_map, 98), aspect='auto')
+mape_vmax = np.nanpercentile(mape_map, 98) if np.any(np.isfinite(mape_map)) else 1.0
+if not np.isfinite(mape_vmax) or mape_vmax <= 0:
+    mape_vmax = 1.0
+im3 = ax3.imshow(mape_map.T, origin='lower', cmap='inferno', vmin=0, vmax=mape_vmax, aspect='auto')
 
 # ax3.set_title('Spatial Map of Mean Absolute Percentage Error (MAPE)')
 ax3.set_xlabel('pixel', fontsize=16)
@@ -866,8 +904,15 @@ ax1.legend(lines + lines2, labels + labels2, loc='upper right', framealpha=0.9)
 ax2 = fig.add_subplot(gs[1, 0])
 
 flat_rel_error = rel_error.flatten()
+# Filter out non-finite values (NaN and Inf)
+flat_rel_error = flat_rel_error[np.isfinite(flat_rel_error)]
+if len(flat_rel_error) == 0:
+    flat_rel_error = np.array([0.0])
+
 # Range for visualization (clip extreme outliers just for the plot view)
 viz_range = np.percentile(flat_rel_error, [0.1, 99.9])
+if not np.all(np.isfinite(viz_range)) or viz_range[0] == viz_range[1]:
+    viz_range = (-1.0, 1.0)
 
 # Histogram
 bins = 100
@@ -883,8 +928,11 @@ ax2.axvline(0, color='black', linestyle='--', linewidth=1) # Zero reference
 ax3 = fig.add_subplot(gs[1, 1])
 
 # Plotting the transpose to match previous map orientation
+mape_vmax = np.nanpercentile(mape_map, 98) if np.any(np.isfinite(mape_map)) else 1.0
+if not np.isfinite(mape_vmax) or mape_vmax <= 0:
+    mape_vmax = 1.0
 im3 = ax3.imshow(mape_map.T, origin='lower', cmap='inferno', 
-                 vmin=0, vmax=np.percentile(mape_map, 98), aspect='auto')
+                 vmin=0, vmax=mape_vmax, aspect='auto')
 
 ax3.set_title('Spatial Map of MAPE', fontsize=14)
 ax3.set_xlabel('x pixel', fontsize=14)

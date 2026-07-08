@@ -438,20 +438,106 @@ def normalize_features_with_params(features, labels, norm_params, type='log'):
     else:
         raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
 
-def normalize_pops(pops, factor=4., log_offset=1e-12, type='log'):
-    print(f"Nomalaizing populations with {type}")
+def normalize_dep_coeffs(beta, pops_lte=None, log_offset=1e-12):
+    """
+    Normalize departure coefficients using log10, height-stratified mean/std,
+    and scale to [-1, 1].
+
+    Args:
+        beta: Departure coefficient array of shape (nz, ny, nx, nlev)
+        pops_lte: Optional LTE population array of shape (nz, ny, nx, nlev)
+        log_offset: Small value to avoid log(0) (default: 1e-12)
+
+    Returns:
+        normalized_beta: Normalized departure coefficients
+        norm_params: Dictionary with normalization parameters for denormalization
+    """
+    y = np.log10(beta + log_offset)
+    # mean and std over spatial dimensions (axes 1 and 2)
+    mean_y = np.mean(y, axis=(1, 2))
+    std_y = np.std(y, axis=(1, 2))
+
+    mean_broadcast = mean_y[:, np.newaxis, np.newaxis, :]
+    std_broadcast = std_y[:, np.newaxis, np.newaxis, :]
+
+    normed = (y - mean_broadcast) / (std_broadcast + 1e-12)
+    # max_abs_value = np.max(np.abs(normed))
+    # scale_factor = max_abs_value if max_abs_value > 0 else 1.0
+    # Scale such that the standard deviation of the normalized values is exactly 0.1
+    # to increase sensitivity in the center and avoid outlier compression.
+    scale_factor = 10.0
+
+    normalized_beta = normed / scale_factor
+
+    norm_params = {
+        'means': mean_y,
+        'stds': std_y,
+        'scale_factor': scale_factor,
+        'log_offset': log_offset
+    }
+
+    if pops_lte is not None:
+        norm_params['pops_lte'] = pops_lte
+
+    return normalized_beta, norm_params
+
+def denormalize_dep_coeffs(normalized_beta, norm_params):
+    """
+    Denormalize departure coefficients back to original space.
+
+    Args:
+        normalized_beta: Normalized departure coefficient array
+        norm_params: Dictionary with 'means', 'stds', 'scale_factor', and 'log_offset'
+
+    Returns:
+        beta: Original departure coefficients
+    """
+    mean_y = norm_params['means']
+    std_y = norm_params['stds']
+    scale_factor = norm_params['scale_factor']
+    log_offset = norm_params['log_offset']
+
+    mean_broadcast = mean_y[:, np.newaxis, np.newaxis, :]
+    std_broadcast = std_y[:, np.newaxis, np.newaxis, :]
+
+    normed = normalized_beta * scale_factor
+    y = normed * (std_broadcast + 1e-12) + mean_broadcast
+    beta = 10**y - log_offset
+
+    return beta
+
+def normalize_pops(pops, factor=4., log_offset=1e-12, type='log', pops_lte=None):
+    print(f"Normalizing populations with {type}")
     if type == 'log':
         return normalize_pops_log(pops, factor, log_offset)
     elif type == 'pow':
         return normalize_pops_pow(pops, factor, log_offset)
+    elif type == 'beta':
+        return normalize_dep_coeffs(pops, pops_lte, log_offset)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow', 'beta'.")
 
-def denormalize_pops(normalized_pops, norm_params, type='log'):
-    print(f"Denomalaizing populations with {type}")
+def denormalize_pops(normalized_pops, norm_params, type=None):
+    if type is None:
+        if 'scale_factor' in norm_params:
+            type = 'beta'
+        elif 'means' in norm_params:
+            type = 'log'
+        else:
+            type = 'pow'
+            
+    print(f"Denormalizing populations with detected/specified type: {type}")
     if type == 'log':
         return denormalize_pops_log(normalized_pops, norm_params)
     elif type == 'pow':
         return denormalize_pops_pow(normalized_pops, norm_params)
+    elif type == 'beta':
+        beta = denormalize_dep_coeffs(normalized_pops, norm_params)
+        if 'pops_lte' in norm_params:
+            print("pops_lte found in norm_params. Reconstructing NLTE populations...")
+            return beta * norm_params['pops_lte']
+        else:
+            return beta
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow', 'beta'.")
+

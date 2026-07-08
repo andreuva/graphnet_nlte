@@ -9,6 +9,8 @@ from graphnet import *
 from configobj import ConfigObj
 from Dataset import *
 from normalization import normalize_pops, denormalize_pops, normalize_features, denormalize_features
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os, time, shutil
 from datetime import datetime
@@ -48,7 +50,12 @@ log_offset = config['normalization']['log_offset']
 normalization_type = config['normalization'].get('type', 'log')
 
 # ---- memory–mapped arrays ----
-pops = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
+if normalization_type == 'beta':
+    print("Loading Departure Coefficients (beta) as GNN target variables...")
+    pops = np.load(f'{datadir}/AR_385_CaII_5L_beta.npy', mmap_mode='r')
+    pops_nlte_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
+else:
+    pops = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
 b_xyz = np.memmap(f'{datadir}/AR_385_B.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 3))
 temp = np.memmap(f'{datadir}/AR_385_temp.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 1))
 vel = np.memmap(f'{datadir}/AR_385_veloc.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 3))
@@ -82,6 +89,11 @@ new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=
 print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
 new_points = (new_zv, new_yv, new_xv)
 pops = interpn((z, y, x), pops, new_points)
+if normalization_type == 'beta':
+    pops_nlte = interpn((z, y, x), pops_nlte_orig, new_points)
+    pops_lte = pops_nlte / (pops + 1e-30)
+else:
+    pops_lte = None
 temp = interpn((z, y, x), temp, new_points)
 b_xyz = interpn((z, y, x), b_xyz, new_points)
 vel = interpn((z, y, x), vel, new_points)
@@ -116,8 +128,9 @@ features_data = [vel, b_xyz, temp, n_e,
                 #  n_h,  n_p]
                  rho, press]
 
-normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=normalization_type)
-pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
+feature_norm_type = 'log' if normalization_type == 'beta' else normalization_type
+normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=feature_norm_type)
+pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type, pops_lte=pops_lte)
 
 features_list = normalized_features
 targets_list = [pops_normalized]

@@ -1,5 +1,7 @@
 import numpy as np
 import scipy.interpolate as interp
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from astropy.io import fits
@@ -79,28 +81,38 @@ print(f"   Clipped GNN vertical heights (Mm): min={zz_gnn_clipped.min():.4f}, ma
 print(f"   Keeping {len(zz_gnn_clipped)} GNN heights out of 50.")
 
 # Load GNN predictions
-pred_path = 'muram_predictions_stride_4_full.npy'
+pred_path = 'muram_predictions_stride_4_test.npy'
 if not os.path.exists(pred_path):
-    # Try parent directory
-    pred_path_parent = os.path.join('..', 'muram_predictions_stride_4_full.npy')
-    if os.path.exists(pred_path_parent):
-        pred_path = pred_path_parent
+    pred_path = 'muram_predictions_stride_4_full.npy'
+if not os.path.exists(pred_path):
+    # Try absolute path or parent directories
+    pred_path_abs = '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_test.npy'
+    if os.path.exists(pred_path_abs):
+        pred_path = pred_path_abs
     else:
-        # Try absolute path
-        pred_path_abs = '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy'
-        if os.path.exists(pred_path_abs):
-            pred_path = pred_path_abs
+        pred_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy'
 
 if not os.path.exists(pred_path):
     print(f"Error: GNN predictions not found at {pred_path}")
     sys.exit(1)
+
 print(f"Loading GNN predictions from {pred_path}...")
-pred = np.load(pred_path) # Shape: (50, 992, 992, 6) in m^-3
-# Convert GNN predictions to CGS (cm^-3)
-# pred = pred * 1e6
+pred = np.load(pred_path) # Shape: (50, ny, nx, 6)
+pred_ny, pred_nx = pred.shape[1], pred.shape[2]
+
+# Auto-detect offset based on GNN predictions shape
+if pred_ny == 287:
+    offset = 721
+    print(f"   Detected test split predictions. Using offset {offset}.")
+elif pred_ny == 992:
+    offset = 16
+    print(f"   Detected full split predictions. Using offset {offset}.")
+else:
+    offset = 16
+    print(f"   Unknown predictions shape {pred.shape}. Defaulting to offset {offset}.")
 
 # Clip GNN predictions to the same heights
-pred_clipped = pred[valid_mask, :, :, :] # Shape: (len(zz_gnn_clipped), 992, 992, 6)
+pred_clipped = pred[valid_mask, :, :, :] # Shape: (len(zz_gnn_clipped), ny, nx, 6)
 
 fits_path = "/dat/milic/MURaM_enhanced_network/che_full_499000_lwsynth_200.0.fits"
 if not os.path.exists(fits_path):
@@ -110,8 +122,8 @@ if not os.path.exists(fits_path):
 print("2. Memory-mapping the 29 GB FITS file...")
 with fits.open(fits_path, memmap=True) as hdul:
     # FITS shape in Python: (1024, 1024, 6, 401) representing [x_idx, y_idx, level, z_fits_idx]
-    print("   Loading cropped horizontal domain...")
-    fits_cropped = hdul[2].data[16:-16, 16:-16, :, :] # Shape: (992, 992, 6, 401)
+    print(f"   Loading cropped horizontal domain with offset {offset}...")
+    fits_cropped = hdul[2].data[offset : offset + pred_nx, offset : offset + pred_ny, :, :] # Shape: (nx, ny, 6, 401)
     
 # Reverse the FITS vertical axis to match the increasing order of fits_heights (from photosphere to chromosphere)
 fits_cropped = fits_cropped[..., ::-1]
@@ -126,15 +138,14 @@ fits_cropped = fits_cropped * 1e-6
 
 print("3. Reinterpolating NLTE populations onto clipped GNN heights grid...")
 # fits_heights has shape (401,), and is strictly increasing.
-# fits_cropped has shape (992, 992, 6, 401).
 # We interpolate along the last axis (axis=-1) to target heights zz_gnn_clipped.
 fits_interp_func = interp.interp1d(fits_heights, fits_cropped, axis=-1, bounds_error=False, fill_value="extrapolate")
-fits_on_gnn = fits_interp_func(zz_gnn_clipped) # Shape: (992, 992, 6, len(zz_gnn_clipped))
+fits_on_gnn = fits_interp_func(zz_gnn_clipped) # Shape: (nx, ny, 6, len(zz_gnn_clipped))
 print(f"   Interpolated NLTE shape: {fits_on_gnn.shape}")
 
 print("4. Aligning coordinate axes...")
-# GNN predictions has shape (len(zz_gnn_clipped), 992, 992, 6) -> (z, y, x, npops).
-# We transpose to (x, y, npops, z) to match fits_on_gnn.
+# GNN predictions has shape (len(zz_gnn_clipped), ny, nx, 6) -> (z, y, x, npops).
+# We transpose to (x, y, npops, z) to match fits_on_gnn which is (nx, ny, 6, z).
 pred_aligned = pred_clipped.transpose(2, 1, 3, 0)
 print(f"   Aligned GNN shape: {pred_aligned.shape}")
 
@@ -143,6 +154,12 @@ print("\n5. Computing comparison statistics at each height...")
 # We will compare levels 0, 3, 5
 levels_to_compare = [0, 3, 5]
 levels_labels = {0: "Ca II Ground (lvl 0)", 3: "Ca II Metastable (lvl 3)", 5: "Ca III Ion (lvl 5)"}
+
+# Clean terminal table formatting
+# Compute mask of active/predicted pixels (columns where GNN predicted non-zero populations)
+non_zero_mask = np.any(pred_aligned != 0.0, axis=(2, 3))
+num_active = np.sum(non_zero_mask)
+print(f"Found {num_active} active/non-zero pixels out of {non_zero_mask.size} total pixels (sparse ratio: {100.0 * num_active / non_zero_mask.size:.2f}%).")
 
 # Clean terminal table formatting
 print("\n" + "=" * 105)
@@ -154,20 +171,27 @@ for h_idx, h in enumerate(zz_gnn_clipped):
         g_slice = pred_aligned[:, :, lvl, h_idx]
         f_slice = fits_on_gnn[:, :, lvl, h_idx]
         
-        g_flat = g_slice.flatten()
-        f_flat = f_slice.flatten()
+        # Only compare pixels where the GNN actually predicted values (non-zero mask)
+        g_flat = g_slice[non_zero_mask]
+        f_flat = f_slice[non_zero_mask]
         
-        eps = 1e-30
-        rel_diff = np.abs(g_flat - f_flat) / (f_flat + eps)
-        mare = np.mean(rel_diff) * 100
-        mae = np.mean(np.abs(g_flat - f_flat))
-        
-        # Pearson correlation
-        corr = np.corrcoef(g_flat, f_flat)[0, 1]
-        
-        # Mean Ratio
-        ratio = g_flat / (f_flat + eps)
-        mean_ratio = np.mean(ratio)
+        if len(g_flat) == 0:
+            mare, mae, corr, mean_ratio = np.nan, np.nan, np.nan, np.nan
+        else:
+            eps = 1e-30
+            rel_diff = np.abs(g_flat - f_flat) / (f_flat + eps)
+            mare = np.mean(rel_diff) * 100
+            mae = np.mean(np.abs(g_flat - f_flat))
+            
+            # Pearson correlation
+            if np.std(g_flat) == 0 or np.std(f_flat) == 0:
+                corr = np.nan
+            else:
+                corr = np.corrcoef(g_flat, f_flat)[0, 1]
+            
+            # Mean Ratio
+            ratio = g_flat / (f_flat + eps)
+            mean_ratio = np.mean(ratio)
         
         print(f"{h:10.4f}   | {levels_labels[lvl]:<25} | {corr:10.4f}   | {mare:10.2f}%  | {mae:10.4e} | {mean_ratio:16.4f}   |")
     print("-" * 105)
