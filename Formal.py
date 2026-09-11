@@ -147,7 +147,7 @@ class Formal(object):
 
         # Put the model in training mode
         self.model.train()
-        print("Epoch {0}/{1}".format(epoch, self.n_epochs))
+        print("\nEpoch {0}/{1}".format(epoch, self.n_epochs))
         t = tqdm(self.train_loader)
         loss_avg = 0.0
 
@@ -309,6 +309,8 @@ class Formal(object):
                      'global': self.u,
                      'loss': loss_avg,
                      'checkpoint': self.checkpoint,
+                     'train_loss': checkpoint.get('train_loss', None),
+                     'valid_loss': checkpoint.get('valid_loss', None),
                      'datadir': self.datadir,
                      'hyperparams': self.hyperameters
                      }
@@ -319,7 +321,7 @@ class Formal(object):
         with open(savedir + f'{dtst_type}_checkpoint_{self.checkpoint[-24:-9]}_at_{time.strftime("%Y%m%d-%H%M%S")}.pkl', 'wb') as filehandle:
             pickle.dump(test_dict, filehandle)
 
-    def predict(self, TT=[None], tau=[None], vturb=[None], vlos=[None], ne=[None], cmass=[None], checkpoint=None, readir=None):
+    def predict(self, TT=[None], tau=[None], vturb=[None], vlos=[None], ne=[None], zz=[None], checkpoint=None, readir=None):
         # Prediction of simple models directly and return the results
 
         if (checkpoint is None):
@@ -356,8 +358,8 @@ class Formal(object):
         with open(directory + f'{prefix}_tau.pkl', 'wb') as filehandle:
             pickle.dump(tau, filehandle)
 
-        with open(directory + f'{prefix}_cmass.pkl', 'wb') as filehandle:
-            pickle.dump(cmass, filehandle)
+        with open(directory + f'{prefix}_z.pkl', 'wb') as filehandle:
+            pickle.dump(zz, filehandle)
 
         with open(directory + f'{prefix}_vlos.pkl', 'wb') as filehandle:
             pickle.dump(vlos, filehandle)

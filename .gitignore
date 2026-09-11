@@ -132,4 +132,8 @@ dmypy.json
 .pyre/
 
 # checkpoints
-checkpoints/
+checkpoints*/
+
+# plots
+plots_comparison/
+plots_verification/

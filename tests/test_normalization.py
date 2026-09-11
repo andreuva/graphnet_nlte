@@ -40,7 +40,7 @@ sampler = np.random.randint(0, nsamples, 1000)
 print('Computing Intensities based on test the populations')
 for i, indx in enumerate(tqdm(sampler)):
 
-    cmass, tau, vturb, vlos, temp_origin, u, log_dep = test_dataset(indx)
+    temp_origin, zz, ne, vturb, vlos, u, log_dep = test_dataset(indx)
     if test['hyperparams']['node_input_size'] > 1:
         temp = 10**test['features'][indx][:, 0]
     else:

@@ -15,8 +15,8 @@ from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_ato
 
 test = []
 
-files = sorted(glob('/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si/20260721-143010/test_checkpoint_*.pkl'))
 type_dtst = 'test'
+files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si/20260721-143010/{type_dtst}_checkpoint_*.pkl'))
 dirs = [os.path.split(files[i])[0] for i in range(len(files))]
 plotdirs = [dirs[i] + '/plots/' for i in range(len(files))]
 names = [os.path.split(files[i])[1] for i in range(len(files))]
@@ -27,9 +27,19 @@ latdim = np.zeros(len(files))
 nhiden = np.zeros(len(files))
 hiden_size = np.zeros(len(files))
 
+import torch
+
 for j, file in enumerate(files):
     with open(file, 'rb') as filehandle:
         test.append(pickle.load(filehandle))
+
+    if 'train_loss' not in test[j] or test[j]['train_loss'] is None:
+        pth_name = os.path.basename(test[j]['checkpoint'])
+        pth_path = os.path.join(dirs[j], pth_name)
+        if os.path.exists(pth_path):
+            ckpt = torch.load(pth_path, map_location='cpu', weights_only=False)
+            test[j]['train_loss'] = ckpt.get('train_loss', None)
+            test[j]['valid_loss'] = ckpt.get('valid_loss', None)
 
     print(file, 'loss: ', test[j]['loss'].mean())
     loss[j] = test[j]['loss'].mean()
@@ -61,7 +71,25 @@ plt.yscale('log')
 # plt.savefig('log_msn_loss.png')
 # plt.show()
 plt.close()
-# exit()
+
+for j in range(len(files)):
+    if 'train_loss' in test[j] and test[j]['train_loss'] is not None:
+        train_loss = test[j]['train_loss']
+        valid_loss = test[j].get('valid_loss', None)
+        epochs = np.arange(1, len(train_loss) + 1)
+
+        plt.figure(figsize=(10, 6), dpi=180)
+        plt.plot(epochs, train_loss, label='Training Loss')
+        if valid_loss is not None and len(valid_loss) == len(train_loss):
+            plt.plot(epochs, valid_loss, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (MSE)')
+        plt.title(f'Loss vs Epochs ({names[j]})')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(plotdirs[j] + f'train_loss_vs_epochs_{names[j]}.png')
+        # plt.show()
+        plt.close()
 
 for j, file in enumerate(files):
     print('loading dataset')

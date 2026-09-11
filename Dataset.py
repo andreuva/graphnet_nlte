@@ -6,6 +6,15 @@ import numpy as np
 from sklearn import neighbors
 import torch_geometric.data
 
+# Feature normalization statistics (Z-score: (x - mean) / std)
+NORM_STATS = {
+    'T_log10': {'mean': 4.115, 'std': 0.615},
+    'z': {'mean': 1.331e6, 'std': 1.127e6},      # height in meters
+    'tau_log10': {'mean': -7.822, 'std': 4.215},
+    'ne_log10': {'mean': 17.529, 'std': 2.405},
+    'vturb_km': {'mean': 2.068, 'std': 5.369},   # vturb in km/s (scaled by 1e3)
+    'vlos_km': {'mean': -0.689, 'std': 4.844},    # vlos in km/s (scaled by 1e3)
+}
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, hyperparameters, datadir='../data/', prefix='train'):
@@ -42,11 +51,11 @@ class Dataset(torch.utils.data.Dataset):
             with open(datadir + prefix + '_ne.pkl', 'rb') as filehandle:
                 self.ne = pickle.load(filehandle)
 
-        self.cmass_activated = False
-        if os.path.isfile(datadir + prefix + '_cmass.pkl'):
-            self.cmass_activated = True
-            with open(datadir + prefix + '_cmass.pkl', 'rb') as filehandle:
-                self.cmass_all = pickle.load(filehandle)
+        self.z_activated = False
+        if os.path.isfile(datadir + prefix + '_z.pkl'):
+            self.z_activated = True
+            with open(datadir + prefix + '_z.pkl', 'rb') as filehandle:
+                self.z_all = pickle.load(filehandle)
 
         # Now we need to define the graphs for each one of the computed models
         # The graph will connect all points at certain distance. We define this distance
@@ -61,7 +70,7 @@ class Dataset(torch.utils.data.Dataset):
         self.target = [None] * self.n_training
 
         # Loop over all training examples
-        for i in tqdm(range(self.n_training)):
+        for i in tqdm(range(self.n_training), "Preparing graphs..."):
 
             num_nodes = len(self.tau_all[i])
             index_tau = np.zeros((num_nodes, 1))
@@ -89,35 +98,56 @@ class Dataset(torch.utils.data.Dataset):
 
             n_edges = self.edge_index[i].shape[1]
 
-            # Now define the nodes. For the moment we use only one quantity, the log10(T)
+            # Define normalized node features (mean=0, std=1)
             node_input_size = hyperparameters['node_input_size']
             self.nodes[i] = np.zeros((num_nodes, node_input_size))
-            self.nodes[i][:, 0] = np.log10(self.T_all[i])
-            if node_input_size > 1:
-                self.nodes[i][:, 1] = np.log10(self.tau_all[i])
-            if node_input_size > 2 and self.ne_activated:
-                self.nodes[i][:, 2] = np.log10(self.ne[i])
-            if node_input_size > 3:
-                self.nodes[i][:, 3] = self.vturb_all[i]/1e3
-            if node_input_size > 4:
-                self.nodes[i][:, 4] = self.vlos_all[i]/1e3
 
-            # We use two quantities for the information encoded on the edges: log(column mass) and log(tau)
+            # Feature 0: log10(T)
+            self.nodes[i][:, 0] = (np.log10(self.T_all[i]) - NORM_STATS['T_log10']['mean']) / NORM_STATS['T_log10']['std']
+
+            # Feature 1: Height z or log10(tau)
+            if node_input_size > 1:
+                if self.z_activated:
+                    self.nodes[i][:, 1] = (self.z_all[i] - NORM_STATS['z']['mean']) / NORM_STATS['z']['std']
+                else:
+                    self.nodes[i][:, 1] = (np.log10(self.tau_all[i]) - NORM_STATS['tau_log10']['mean']) / NORM_STATS['tau_log10']['std']
+
+            # Feature 2: log10(ne)
+            if node_input_size > 2 and self.ne_activated:
+                self.nodes[i][:, 2] = (np.log10(self.ne[i]) - NORM_STATS['ne_log10']['mean']) / NORM_STATS['ne_log10']['std']
+
+            # Feature 3: vturb [km/s]
+            if node_input_size > 3:
+                self.nodes[i][:, 3] = (self.vturb_all[i] / 1e3 - NORM_STATS['vturb_km']['mean']) / NORM_STATS['vturb_km']['std']
+
+            # Feature 4: vlos [km/s]
+            if node_input_size > 4:
+                self.nodes[i][:, 4] = (self.vlos_all[i] / 1e3 - NORM_STATS['vlos_km']['mean']) / NORM_STATS['vlos_km']['std']
+
+            # Define normalized edge features
             edge_input_size = hyperparameters['edge_input_size']
             self.edges[i] = np.zeros((n_edges, edge_input_size))
 
             if edge_input_size == 2:
-                cmass_0 = np.log10(self.cmass_all[i][self.edge_index[i][0, :]])
-                cmass_1 = np.log10(self.cmass_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 0] = (cmass_0 - cmass_1)
+                if not self.z_activated:
+                    raise ValueError("No z data available for edge features")
+                else:
+                    z_0 = self.z_all[i][self.edge_index[i][0, :]]
+                    z_1 = self.z_all[i][self.edge_index[i][1, :]]
+                    self.edges[i][:, 0] = (z_0 - z_1)*10 / NORM_STATS['z']['std']
 
                 tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
                 tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 1] = (tau0 - tau1)
+                self.edges[i][:, 1] = (tau0 - tau1) / NORM_STATS['tau_log10']['std']
             elif edge_input_size == 1:
-                tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
-                tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 0] = (tau0 - tau1)
+                if self.z_activated:
+                    z_0 = self.z_all[i][self.edge_index[i][0, :]]
+                    z_1 = self.z_all[i][self.edge_index[i][1, :]]
+                    self.edges[i][:, 0] = (z_0 - z_1) / NORM_STATS['z']['std']
+                else:
+                    tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
+                    tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
+                    self.edges[i][:, 0] = (tau0 - tau1) / NORM_STATS['tau_log10']['std']
             else:
                 raise ValueError("Incompatible edge input size")
 
@@ -156,4 +186,4 @@ class Dataset(torch.utils.data.Dataset):
         return self.n_training
 
     def __call__(self, index):
-        return self.cmass_all[index], self.tau_all[index], self.vturb_all[index], self.vlos_all[index], self.T_all[index], self.u[index], self.dep_all[index]
+        return self.T_all[index], self.z_all[index], self.ne[index], self.vturb_all[index], self.vlos_all[index], self.u[index], self.dep_all[index]

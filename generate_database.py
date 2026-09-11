@@ -14,7 +14,7 @@ from mpi4py import MPI
 import argparse
 from enum import IntEnum
 from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_atom, OI_ord_atom, \
-    Si_atom, Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+    Si_atom_custom, Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
 import lightweaver as lw
 
 
@@ -38,13 +38,13 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
     atmos.quadrature(5)
 
     # Configure the set of atomic models to use.
-    aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
+    aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom_custom(), Al_atom(), CaII_atom(),
                             Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
 
     # Set H and Ca to "active" i.e. NLTE, everything else participates as an
     # LTE background.
     # aSet.set_active('H', 'Ca')
-    aSet.set_active('H', 'Ca', 'Si')
+    aSet.set_active('Si')
 
     # Compute the necessary wavelength dependent information (SpectrumConfiguration).
     spect = aSet.compute_wavelength_grid()
@@ -227,8 +227,8 @@ class Model_generator(object):
             vlos_new = 0 + f(self.ltau[i])
 
             # Select the depth as the column mass and the depth scale acordingly
-            depth = self.atmosRef[i].cmass
-            depth_scale = lw.ScaleType.ColumnMass
+            depth = self.atmosRef[i].z
+            depth_scale = lw.ScaleType.Geometric
 
             return depth_scale, depth, T_new, vlos_new, vturb_new, ne
 
@@ -249,8 +249,8 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
     T_list = [None] * nsamples                  # Temperatures
     tau_list = [None] * nsamples                # optical depths
     vturb_list = [None] * nsamples              # Turbulent velocities
-    vlos_list = [None] * nsamples              # line of sight velocities
-    cmass_list = [None] * nsamples              # Column mass
+    vlos_list = [None] * nsamples               # line of sight velocities
+    z_list = [None] * nsamples                  # Column mass
     ne_list = [None] * nsamples                 # density of electrons in the atmosphere
     Iwave_list = [None] * nsamples              # Intensity profile of the model
 
@@ -319,7 +319,7 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                     tau_list[index] = dataReceived['tau']
                     vturb_list[index] = dataReceived['vturb']
                     vlos_list[index] = dataReceived['vlos']
-                    cmass_list[index] = dataReceived['cmass']
+                    z_list[index] = dataReceived['zz']
                     ne_list[index] = dataReceived['ne']
                     Iwave_list[index] = dataReceived['Iwave']
                     pbar.update(1)
@@ -353,8 +353,8 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                 with open(savedir + f'{filename}_tau.pkl', 'wb') as filehandle:
                     pickle.dump(tau_list[0:task_index], filehandle)
 
-                with open(savedir + f'{filename}_cmass.pkl', 'wb') as filehandle:
-                    pickle.dump(cmass_list[0:task_index], filehandle)
+                with open(savedir + f'{filename}_z.pkl', 'wb') as filehandle:
+                    pickle.dump(z_list[0:task_index], filehandle)
 
                 with open(savedir + f'{filename}_ne.pkl', 'wb') as filehandle:
                     pickle.dump(ne_list[0:task_index], filehandle)
@@ -365,8 +365,8 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
     # Once finished, dump all the data
     print("Master finishing")
 
-    with open(savedir + f'{filename}_cmass.pkl', 'wb') as filehandle:
-        pickle.dump(cmass_list, filehandle)
+    with open(savedir + f'{filename}_z.pkl', 'wb') as filehandle:
+        pickle.dump(z_list, filehandle)
 
     with open(savedir + f'{filename}_logdeparture.pkl', 'wb') as filehandle:
         pickle.dump(log_departure_list, filehandle)
@@ -419,8 +419,8 @@ def slave_work(rank):
             log_departure = None
             n_Nat = None
             tau = None
-            cmass = None
-            wave = np.linspace(853.9444, 854.9444, 1001)
+            zz = None
+            wave = np.linspace(1074.0, 1085.0, 1100)
             Iwave = wave*0
             success = 1
             # print(f" * WORKER {rank}: starting task {task_index}.", flush=True)
@@ -432,7 +432,7 @@ def slave_work(rank):
                 ctx = synth_spectrum(atmos, depthData=True, conserveCharge=False, prd=prd_active)
                 # print(f" * WORKER {rank}: finished NLTE task {task_index}.", flush=True)
                 tau = atmos.tauRef
-                cmass = atmos.cmass
+                zz = atmos.z
                 temperature = atmos.temperature
                 ne = atmos.ne
                 vturb = atmos.vturb
@@ -450,7 +450,7 @@ def slave_work(rank):
                                           np.log10(ctx.activeAtoms[at].n / ctx.activeAtoms[at].nTotal),
                                           axis=0)
 
-                Iwave = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
+                Iwave = ctx.compute_rays(ctx.spect.wavelength, [atmos.muz[-1]], stokes=False)
 
                 # If the coefficients are not converged set as failure
                 if np.isnan(np.sum(log_departure)):
@@ -467,7 +467,7 @@ def slave_work(rank):
 
             # Send the computed data
             dataToSend = {'index': task_index, 'T': temperature, 'log_departure': log_departure, 'n_Nat': n_Nat,
-                          'tau': tau, 'cmass': cmass, 'vlos': vlos, 'vturb': vturb, 'ne': ne, 'success': success, 'Iwave': Iwave}
+                          'tau': tau, 'zz': zz, 'vlos': vlos, 'vturb': vturb, 'ne': ne, 'success': success, 'Iwave': Iwave}
             comm.send(dataToSend, dest=0, tag=tags.DONE)
             # print(f" * WORKER {rank}: finished task {task_index}.", flush=True)
 

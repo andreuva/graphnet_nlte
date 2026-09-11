@@ -1,4 +1,6 @@
 import os
+import shutil
+import time
 import argparse
 from Formal import Formal
 
@@ -25,8 +27,27 @@ if (__name__ == '__main__'):
 
     parsed = vars(parser.parse_args())
 
-    if not os.path.exists(parsed['sav']):
-        os.makedirs(parsed['sav'])
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(parsed['sav'], timestamp)
+
+    if not os.path.exists(run_dir):
+        os.makedirs(run_dir)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    files_to_copy = [
+        parsed['conf'],
+        os.path.join(script_dir, 'Dataset.py'),
+        os.path.join(script_dir, 'Formal.py'),
+        os.path.join(script_dir, 'graphnet.py'),
+        os.path.join(script_dir, 'train.py'),
+        os.path.join(script_dir, 'conf.dat'),
+    ]
+
+    for file_path in files_to_copy:
+        if os.path.exists(file_path):
+            shutil.copy(file_path, run_dir)
+
+    savedir_run = os.path.join(run_dir, '')
 
     network = Formal(
                      configuration=parsed['conf'],
@@ -36,4 +57,5 @@ if (__name__ == '__main__'):
                      smooth=parsed['smooth'],
                      datadir=parsed['rd'])
 
-    network.optimize(parsed['sav'], parsed['epochs'], lr=parsed['lr'])
+    network.optimize(savedir_run, parsed['epochs'], lr=parsed['lr'])
+

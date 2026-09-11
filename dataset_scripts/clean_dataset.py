@@ -40,8 +40,14 @@ def find_global_invalid_indices(all_datasets: list) -> set:
 
     for dataset in all_datasets:
         for i, item in enumerate(dataset):
-            if item is None or (hasattr(item, '__iter__') and np.isnan(np.sum(item))):
+            if item is None:
                 invalid_indices.add(i)
+            else:
+                try:
+                    if np.isnan(np.sum(item)):
+                        invalid_indices.add(i)
+                except Exception:
+                    pass
     return invalid_indices
 
 def clean_and_save_datasets(filepaths: list, all_datasets: list, invalid_indices: set):
@@ -78,26 +84,53 @@ def main():
     """
     Main function to find, synchronize, clean, and save all dataset files.
     """
-    file_pattern = '../../data/database_multiatom_big/train_*.pkl'
-    filepaths = glob(file_pattern)
+    import argparse
+    parser = argparse.ArgumentParser(description="Synchronously clean datasets by removing indices with NaNs or Nones.")
+    parser.add_argument('--dir', default='../data_1d_adur/', help='Directory containing pickle files')
+    args = parser.parse_args()
 
-    if not filepaths:
-        print(f"No files found matching the pattern: {file_pattern}")
+    datadir = args.dir
+    if not datadir.endswith('/'):
+        datadir += '/'
+
+    # Find all prefixes by looking for files ending with _T.pkl
+    t_files = glob(os.path.join(datadir, '*_T.pkl'))
+    prefixes = sorted(list(set(os.path.basename(f).split('_')[0] for f in t_files)))
+
+    if not prefixes:
+        print(f"No datasets found in {datadir}")
         return
 
-    print("Starting synchronized dataset cleaning process...")
-    print(f"Found {len(filepaths)} files to process.")
+    print(f"Starting synchronized dataset cleaning process in: {datadir}")
+    print(f"Found prefixes to clean: {prefixes}")
 
-    # PASS 1: Load data and find all bad indices
-    datasets = load_all_datasets(filepaths)
-    if not datasets:
-        print("No valid datasets were loaded. Exiting.")
-        return
+    for prefix in prefixes:
+        print(f"\n--- Processing prefix: {prefix} ---")
+        file_pattern = os.path.join(datadir, f'{prefix}_*.pkl')
+        filepaths = glob(file_pattern)
         
-    global_invalid_indices = find_global_invalid_indices(datasets)
+        # Filter filepaths to only include those ending in known patterns to avoid cleaning unrelated files
+        valid_patterns = ['_T.pkl', '_tau.pkl', '_ne.pkl', '_vturb.pkl', '_vlos.pkl', '_z.pkl', '_logdeparture.pkl', '_n_Nat.pkl', '_Iwave.pkl']
+        filepaths = sorted([f for f in filepaths if any(f.endswith(p) for p in valid_patterns)])
 
-    # PASS 2: Clean all datasets using the global index list and save them
-    clean_and_save_datasets(filepaths, datasets, global_invalid_indices)
+        if not filepaths:
+            print(f"No files found for prefix '{prefix}'")
+            continue
+
+        print(f"Found {len(filepaths)} files to process for prefix '{prefix}':")
+        for fp in filepaths:
+            print(f"  - {os.path.basename(fp)}")
+
+        # PASS 1: Load data and find all bad indices
+        datasets = load_all_datasets(filepaths)
+        if not datasets:
+            print("No valid datasets were loaded. Skipping.")
+            continue
+            
+        global_invalid_indices = find_global_invalid_indices(datasets)
+
+        # PASS 2: Clean all datasets using the global index list and save them
+        clean_and_save_datasets(filepaths, datasets, global_invalid_indices)
 
 if __name__ == "__main__":
     main()
