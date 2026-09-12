@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as pl
 import torch
 import torch.nn as nn
+from torch.nn import init
 from torch_geometric.nn import MetaLayer
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx

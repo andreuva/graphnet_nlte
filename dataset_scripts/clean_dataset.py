@@ -44,7 +44,7 @@ def find_global_invalid_indices(all_datasets: list) -> set:
                 invalid_indices.add(i)
             else:
                 try:
-                    if np.isnan(np.sum(item)):
+                    if not np.all(np.isfinite(item)):
                         invalid_indices.add(i)
                 except Exception:
                     pass

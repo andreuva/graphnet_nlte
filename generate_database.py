@@ -128,8 +128,10 @@ class Model_generator(object):
         else:
             self.current_bifrost = int(0.8*self.n_bifrost)
 
-        # If we are in training or testing read the semiempirical models if not we just use bifrost
-        if self.train >= 0:
+        # Read the semiempirical reference atmospheres for every split, including validation, so
+        # that validation samples also get vturb/vlos perturbations instead of being Bifrost-only
+        # (Bifrost columns always carry vturb=0, see new_model() below).
+        if True:
             print(f"READING ATMOSPHERES: ...\n", flush=True)
             # Read all the models in the datadir folder and store it in the atmosRef list
             atmospheres = sorted(glob(datadir + '*.atmos'))
@@ -174,10 +176,7 @@ class Model_generator(object):
 
         """ Pick randomly a sample from bifrost or from the reference atmospheres unless we already
         computed all the bifrost models """
-        if self.train < 0:
-            choices = [True]
-        else:
-            choices = [True, False]
+        choices = [True, False]
 
         if np.random.choice(a=choices) and self.current_bifrost < self.n_bifrost:
 
@@ -452,8 +451,9 @@ def slave_work(rank):
 
                 Iwave = ctx.compute_rays(ctx.spect.wavelength, [atmos.muz[-1]], stokes=False)
 
-                # If the coefficients are not converged set as failure
-                if np.isnan(np.sum(log_departure)):
+                # If the coefficients are not converged (NaN) or blew up to +/-inf
+                # (e.g. a population underflowing to exactly 0 before the log10) set as failure
+                if not np.all(np.isfinite(log_departure)):
                     # print(f"!!! WORKER {rank}: task {task_index} did not converge !!!", flush=True)
                     success = 0
 

@@ -13,6 +13,7 @@ import shutil
 
 import graphnet
 from Dataset import Dataset as dtst
+from Dataset import NORM_STATS
 
 
 try:
@@ -135,6 +136,11 @@ class Formal(object):
                     'best_loss': best_loss,
                     'hyperparameters': self.hyperparameters,
                     'optimizer': self.optimizer.state_dict(),
+                    # Normalization constants used by Dataset.py to build this checkpoint's
+                    # training inputs/targets, so inference code can always reproduce the
+                    # exact normalization a given checkpoint was trained with, even after
+                    # NORM_STATS is later retuned for a new training run.
+                    'norm_stats': NORM_STATS,
                 }
 
                 print("Saving best model...")

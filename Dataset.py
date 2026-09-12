@@ -6,14 +6,17 @@ import numpy as np
 from sklearn import neighbors
 import torch_geometric.data
 
-# Feature normalization statistics (Z-score: (x - mean) / std)
+# Feature normalization statistics (Z-score: (x - mean) / std), computed over the full
+# data_1d_si/train_* set (493391 columns, ~6.8e7 depth points). Recompute if the training
+# set changes materially (different atom/species, different atmosphere mix, etc.).
 NORM_STATS = {
-    'T_log10': {'mean': 4.115, 'std': 0.615},
-    'z': {'mean': 1.331e6, 'std': 1.127e6},      # height in meters
-    'tau_log10': {'mean': -7.822, 'std': 4.215},
-    'ne_log10': {'mean': 17.529, 'std': 2.405},
-    'vturb_km': {'mean': 2.068, 'std': 5.369},   # vturb in km/s (scaled by 1e3)
-    'vlos_km': {'mean': -0.689, 'std': 4.844},    # vlos in km/s (scaled by 1e3)
+    'T_log10': {'mean': 4.10228, 'std': 0.600127},
+    'z': {'mean': 1.30265e6, 'std': 1.09178e6},      # height in meters
+    'tau_log10': {'mean': -7.75738, 'std': 4.37718},
+    'ne_log10': {'mean': 17.5785, 'std': 2.35518},
+    'vturb_km': {'mean': 2.88109, 'std': 6.14624},   # vturb in km/s (scaled by 1e3)
+    'vlos_km': {'mean': -0.603487, 'std': 4.86515},  # vlos in km/s (scaled by 1e3)
+    'delta_z': {'std': 17706.5},                     # std of z differences between adjacent nodes (edge feature)
 }
 
 class Dataset(torch.utils.data.Dataset):
@@ -134,7 +137,7 @@ class Dataset(torch.utils.data.Dataset):
                 else:
                     z_0 = self.z_all[i][self.edge_index[i][0, :]]
                     z_1 = self.z_all[i][self.edge_index[i][1, :]]
-                    self.edges[i][:, 0] = (z_0 - z_1)*10 / NORM_STATS['z']['std']
+                    self.edges[i][:, 0] = (z_0 - z_1) / NORM_STATS['delta_z']['std']
 
                 tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
                 tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
@@ -143,7 +146,7 @@ class Dataset(torch.utils.data.Dataset):
                 if self.z_activated:
                     z_0 = self.z_all[i][self.edge_index[i][0, :]]
                     z_1 = self.z_all[i][self.edge_index[i][1, :]]
-                    self.edges[i][:, 0] = (z_0 - z_1) / NORM_STATS['z']['std']
+                    self.edges[i][:, 0] = (z_0 - z_1) / NORM_STATS['delta_z']['std']
                 else:
                     tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
                     tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
@@ -155,9 +158,14 @@ class Dataset(torch.utils.data.Dataset):
             self.u[i] = np.zeros((1, 1))
             # self.u[i][0, :] = np.array([np.log10(self.eps_all[i][0, 0]), np.log10(self.ratio_all[i][0, 0])], dtype=np.float32)
 
-            # We use the log10(departure coeff) as output, divided by 5 to make it closer to 1. In case a NaN is found, we
-            # make them equal to zero
-            self.target[i] = np.nan_to_num(self.dep_all[i][:, :].T / 5.0)
+            # We use the log10(departure coeff) as output, divided by 5 to make it closer to 1.
+            # log10(b) is clipped to +-10 first: beyond that range b is dominated by a Saha/LTE
+            # collapse of the reference population (nStar -> 0, mostly in the transition region/
+            # corona) rather than by the actual level population, which by then is astrophysically
+            # negligible (n/Ntotal below ~1e-9) -- so the true value doesn't matter, and letting it
+            # through unclipped just adds noisy outliers to the MSE loss. In case a NaN or Inf is
+            # still found (non-converged sample slipping through), we make it zero.
+            self.target[i] = np.nan_to_num(np.clip(self.dep_all[i][:, :].T, -10.0, 10.0) / 5.0)
 
             # Finally, all information is transformed to float32 tensors
             self.nodes[i] = torch.tensor(self.nodes[i].astype('float32'))

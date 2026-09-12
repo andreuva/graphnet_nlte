@@ -16,7 +16,7 @@ from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_ato
 test = []
 
 type_dtst = 'test'
-files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si/20260721-143010/{type_dtst}_checkpoint_*.pkl'))
+files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si_v2/20260911-231808/{type_dtst}_checkpoint_*.pkl'))
 dirs = [os.path.split(files[i])[0] for i in range(len(files))]
 plotdirs = [dirs[i] + '/plots/' for i in range(len(files))]
 names = [os.path.split(files[i])[1] for i in range(len(files))]
@@ -110,13 +110,14 @@ for j, file in enumerate(files):
 
         zz = zz.astype('float64')
         vturb = vturb.astype('float64')
+        ne = ne.astype('float64')
 
         ptop = None
         if u != 0:
             ptop = u
 
         atmos_pre = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, depthScale=zz, temperature=temp,
-                                          vlos=vlos, vturb=vturb, Ptop=ptop, verbose=False)
+                                          vlos=vlos, vturb=vturb, ne=ne, Ptop=ptop, verbose=False)
         atmos_pre.quadrature(5)
         aSet_pre = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom_custom(), Al_atom(), CaII_atom(),
                                     Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
@@ -124,6 +125,7 @@ for j, file in enumerate(files):
         spect_pre = aSet_pre.compute_wavelength_grid()
 
         eqPops_pre = aSet_pre.compute_eq_pops(atmos_pre)
+        eqPops_pre.update_lte_atoms_Hmin_pops(atmos_pre, quiet=True)
         ctx_pre = lw.Context(atmos_pre, spect_pre, eqPops_pre, Nthreads=1, conserveCharge=False)
 
         # Compute the intensity with the LTE populations
@@ -137,7 +139,7 @@ for j, file in enumerate(files):
         dep_lte = np.log10(eqPops_pre.atomicPops['Si'].n / eqPops_pre.atomicPops['Si'].nStar)
         lte_pops.append(np.moveaxis(dep_lte, 0, -1))
 
-        atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, depthScale=zz, temperature=temp, vlos=vlos, vturb=vturb, verbose=False)
+        atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, depthScale=zz, temperature=temp, vlos=vlos, vturb=vturb, ne=ne, verbose=False)
         atmos.quadrature(5)
         aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom_custom(), Al_atom(), CaII_atom(),
                                 Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
@@ -146,6 +148,7 @@ for j, file in enumerate(files):
 
         # Compute the intensity with the target populations
         eqPops = aSet.compute_eq_pops(atmos)
+        eqPops.update_lte_atoms_Hmin_pops(atmos, quiet=True)
         eqPops.atomicPops['Si'].n = pops_true
 
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
