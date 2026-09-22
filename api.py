@@ -40,8 +40,10 @@ Dependencies
     synthesis_lw/intensity_gnn : the above, plus lightweaver (imported lazily, only
                                  when one of these two functions is actually called)
 """
+import glob
 import os
 import sys
+import warnings
 
 import numpy as np
 import torch
@@ -52,29 +54,20 @@ if _MODULE_DIR not in sys.path:
 
 import graphnet
 
-# Update this once the current training run finishes; any *_best.pth checkpoint trained
-# with node_input_size=5 / edge_input_size=1 (T, z, ne, vturb, vlos node features, delta-z
-# edge feature) works, just pass it explicitly via the `checkpoint=` argument.
-DEFAULT_CHECKPOINT = os.path.join(_MODULE_DIR, 'checkpoints_si_v2/20260911-231808', '20260911-233633_best.pth')
+# Points at the checkpoint tree, not a specific file: Formal.py saves a new timestamped
+# '*_best.pth' under a per-run directory each time validation loss improves, so the most recent
+# one anywhere below here is the best checkpoint of the most recent run. Resolved at call time
+# (see _resolve_checkpoint), so this keeps tracking training automatically -- no need to edit it
+# by hand as new runs and checkpoints appear. Point it at a specific *.pth file instead (or pass
+# checkpoint= explicitly) once training is finished and you want to pin a fixed model.
+DEFAULT_CHECKPOINT = os.path.join(_MODULE_DIR, 'checkpoints_si_v2')
 
-# Normalization constants a checkpoint was trained with are read from the checkpoint file
-# itself (Formal.py saves the Dataset.py NORM_STATS dict in use at training time as
-# checkpoint['norm_stats']). This is the fallback for older checkpoints saved before that
-# was added -- it reproduces the NORM_STATS / edge-feature formula Dataset.py used to use.
-# Do not edit this to "fix" it: doing so would silently change predictions for every
-# checkpoint trained before norm_stats was embedded.
-_LEGACY_NORM_STATS = {
-    'T_log10': {'mean': 4.115, 'std': 0.615},
-    'z': {'mean': 1.331e6, 'std': 1.127e6},
-    'tau_log10': {'mean': -7.822, 'std': 4.215},
-    'ne_log10': {'mean': 17.529, 'std': 2.405},
-    'vturb_km': {'mean': 2.068, 'std': 5.369},
-    'vlos_km': {'mean': -0.689, 'std': 4.844},
-    'delta_z': {'std': 1.127e6},  # old Dataset.py normalized edges by NORM_STATS['z']['std']
-}
-
-# Si I 10827 A window used to build the training set (generate_database.py).
-DEFAULT_WAVE = np.linspace(1074.0, 1085.0, 1100)
+# Si I 10827 A window (the line sits at 1083.0038 nm in vacuum). The sampling has to resolve the
+# Doppler width, which for Si at the coolest temperature in the training set (2500 K, vturb=0)
+# is 1083 nm * sqrt(2kT/m)/c = 4.4 pm; 2 pm gives at least two samples across it everywhere. An
+# earlier 1100-point version of this grid sampled at 10 pm -- coarser than the Doppler width --
+# and read the line core 0.2-4% too shallow.
+DEFAULT_WAVE = np.linspace(1074.0, 1085.0, 5501)
 
 _MODEL_CACHE = {}
 
@@ -92,7 +85,11 @@ def _validate_atmosphere(T, z, ne, vturb, vlos):
     for name, val in zip(names, raw):
         if val is None:
             raise AtmosphereError(f"'{name}' is required and cannot be None")
-        arr = np.asarray(val, dtype=np.float64)
+        # ascontiguousarray (not asarray): lightweaver's Cython layer requires C-contiguous
+        # memory and fails with an opaque "ndarray is not C-contiguous" error deep inside
+        # its own internals otherwise -- easy to hit by passing a reversed/sliced view (e.g.
+        # arr[::-1] to flip height ordering), so guard against it once here for all callers.
+        arr = np.ascontiguousarray(val, dtype=np.float64)
         if arr.ndim != 1:
             raise AtmosphereError(f"'{name}' must be a 1D array, got shape {arr.shape}")
         arrays.append(arr)
@@ -114,6 +111,14 @@ def _validate_atmosphere(T, z, ne, vturb, vlos):
         raise AtmosphereError("'ne' must be strictly positive (m^-3)")
     if np.any(vturb < 0):
         raise AtmosphereError("'vturb' cannot be negative (m/s)")
+    if not np.all(np.diff(z) < 0):
+        raise AtmosphereError(
+            "'z' must be strictly decreasing (index 0 = top of the atmosphere, highest z, "
+            "down to the last index = deepest point) -- this matches lightweaver's geometric "
+            "scale convention and how the training set was generated (e.g. Bifrost columns "
+            "are reversed with z[::-1] before use). Flip all five arrays with [::-1] if your "
+            "atmosphere is ordered the other way."
+        )
 
     return T, z, ne, vturb, vlos
 
@@ -145,11 +150,29 @@ def _build_graph(T, z, ne, vturb, vlos, norm_stats):
     return torch.from_numpy(node), torch.from_numpy(edge_index), torch.from_numpy(edge_attr)
 
 
+def _resolve_checkpoint(checkpoint):
+    """
+    If `checkpoint` is a directory, resolve it to the most recent '*_best.pth' file at or below
+    it (Formal.py timestamps each improved-validation-loss save, so the lexicographically-last
+    filename is always the best checkpoint so far). The search is recursive so that either a
+    single run directory or the whole checkpoint tree can be given. If `checkpoint` is already a
+    file, it is returned unchanged. Directories are re-resolved on every call, so a
+    still-training run always yields its current best checkpoint.
+    """
+    if os.path.isdir(checkpoint):
+        candidates = sorted(glob.glob(os.path.join(checkpoint, '**', '*_best.pth'), recursive=True))
+        if not candidates:
+            raise FileNotFoundError(f"No '*_best.pth' checkpoint found under directory: {checkpoint}")
+        return candidates[-1]
+    return checkpoint
+
+
 def _load_model(checkpoint, device):
     """
     Load (and cache) a GraphNet checkpoint, along with the exact normalization constants it
-    was trained with. Repeated calls are free after the first.
+    was trained with. Repeated calls are free after the first (per resolved checkpoint file).
     """
+    checkpoint = _resolve_checkpoint(checkpoint)
     key = (os.path.abspath(checkpoint), device)
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
@@ -165,11 +188,13 @@ def _load_model(checkpoint, device):
             f"vturb, vlos) and edge_input_size=1 (delta z); got node_input_size="
             f"{hyperparams.get('node_input_size')}, edge_input_size={hyperparams.get('edge_input_size')}."
         )
-    # Checkpoints saved before 'norm_stats' was added to Formal.py fall back to the
-    # normalization Dataset.py used at the time -- the two MUST stay paired, since feeding a
-    # checkpoint inputs normalized differently from its own training data silently degrades
-    # predictions without any error.
-    norm_stats = ckpt.get('norm_stats', _LEGACY_NORM_STATS)
+    norm_stats = ckpt.get('norm_stats')
+    if norm_stats is None:
+        raise ValueError(
+            f"Checkpoint {checkpoint} has no embedded 'norm_stats' -- it predates that being "
+            "saved by Formal.py and is not supported. Use a checkpoint trained with the "
+            "current Formal.py/Dataset.py."
+        )
 
     model = graphnet.EncodeProcessDecode(**hyperparams).to(device)
     model.load_state_dict(ckpt['state_dict'])
@@ -193,7 +218,10 @@ def compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=DEFAULT_CHECKPOINT, dev
         Atmospheric stratification, see module docstring for units. `ne` is required: unlike
         a full lightweaver solve, the network cannot derive it on its own.
     checkpoint : str, optional
-        Path to a trained GraphNet checkpoint (*_best.pth). Selects which training run to use.
+        Path to a trained GraphNet checkpoint (*_best.pth), or a directory containing one or
+        more -- in which case the most recent '*_best.pth' in it is used (re-resolved on every
+        call, so pointing this at an in-progress training run's directory always picks up its
+        current best checkpoint). Selects which training run to use.
     device : str, optional
         torch device for inference, e.g. 'cpu' or 'cuda:0'.
 
@@ -208,9 +236,11 @@ def compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=DEFAULT_CHECKPOINT, dev
     AtmosphereError
         Input arrays are missing, inconsistent, too short, non-finite, or unphysical.
     FileNotFoundError
-        `checkpoint` does not exist.
+        `checkpoint` does not exist, or is a directory with no '*_best.pth' file in it.
     NotImplementedError
         `checkpoint` was trained with an unsupported node/edge feature configuration.
+    ValueError
+        `checkpoint` has no embedded normalization constants (too old / incompatible).
     """
     T, z, ne, vturb, vlos = _validate_atmosphere(T, z, ne, vturb, vlos)
     model, _, norm_stats = _load_model(checkpoint, device)
@@ -227,14 +257,43 @@ def compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=DEFAULT_CHECKPOINT, dev
     if not np.all(np.isfinite(log_dep)):
         raise RuntimeError("GraphNet produced non-finite departure coefficients")
 
-    return log_dep
+    # Clamp to the range the targets were clipped to. Inside it this is a no-op; outside it
+    # guards the levels and depths that carry n_i/n_Total < 1e-9 and are therefore masked out of
+    # the training loss (see Dataset.NEGLIGIBLE_LOG_N_OVER_NTOT) -- the network is unsupervised
+    # there and its raw output can be arbitrary, while 10**log_dep feeds straight into the
+    # populations. At +-10 the resulting populations are bounded by what the clipped targets
+    # themselves produce, which changes the emergent profile by <= 2e-7.
+    return np.clip(log_dep, -10.0, 10.0)
+
+
+# Below this wavelength the background coherent-scattering emissivity (sigma * J) is a
+# significant part of the source function, and intensity_gnn's single formal solution runs on a
+# Context that has never iterated, so J = 0. Measured against the converged reference: 1.6e-4
+# median error at 800-1100 nm, but 1.3e-2 median and up to 0.68 at 100-200 nm.
+_SCATTERING_SAFE_MIN_NM = 400.0
+
+
+def _warn_if_scattering_matters(wave):
+    """Warn when intensity_gnn is asked for wavelengths where its J = 0 assumption breaks."""
+    wave = np.asarray(wave)
+    if wave.size and wave.min() < _SCATTERING_SAFE_MIN_NM:
+        warnings.warn(
+            f"intensity_gnn takes a single formal solution on a Context that has not been "
+            f"iterated, so the mean intensity J is zero and the background coherent-scattering "
+            f"emissivity is missing. This is accurate in the near-IR (~1e-4 relative) but not "
+            f"below {_SCATTERING_SAFE_MIN_NM:.0f} nm (up to ~0.7 relative at 100-200 nm), and "
+            f"the requested grid reaches {wave.min():.1f} nm. Use synthesis_lw for those "
+            f"wavelengths.",
+            RuntimeWarning, stacklevel=3)
 
 
 def _build_atmosphere(T, z, ne, vturb, vlos):
     """Shared lightweaver atmosphere/population setup for synthesis_lw and intensity_gnn."""
     import lightweaver as lw
-    from lightweaver.rh_atoms import (H_6_atom, C_atom, OI_ord_atom, Si_atom_custom, Al_atom,
+    from lightweaver.rh_atoms import (H_6_atom, C_atom, OI_ord_atom, Al_atom,
                                        CaII_atom, Fe_atom, He_9_atom, MgII_atom, N_atom, Na_atom, S_atom)
+    # Si_atom_custom is not in released lightweaver -- it ships with this repo (si_atom.py).
+    from si_atom import Si_atom_custom
 
     atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, depthScale=z, temperature=T,
                                    vlos=vlos, vturb=vturb, ne=ne, verbose=False)
@@ -264,8 +323,9 @@ def synthesis_lw(T, z, ne, vturb, vlos, wave=None, mu=None, conserve_charge=Fals
         Wavelength grid [nm]. Defaults to the Si I 10827 A window used for training
         (1074-1085 nm, 1100 points).
     mu : float, optional
-        Cosine of the viewing angle. Defaults to the outermost angle of the 5-point
-        Gauss-Legendre quadrature (near disk-center), matching training-set generation.
+        Cosine of the viewing angle. Defaults to atmos.muz[-1], the outermost node of the
+        5-point Gauss-Legendre quadrature -- mu = 0.9531, i.e. theta = 17.6 deg, not disk
+        centre. This matches training-set generation; pass mu=1.0 for disk centre.
     conserve_charge : bool, optional
         Solve for charge-conserving electron density during the NLTE iteration.
         False (default) matches training-set generation.
@@ -329,7 +389,7 @@ def intensity_gnn(T, z, ne, vturb, vlos, log_dep=None, wave=None, mu=None,
         Precomputed departure coefficients (e.g. from a prior `compute_dep_coeffs` call),
         to avoid recomputing them. If None (default), they are predicted here.
     wave, mu : optional
-        See `synthesis_lw`.
+        See `synthesis_lw`. `mu` defaults to 0.9531 (theta = 17.6 deg), not disk centre.
     checkpoint, device : optional
         See `compute_dep_coeffs`. Ignored if `log_dep` is supplied directly.
 
@@ -345,13 +405,14 @@ def intensity_gnn(T, z, ne, vturb, vlos, log_dep=None, wave=None, mu=None,
     ------
     AtmosphereError
         Input arrays are missing, inconsistent, too short, non-finite, or unphysical.
-    FileNotFoundError, NotImplementedError, RuntimeError
+    FileNotFoundError, NotImplementedError, ValueError, RuntimeError
         Only if `log_dep` is not supplied: propagated from the internal
         `compute_dep_coeffs` call, see there.
     """
     T, z, ne, vturb, vlos = _validate_atmosphere(T, z, ne, vturb, vlos)
     if wave is None:
         wave = DEFAULT_WAVE
+    _warn_if_scattering_matters(wave)
     if log_dep is None:
         log_dep = compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=checkpoint, device=device)
 
@@ -374,9 +435,9 @@ if __name__ == '__main__':
     # Lightweight smoke test for compute_dep_coeffs (no lightweaver needed). Uses a
     # simple isothermal-ish toy column purely to exercise the code path end-to-end.
     n = 60
-    z = np.linspace(-5e5, 2.5e6, n)                    # m
+    z = np.linspace(2.5e6, -5e5, n)                      # m, decreasing: index 0 = top
     T = 6000.0 + 4000.0 * np.exp(-((z - 1e6) / 8e5)**2)  # K
-    ne = 10.0 ** np.linspace(21.0, 17.0, n)             # m^-3
+    ne = 10.0 ** np.linspace(17.0, 21.0, n)              # m^-3, rising with depth
     vturb = np.full(n, 2.0e3)                            # m/s
     vlos = np.zeros(n)                                   # m/s
 

@@ -5,7 +5,13 @@ from glob import glob
 import os
 
 def load_all_datasets(filepaths: list) -> list:
-    """Loads all pickle files into a list of datasets."""
+    """
+    Load the pickle files, returning (filepath, dataset) pairs.
+
+    Pairs rather than a bare list of datasets: a file that is skipped here used to shift every
+    dataset after it by one position, and clean_and_save_datasets then zipped the shortened list
+    back against the full filepath list -- writing each array out under its neighbour's name.
+    """
     all_datasets = []
     for filepath in filepaths:
         try:
@@ -14,7 +20,7 @@ def load_all_datasets(filepaths: list) -> list:
                 if not isinstance(dataset, list):
                     print(f"Warning: Content of {os.path.basename(filepath)} is not a list. Skipping.")
                     continue
-                all_datasets.append(dataset)
+                all_datasets.append((filepath, dataset))
         except (pickle.UnpicklingError, EOFError) as e:
             print(f"Error reading {os.path.basename(filepath)}. It may be corrupt. Skipping. Details: {e}")
     return all_datasets
@@ -33,12 +39,12 @@ def find_global_invalid_indices(all_datasets: list) -> set:
     invalid_indices = set()
     
     # Check that all datasets have the same length before starting
-    if len(set(len(d) for d in all_datasets)) > 1:
+    if len(set(len(d) for _, d in all_datasets)) > 1:
         print("Warning: Datasets have inconsistent lengths. Synchronization may be incorrect.")
         # You might want to raise an error here depending on how strict you need to be
         # raise ValueError("Inconsistent dataset lengths found.")
 
-    for dataset in all_datasets:
+    for _, dataset in all_datasets:
         for i, item in enumerate(dataset):
             if item is None:
                 invalid_indices.add(i)
@@ -50,13 +56,12 @@ def find_global_invalid_indices(all_datasets: list) -> set:
                     pass
     return invalid_indices
 
-def clean_and_save_datasets(filepaths: list, all_datasets: list, invalid_indices: set):
+def clean_and_save_datasets(all_datasets: list, invalid_indices: set):
     """
     Removes items at the specified indices from all datasets and saves them.
-    
+
     Args:
-        filepaths: The original file paths.
-        all_datasets: The list of datasets to clean.
+        all_datasets: (filepath, dataset) pairs, as returned by load_all_datasets.
         invalid_indices: A set of indices to remove.
     """
     if not invalid_indices:
@@ -65,7 +70,7 @@ def clean_and_save_datasets(filepaths: list, all_datasets: list, invalid_indices
 
     print(f"Found {len(invalid_indices)} unique indices to remove across all files.")
 
-    for i, (filepath, original_dataset) in enumerate(zip(filepaths, all_datasets)):
+    for filepath, original_dataset in all_datasets:
         # Build the new dataset using a list comprehension for safety and efficiency
         cleaned_dataset = [
             item for idx, item in enumerate(original_dataset)
@@ -109,7 +114,9 @@ def main():
         file_pattern = os.path.join(datadir, f'{prefix}_*.pkl')
         filepaths = glob(file_pattern)
         
-        # Filter filepaths to only include those ending in known patterns to avoid cleaning unrelated files
+        # Filter filepaths to only include those ending in known patterns to avoid cleaning
+        # unrelated files. NB: '_wave.pkl' is deliberately absent -- it is the shared wavelength
+        # grid, not a per-sample list, so it must not be index-filtered.
         valid_patterns = ['_T.pkl', '_tau.pkl', '_ne.pkl', '_vturb.pkl', '_vlos.pkl', '_z.pkl', '_logdeparture.pkl', '_n_Nat.pkl', '_Iwave.pkl']
         filepaths = sorted([f for f in filepaths if any(f.endswith(p) for p in valid_patterns)])
 
@@ -130,7 +137,7 @@ def main():
         global_invalid_indices = find_global_invalid_indices(datasets)
 
         # PASS 2: Clean all datasets using the global index list and save them
-        clean_and_save_datasets(filepaths, datasets, global_invalid_indices)
+        clean_and_save_datasets(datasets, global_invalid_indices)
 
 if __name__ == "__main__":
     main()

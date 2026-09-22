@@ -10,13 +10,15 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from Dataset import Dataset as dtst
 import lightweaver as lw
 from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_atom, OI_ord_atom, \
-    Si_atom_custom, Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+    Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+# Si_atom_custom is not in released lightweaver -- it ships with this repo (si_atom.py).
+from si_atom import Si_atom_custom
 
 
 test = []
 
-type_dtst = 'test'
-files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si_v2/20260911-231808/{type_dtst}_checkpoint_*.pkl'))
+type_dtst = 'validation'
+files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si_v2/20260912-225035/{type_dtst}_checkpoint_*.pkl'))
 dirs = [os.path.split(files[i])[0] for i in range(len(files))]
 plotdirs = [dirs[i] + '/plots/' for i in range(len(files))]
 names = [os.path.split(files[i])[1] for i in range(len(files))]
@@ -87,6 +89,7 @@ for j in range(len(files)):
         plt.title(f'Loss vs Epochs ({names[j]})')
         plt.legend()
         plt.grid(True)
+        plt.yscale('log')
         plt.savefig(plotdirs[j] + f'train_loss_vs_epochs_{names[j]}.png')
         # plt.show()
         plt.close()
@@ -166,9 +169,11 @@ for j, file in enumerate(files):
     print('Ploting and saving sampled populations from the test predictions')
 
     for i, indx in enumerate(sampler):
+        # target/prediction are stored scaled by 1/5 (Dataset.py); lte_pops is raw log10(b),
+        # so undo the scaling before putting them on the same axes.
         ax.flat[i].plot(lte_pops[i], color='C2')
-        ax.flat[i].plot(test[j]['target'][indx], color='C1')
-        ax.flat[i].plot(test[j]['prediction'][indx], color='C0')
+        ax.flat[i].plot(test[j]['target'][indx] * 5.0, color='C1')
+        ax.flat[i].plot(test[j]['prediction'][indx] * 5.0, color='C0')
         # ax.flat[i].text(0.05, 0.85, f'l$\epsilon$={self.eps[i]:5.3f}', transform=ax.flat[i].transAxes)
         axins = inset_axes(ax.flat[i], width="40%", height="40%", loc=1)
         temp_orig = test_dataset(indx)[0]
@@ -176,7 +181,7 @@ for j, file in enumerate(files):
         axins.set_ylim([3000, 15000])
 
     fig.supxlabel(r'$z$')
-    fig.supylabel('J')
+    fig.supylabel(r'$\log_{10}(n/n^*)$')
 
     print(f'saving at: {plotdirs[j]}')
     plt.savefig(plotdirs[j] + f'Si_checkpoint_{names[j]}_at_{time.strftime("%Y%m%d-%H%M%S")}.png')

@@ -1,128 +1,328 @@
 # graphnet_nlte
-Graphnets for solving radiative transfer problems in stellar atmospheres.
+
+Graph networks for solving radiative transfer problems in stellar atmospheres.
 
 Andres Vicente & Andrés Asensio:
 [Accelerating non-LTE synthesis and inversions with graph networks](https://arxiv.org/pdf/2111.10552.pdf)
 
-## Dependencies
+The current configuration trains a graph network to predict the 16 departure coefficients
+`b_i = n_i / n_i*` of a Si I/II/III model atom from a 1D atmospheric column, so that the
+Si I 1083.0 nm line can be synthesised with a single formal solution instead of a full
+statistical-equilibrium iteration.
 
-It is recommended to create a new `conda` environment to run this experiment.
-To do this, first download the latest version of miniconda at [Conda webpage](https://docs.conda.io/en/latest/miniconda.html#latest-miniconda-installer-links:)
-and follow the instructions of your particular system [install instructions](https://conda.io/projects/conda/en/latest/user-guide/install/index.html)
-Once you have conda install you should activate conda envioroment as:
+---
 
-     source /$install_directory$/miniconda3/bin/activate
+## What is in here
 
-And then you can create and activate a new environment to run the experiment as:
+| File | Role |
+|---|---|
+| `generate_database.py` | MPI database generation: perturbs model atmospheres, solves NLTE with lightweaver, writes the features and targets |
+| `dataset_scripts/clean_dataset.py` | Removes failed samples from a generated database, keeping every file in sync |
+| `Dataset.py` | Builds the graphs: node/edge features, normalisation, targets, loss mask |
+| `graphnet.py` | The Encode-Process-Decode network |
+| `Formal.py` | Training / validation / test loops, checkpointing |
+| `train.py` | Training entry point |
+| `test_prediction.py` | Runs a checkpoint over a split and dumps predictions vs. targets |
+| `explore_tests.py` | Plots those predictions and the profiles they imply |
+| `evaluate_intensity.py` | **Acceptance test**: how much closer to the truth the network gets than LTE, in intensity |
+| `api.py` | Minimal interface for calling the trained network from an inversion code |
+| `si_atom.py` | The custom 16-level Si I/II/III model atom (not in released lightweaver) |
+| `conf.dat` | Network hyperparameters |
 
-     conda create -n graphnet python=3.8
-     conda activate graphnet
+The steps below assume you run everything from inside `graphnet_nlte/`, with the databases one
+level up (`../data_1d_si_v3/` and so on). Nothing depends on that layout — every path is a flag.
 
-You will need to install the following packages for running the network:
+---
 
-     pip install lightweaver
-     conda install  mpi4py configobj pytorch cudatoolkit openmpi
-     pip install --upgrade numpy
-     pip install --upgrade numba
+## 0. Setup
 
-This implementation of Graphnet also depends on the PyTorch Geometric package.
-Check the webpage for more specific, but here you can find the usual installation:
+The environment is in `environment.yml`:
 
-     conda install -c conda-forge pytorch_geometric
-     conda install scipy
+    conda env create -f environment.yml
+    conda activate gph
 
-## Data
-Now you should be able to run the database generation scripts. To
-generate the databases you will need to have the model atmospheres (FALC+Biforst).
-You can find all the required data for that, as well as an already generated dB,
-the checkpoints of a pretrained GN and the tests for that GN with that checkpoint at:
-[data and pretrained models](https://cloud.iac.es/index.php/s/JR3GQym9mgNk4mL)
-The recommended folder structure should be like this (other arrangements are also possible):
+It resolves from conda-forge plus a stock `lightweaver` from PyPI, with no build strings and
+no CUDA wheel index, so it installs on any x86-64 Linux machine. The default is a CUDA build
+of PyTorch; see the header of `environment.yml` for the CPU swap and for building `mpi4py`
+against a site MPI instead.
 
-```bash
-.
-├── checkpoints
-│   ├── crd
-│   └── prd
-├── graphnet_nlte
-│   ├── dataset_scripts
-│   ├── plot_scripts
-│   └── tests
-├── data
-│   ├── crd
-│   ├── models_atmos
-│   └── prd
-└── tests
-    ├── crd
-    │   └── plots
-    └── prd
-        └── plots
+To build one by hand instead, the packages that matter are `lightweaver`, `pytorch`,
+`pytorch_geometric` (with `torch_scatter`), `mpi4py`, `configobj`, `scipy`, `scikit-learn`,
+`astropy`, `numpy`, `matplotlib` and `tqdm`.
+
+The 16-level Si I/II/III model atom this project is built on is **not** part of any released
+lightweaver -- it started as a local patch to `lightweaver/rh_atoms.py`. It now lives in
+`si_atom.py` in this directory, so import it from there rather than from `lightweaver`:
+
+    from si_atom import Si_atom_custom
+
+### Input data
+
+Database generation needs **one directory** containing both:
+
+* the semi-empirical reference atmospheres, `*.atmos` in MULTI format (FAL A/C/F/X-CO, the
+  `model100X` series, `T5750_g4.5_p00_ext`) — 16 models in the current set;
+* the two Bifrost snapshots, `snap385_rh.save` (train and test) and `snap530_rh.save`
+  (validation), as IDL save files.
+
+In this installation that directory is `../data_1d_old/data/models_atmos/`. The originals, along
+with an already-generated database and pretrained checkpoints, are at
+[data and pretrained models](https://cloud.iac.es/index.php/s/JR3GQym9mgNk4mL).
+
+---
+
+## 1. Generate the database
+
+Three separate runs, one per split. They are independent and can be run one after another:
+
+    # training split  (Bifrost snap385, first 80% of the cube in x)
+    mpiexec -n 48 python generate_database.py --train  1 --n 500000 --f 20000 \
+        --rd ../data_1d_old/data/models_atmos/ --sav ../data_1d_si_v3/
+
+    # test split      (Bifrost snap385, remaining 20% in x)
+    mpiexec -n 48 python generate_database.py --train  0 --n 120000 --f 20000 \
+        --rd ../data_1d_old/data/models_atmos/ --sav ../data_1d_si_v3/
+
+    # validation split (Bifrost snap530, a different snapshot entirely)
+    mpiexec -n 48 python generate_database.py --train -1 --n  25000 --f 20000 \
+        --rd ../data_1d_old/data/models_atmos/ --sav ../data_1d_si_v3/
+
+| Flag | Meaning |
+|---|---|
+| `--train` | `1` train, `0` test, `-1` validation. Also sets the output prefix. |
+| `--n` | Number of samples to compute |
+| `--f` | Write a checkpoint of the database every this many *completed* samples |
+| `--rd` | Input directory (see above) |
+| `--sav` | Output directory; created if missing |
+| `--prd` | Partial redistribution, `0` (default) for this line |
+| `--seed` | Order in which each split consumes its own Bifrost columns (default 1234) |
+
+`mpiexec -n K` uses one master and `K-1` workers, so ask for one more process than the number of
+solves you want in flight. This machine has 192 cores. Each NLTE solve takes roughly 0.2–1.5 s
+of single-core CPU, so 500k training samples on 48 processes is a few hours.
+
+**Choosing `--n`.** Each sample is drawn 50/50 from a Bifrost column or a perturbed reference
+atmosphere, until the Bifrost columns for that split run out; after that everything comes from
+the reference atmospheres. The 504×504 cube gives 203,112 columns to train and 50,904 to test,
+so `--n` of about 2× those numbers consumes all of them. For reference, the previous database
+came out as:
+
+| split | samples | Bifrost | reference-derived |
+|---|---|---|---|
+| train | 493,398 | 203,212 | 290,186 |
+| test | 98,873 | 50,804 | 48,069 |
+| validation | 19,763 | 10,316 | 9,447 |
+
+**Choosing `--f`.** Each checkpoint rewrites the whole database, and a full training split is
+~22 GB, so `--f 10` (the default) would spend the entire run on I/O. Something around
+`--n / 25` is a reasonable trade between lost work on a crash and time spent writing.
+
+### Output
+
+Per split, ten pickles named `<split>_<quantity>.pkl`:
+
+`T`, `z`, `ne`, `vturb`, `vlos`, `tau` (the atmosphere), `logdeparture` (the target,
+log₁₀(n/n\*)), `n_Nat` (log₁₀(n/n_total), used to build the loss mask), `Iwave` (the reference
+emergent profile) and `wave`.
+
+All of them are lists with one entry per sample **except `wave`**, which is the single shared
+wavelength grid the `Iwave` arrays live on — that is why `clean_dataset.py` leaves it alone.
+
+### How the splits are built
+
+`--train 1` and `--train 0` read the same snapshot and partition it by *position*: training takes
+the first `TRAIN_X_FRACTION` (0.8) of the cube's x-extent, test takes the rest. The partition is
+deterministic, so the two runs are always disjoint, and the boundary is one line through the
+snapshot rather than a scatter of pixels — neighbouring columns of a granulation snapshot are
+strongly correlated, so a random per-column split leaves near-copies of training columns in the
+test set even when it is a correct partition. `--seed` only shuffles the order in which a split
+consumes its own columns, so a run stopped early is still a reproducible, representative sample.
+
+`--train -1` reads `snap530_rh.save` instead and uses all of it, which makes validation the
+cleanest of the three splits: a different snapshot, sharing nothing with either of the others.
+
+Two details worth knowing about the atmospheres themselves:
+
+* The reference-atmosphere branch hands lightweaver `ne=None` and lets it reconstruct hydrostatic
+  equilibrium, which invents both `ne` and `nHTot`; only `ne` is stored. The atmosphere is
+  therefore rebuilt from that reconstructed `ne` before the NLTE solve, so the column that is
+  solved is exactly the one a consumer rebuilds from the stored features (`api.py` passes `ne`
+  back into `make_1d`, which derives `nHTot` from the electron pressure). Without that rebuild
+  the stored targets belong to an atmosphere the feature vector cannot reproduce, by up to ~1 dex.
+* The emergent intensity is evaluated at `atmos.muz[-1]` = 0.9531, i.e. θ = 17.6°, the outermost
+  node of the 5-point quadrature — not at disk centre.
+
+---
+
+## 2. Clean the database
+
+Samples whose NLTE solve fails are stored as `None` and rescheduled, but a run that ends while
+some are outstanding leaves holes. Remove them from every file at once:
+
+    python dataset_scripts/clean_dataset.py --dir ../data_1d_si_v3/
+
+It finds every prefix in the directory, takes the union of the indices that are `None` or
+non-finite in *any* file, and drops those indices from *all* of them, so the files stay aligned.
+It rewrites in place — copy the directory first if you want to keep the raw output.
+
+---
+
+## 3. Train
+
+    python train.py --epochs 300 --batch 64 --lr 1e-4 --gpu 0 \
+        --conf conf.dat --rd ../data_1d_si_v3/ --sav ./checkpoints_si_v3/
+
+This reads `<rd>/train_*.pkl` and splits it internally into train and validation fractions with
+`--split` (0.2 by default) — the on-disk `validation_*` split is *not* used here, it is for
+step 4. Other flags: `--smooth` (training-loss display only) and `--conf` (the hyperparameters).
+
+`train.py` creates a timestamped run directory under `--sav`, copies `conf.dat`, `Dataset.py`,
+`Formal.py`, `graphnet.py` and `train.py` into it, and writes a new `<timestamp>_best.pth` every
+time the validation loss improves. Each checkpoint carries its hyperparameters and the exact
+normalisation constants it was trained with, so it can always be reproduced later.
+
+Network size is set by `conf.dat`:
+
+    node_input_size = 5          # log10 T, z, log10 ne, vturb, vlos
+    edge_input_size = 1          # delta z between neighbouring depth points
+    global_input_size = 1
+    latent_size = 128
+    mlp_hidden_size = 128
+    mlp_n_hidden_layers = 3
+    n_message_passing_steps = 100
+    output_size = 16             # one departure coefficient per level
+
+`n_message_passing_steps` is the one to think about: the graph is a nearest-neighbour chain, so
+after K steps a node has seen exactly K depth points either side. Bifrost columns have 211
+points, so K = 100 couples about half a column.
+
+### About the loss
+
+The loss is a **masked** MSE. Levels and depths carrying less than
+`Dataset.NEGLIGIBLE_LOG_N_OVER_NTOT` (10⁻⁹) of the species population are dropped from it. They
+are physically inert — they move the emergent 1083 nm profile by less than a part in 10⁶ — but
+numerically loud: about 16% of the raw targets sit on the ±10 clip plateau at |y| = 2 after
+scaling, while the whole line-forming region lives inside |y| ≤ 0.2. At this threshold 20% of
+the points are masked and 83% of the clip plateau goes with them. The mask is built from the
+`*_n_Nat.pkl` files; without them nothing is masked and the loss is the plain MSE.
+
+Because the network is unsupervised on the masked points, `api.compute_dep_coeffs` clamps its
+output to the same ±10 the targets are clipped to.
+
+Two consequences for reading the numbers:
+
+* **the reported MSE is not comparable to runs from before masking** — it will read higher;
+* the MSE is only a proxy in any case. The validation loss is a true mean over the whole held-out
+  fraction (so `_best.pth` is selected on a stable number), but whether a checkpoint actually
+  improves the *profiles* is what step 4b measures.
+
+---
+
+## 4. Test
+
+### 4a. Predictions against a held-out split
+
+    python test_prediction.py --dtst validation --batch 64 --gpu 0 \
+        --rd ../data_1d_si_v3/ --sav ./checkpoints_si_v3/<run>/ --testdir ./checkpoints_si_v3/<run>/
+
+Note the flag names: `--sav` is where the **checkpoint is read from** and `--testdir` is where
+the **result is written**. `--sav` must be a single run directory *with a trailing slash*; the
+lexicographically last `*.pth` directly inside it is used, and the search is not recursive.
+
+This writes `<dtst>_checkpoint_<stamp>.pkl` holding the predictions, the targets, the normalised
+input features and the loss per batch.
+
+Use `--dtst validation`. A `test` split generated by the current code is a genuine hold-out, but
+any database generated before the spatial-split fix shares ~80% of its Bifrost columns with
+`train`, so a number measured on one of those is a memorisation score.
+
+Then plot 25 random columns and the profiles they imply:
+
+    python explore_tests.py
+
+Edit the two variables at the top of the file first — `type_dtst` and the `glob` path — to point
+at the run you just tested. It writes into `<run>/plots/`.
+
+### 4b. Acceptance test in intensity
+
+This is the number to quote. `evaluate_intensity.py` synthesises the Si I 1083.0 nm profile three
+times per column — from the stored converged departure coefficients, from the network, and from
+LTE — and reports how much closer to the reference the network gets than LTE does:
+
+    python evaluate_intensity.py --rd ../data_1d_si_v3/ --dtst validation \
+        --ck ./checkpoints_si_v3/<run>/ --n 120
+
+`--ck` takes either a `*_best.pth` file or a directory, in which case the most recent checkpoint
+at or below it is used. Output goes to `<run>/acceptance/` as a pickle and a three-panel figure,
+and it prints, for example:
+
+      metric (median over columns)                LTE     GraphNet       gain
+      line-core rel. intensity error           1.4308       0.1329      10.8x
+      equivalent-width rel. error              0.3765       0.0412       9.1x
+      GraphNet beats LTE on  95.8% of columns  (line core)
+
+      line depth 1 - I/Ic at core:  reference 0.795   GraphNet 0.768   LTE 0.519
+      log10(b) MAE below 800 km:    0.0326 dex
+      |sum n_i / n_Total - 1|:      0.0164 median below 800 km
+
+The last line is a diagnostic, not an error: the 16 levels are decoded independently, so the
+predicted populations do not conserve the Si total the way the lightweaver targets do.
+
+---
+
+## 5. Inference from your own code
+
+`api.py` is the interface for an external inversion. Three functions, all on one column at a
+time, all in SI units, with `z` **strictly decreasing** (index 0 = top of the atmosphere):
+
+```python
+import sys; sys.path.insert(0, '/path/to/graphnet_nlte')
+import api
+
+# GraphNet only -- milliseconds, no lightweaver. For the hot loop.
+log_dep = api.compute_dep_coeffs(T, z, ne, vturb, vlos)
+
+# GraphNet + one formal solution. Drop-in replacement for the full solve.
+wave, Iwave, log_dep = api.intensity_gnn(T, z, ne, vturb, vlos)
+
+# Full lightweaver NLTE solve. Ground truth, orders of magnitude slower.
+wave, Iwave, log_dep = api.synthesis_lw(T, z, ne, vturb, vlos)
 ```
 
-### Pretrained and Precomputed models
+`api.DEFAULT_CHECKPOINT` points at the `checkpoints_si_v2/` tree and resolves to the most recent
+`*_best.pth` below it on every call, so it follows training automatically; pass `checkpoint=`
+explicitly to pin a model. Point it at your new tree once step 3 is running.
 
-The data provide not only comes with the model atmospheres, you can also find there the precomputed
-databases for the PRD and CRD cases (train/validation/test) and one checkpoint of the PRD and CRD
-networks. The databases can be used to train with different hyperparameters (just changing the `conf.dat`)
-and the pretrained models can be used for inference as well as test it in other database specifying it
-at runtime with the `--readir=../data/other_db/` flag.
+Two limits to be aware of:
 
-## Database generation
-At this point to generate the database just go to graphnet_nlte dir and run:
+* `intensity_gnn` takes a single formal solution on a Context that has never been iterated, so
+  J = 0 and the background coherent-scattering emissivity is missing. That is accurate in the
+  near-IR (~10⁻⁴ relative against the converged solve) but not in the UV, where it reaches ~0.7
+  at 100–200 nm. The function warns below 400 nm; use `synthesis_lw` there.
+* `DEFAULT_WAVE` samples 1074–1085 nm at 2 pm, which keeps at least two samples across the Si
+  Doppler width (4.4 pm at 2500 K) everywhere in the training set. If you pass your own `wave`,
+  keep it at least that fine or the line core will read shallow.
 
-    mpiexec -n 4 python generate_database.py --n 1000 --freq 100 --readir ../data/models_atmos/ --savedir ../data/database/ --train 1 --prd 0
+---
 
-This will generate a training database at `../data/database/` with 1000 models in CRD, saving
-the database every 100 samples and using 4 cores.
-If you have placed the model atmospheres folder `models_atmos` somewhere else, 
-or you have different models, you can specify where to look for with the --readir flag.
+## Known limitations
 
-This is a computationally heavy procedure that is MPI parallelized. It will generate a
-few files containing temperature stratifications, column mass, and optical depths, as
-well as departure coefficients.
-If your machine has more cores you can take advantage by increasing the used cores
-with the -n $ncores flag. It may take a while so you can go to make some coffee :).
+Open items, in the order they are worth addressing:
 
+* **Populations are not conserved.** Σ nᵢ ≠ n_total for the predicted populations, by ~2–5% in
+  the photosphere, which is a systematic floor on the line depth. Renormalising in
+  `compute_dep_coeffs` is cheap and helps; training on `n_Nat` instead of `logdeparture` would
+  remove it properly.
+* **The receptive field is shorter than a column.** See `n_message_passing_steps` above.
+* **A third of the generated atmospheres have no photosphere.** Perturbing T by σ = 2500 K at
+  every knot and re-integrating hydrostatic equilibrium moves the bottom density by orders of
+  magnitude: ~35% of columns never reach τ₅₀₀ = 1 and ~11% exceed 10⁶. They are valid,
+  converged atmospheres, just not ones the Si I 1083 nm line is ever inverted in, and they
+  stretch the input normalisation. Rejecting on max τ₅₀₀ at generation time would fix it.
+* **The stored `tau` column is not a calibrated depth scale.** lightweaver reports
+  τ₅₀₀ = 2.5×10⁻³ at FALC's own h = 0, where the model defines it to be ~1. Nothing in the
+  current configuration reads it — the network uses `z`, and the perturbation knots no longer
+  depend on it — but do not build anything on it without checking first.
 
-## Graphnet training
-
-Once you have the data (either generated or used the provided one) to train with,
-you can train the network. The configuration of the Graphnet model is tuned with
-a configuration file, that needs to be passed to the training script. 
-An example is given by `conf.dat`, so that training can be done using:
-
-    python train.py --epochs=100 --sav ../checkpoints/savedir/ --readir ../data/database/ --batch 32
-
-Where `../data/database` should contain the dataset created earlier (change for `../data/crd`
-to use the provided one). This will train the network for 100 epochs. You can
-also change the parameters of the training, for example, the configuration file `--conf=conf.dat`,
-the validation split `--split=0.2`, the GPU you want to run the training in `--gpu=0`,
-the LR `--lr=1e-4`, or the smoothing factor `--smooth=0.05`.
-
-
-## Verification
-
-The results of the training can be checked against the validation dataset with: 
-
-    python test_prediction.py --readir ../data/database/ --sav ../checkpoints/savedir/ --testdir ../test/test_dir/
-
-This will read the data in the `../data/dataset/validation_*` and save a pickle object in
-`../test/test_dir/` folder with the results of the prediction. Note that the dataset is
-not the same as for training so you will need to have generated another dataset with
-the validation flag `--train -1`. If you want to change the network to test, just change
-the `--sav ../checkpoints/other` to other GN checkpoints.
-Then with those results, you can visualize 25 random predictions and intensity profiles 
-from each of the testing files with:
-
-    cp plot_scripts/explore_tests.py .
-    python explore_tests.py
-    rm explore_tests.py
-
-This will save the plots inside the same directory in which the test has been saved.
-
-## Inference
-
-To do test inference of model atmosphere you can run the scripts `tests/predict_simple.py`.
-Note that this implementation is just for testing the network and has a huge overhead when
-loading the data and other unnecessary tasks. For a more efficient implementation to do inversions please
-contact the authors.
+`tests/` holds scripts from the earlier Ca II work. They do not run against the current pipeline
+and are kept for reference only.

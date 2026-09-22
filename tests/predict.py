@@ -1,3 +1,11 @@
+"""
+STALE -- kept for reference only, does not run against the current Si I pipeline.
+
+These scripts date from the CaII/H work: they use the Ca-active atom set, a ColumnMass depth
+scale, and Formal.predict() paths that the Si I database no longer produces (test_normalization
+also references an undefined `cmass`). For the current verification path see test_prediction.py
+and evaluate_intensity.py in the repository root.
+"""
 from Formal import Formal as graphnet
 import numpy as np
 import lightweaver as lw

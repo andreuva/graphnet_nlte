@@ -19,12 +19,28 @@ NORM_STATS = {
     'delta_z': {'std': 17706.5},                     # std of z differences between adjacent nodes (edge feature)
 }
 
+# Levels and depths whose population falls below this fraction of the species total,
+# log10(n_i / n_Total), are dropped from the loss. They are physically inert -- they change the
+# emergent Si I 1083 nm profile by less than a part in 1e6 -- but they are numerically loud:
+# roughly 16% of all target values sit on the +-10 clip plateau at |y| = 2 after scaling, while
+# the entire line-forming region lives inside |y| <= 0.2, so an unmasked MSE spends most of its
+# gradient there. At -9 this masks 20% of the points and removes 83% of the clipped plateau.
+# Requires the *_n_Nat.pkl files; without them nothing is masked.
+NEGLIGIBLE_LOG_N_OVER_NTOT = -9.0
+
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, hyperparameters, datadir='../data/', prefix='train'):
+    def __init__(self, hyperparameters, datadir='../data/', prefix='train', norm_stats=None):
         """
         Dataset for the depth stratification
+
+        norm_stats : dict, optional
+            Normalization constants to build the features with. Defaults to the module-level
+            NORM_STATS; pass a checkpoint's embedded 'norm_stats' when reproducing the exact
+            inputs an older checkpoint was trained with.
         """
         super(Dataset, self).__init__()
+
+        ns = NORM_STATS if norm_stats is None else norm_stats
 
         # Read the training database
         with open(datadir + prefix + '_tau.pkl', 'rb') as filehandle:
@@ -71,6 +87,7 @@ class Dataset(torch.utils.data.Dataset):
         self.edges = [None] * self.n_training
         self.u = [None] * self.n_training
         self.target = [None] * self.n_training
+        self.mask = [None] * self.n_training
 
         # Loop over all training examples
         for i in tqdm(range(self.n_training), "Preparing graphs..."):
@@ -106,26 +123,26 @@ class Dataset(torch.utils.data.Dataset):
             self.nodes[i] = np.zeros((num_nodes, node_input_size))
 
             # Feature 0: log10(T)
-            self.nodes[i][:, 0] = (np.log10(self.T_all[i]) - NORM_STATS['T_log10']['mean']) / NORM_STATS['T_log10']['std']
+            self.nodes[i][:, 0] = (np.log10(self.T_all[i]) - ns['T_log10']['mean']) / ns['T_log10']['std']
 
             # Feature 1: Height z or log10(tau)
             if node_input_size > 1:
                 if self.z_activated:
-                    self.nodes[i][:, 1] = (self.z_all[i] - NORM_STATS['z']['mean']) / NORM_STATS['z']['std']
+                    self.nodes[i][:, 1] = (self.z_all[i] - ns['z']['mean']) / ns['z']['std']
                 else:
-                    self.nodes[i][:, 1] = (np.log10(self.tau_all[i]) - NORM_STATS['tau_log10']['mean']) / NORM_STATS['tau_log10']['std']
+                    self.nodes[i][:, 1] = (np.log10(self.tau_all[i]) - ns['tau_log10']['mean']) / ns['tau_log10']['std']
 
             # Feature 2: log10(ne)
             if node_input_size > 2 and self.ne_activated:
-                self.nodes[i][:, 2] = (np.log10(self.ne[i]) - NORM_STATS['ne_log10']['mean']) / NORM_STATS['ne_log10']['std']
+                self.nodes[i][:, 2] = (np.log10(self.ne[i]) - ns['ne_log10']['mean']) / ns['ne_log10']['std']
 
             # Feature 3: vturb [km/s]
             if node_input_size > 3:
-                self.nodes[i][:, 3] = (self.vturb_all[i] / 1e3 - NORM_STATS['vturb_km']['mean']) / NORM_STATS['vturb_km']['std']
+                self.nodes[i][:, 3] = (self.vturb_all[i] / 1e3 - ns['vturb_km']['mean']) / ns['vturb_km']['std']
 
             # Feature 4: vlos [km/s]
             if node_input_size > 4:
-                self.nodes[i][:, 4] = (self.vlos_all[i] / 1e3 - NORM_STATS['vlos_km']['mean']) / NORM_STATS['vlos_km']['std']
+                self.nodes[i][:, 4] = (self.vlos_all[i] / 1e3 - ns['vlos_km']['mean']) / ns['vlos_km']['std']
 
             # Define normalized edge features
             edge_input_size = hyperparameters['edge_input_size']
@@ -137,20 +154,20 @@ class Dataset(torch.utils.data.Dataset):
                 else:
                     z_0 = self.z_all[i][self.edge_index[i][0, :]]
                     z_1 = self.z_all[i][self.edge_index[i][1, :]]
-                    self.edges[i][:, 0] = (z_0 - z_1) / NORM_STATS['delta_z']['std']
+                    self.edges[i][:, 0] = (z_0 - z_1) / ns['delta_z']['std']
 
                 tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
                 tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 1] = (tau0 - tau1) / NORM_STATS['tau_log10']['std']
+                self.edges[i][:, 1] = (tau0 - tau1) / ns['tau_log10']['std']
             elif edge_input_size == 1:
                 if self.z_activated:
                     z_0 = self.z_all[i][self.edge_index[i][0, :]]
                     z_1 = self.z_all[i][self.edge_index[i][1, :]]
-                    self.edges[i][:, 0] = (z_0 - z_1) / NORM_STATS['delta_z']['std']
+                    self.edges[i][:, 0] = (z_0 - z_1) / ns['delta_z']['std']
                 else:
                     tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
                     tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                    self.edges[i][:, 0] = (tau0 - tau1) / NORM_STATS['tau_log10']['std']
+                    self.edges[i][:, 0] = (tau0 - tau1) / ns['tau_log10']['std']
             else:
                 raise ValueError("Incompatible edge input size")
 
@@ -167,11 +184,25 @@ class Dataset(torch.utils.data.Dataset):
             # still found (non-converged sample slipping through), we make it zero.
             self.target[i] = np.nan_to_num(np.clip(self.dep_all[i][:, :].T, -10.0, 10.0) / 5.0)
 
+            # Per (depth, level) weight of 1/0 for the loss. A NaN in n_Nat compares False and is
+            # therefore masked out, which is what we want: it means the population underflowed to
+            # zero, i.e. the level is empty.
+            if self.n_Nat_activated:
+                with np.errstate(invalid='ignore'):
+                    self.mask[i] = (self.n_Nat[i][:, :].T >= NEGLIGIBLE_LOG_N_OVER_NTOT)
+            else:
+                self.mask[i] = np.ones_like(self.target[i], dtype=bool)
+
             # Finally, all information is transformed to float32 tensors
             self.nodes[i] = torch.tensor(self.nodes[i].astype('float32'))
             self.edges[i] = torch.tensor(self.edges[i].astype('float32'))
             self.u[i] = torch.tensor(self.u[i].astype('float32'))
             self.target[i] = torch.tensor(self.target[i].astype('float32'))
+            self.mask[i] = torch.tensor(self.mask[i].astype('float32'))
+
+        # The raw n_Nat arrays are only needed to build the masks above, and they are as large as
+        # the departure coefficients themselves (8.7 GB for the training split).
+        self.n_Nat = None
 
     def __getitem__(self, index):
 
@@ -186,7 +217,8 @@ class Dataset(torch.utils.data.Dataset):
         u = self.u[index]
         edge_index = self.edge_index[index]
 
-        data = torch_geometric.data.Data(x=node, edge_index=edge_index, edge_attr=edge_attr, y=target, u=u)
+        data = torch_geometric.data.Data(x=node, edge_index=edge_index, edge_attr=edge_attr, y=target, u=u,
+                                         mask=self.mask[index])
 
         return data
 

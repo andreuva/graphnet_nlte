@@ -1,5 +1,4 @@
 import numpy as np
-from random import shuffle
 from astropy.convolution import Box1DKernel
 from astropy.convolution import convolve
 import scipy.io as io
@@ -14,7 +13,9 @@ from mpi4py import MPI
 import argparse
 from enum import IntEnum
 from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_atom, OI_ord_atom, \
-    Si_atom_custom, Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+    Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+# Si_atom_custom is not in released lightweaver -- it ships with this repo (si_atom.py).
+from si_atom import Si_atom_custom
 import lightweaver as lw
 
 
@@ -25,6 +26,25 @@ class tags(IntEnum):
     DONE = 1
     EXIT = 2
     START = 3
+
+
+# Fraction of the snapshot's x-extent reserved for the training split; the rest is the test
+# split. The hold-out is a contiguous strip in x, and is derived from the column's position in
+# the cube rather than from a random draw, for two reasons:
+#   - it is deterministic, so a `--train 1` run and a `--train 0` run of this script always
+#     produce a true partition. The previous scheme reshuffled the columns with an unseeded
+#     random.shuffle in every run and then sliced [0:0.8N] / [0.8N:N] of *different*
+#     permutations, which put ~80% of the test columns back into the training set;
+#   - neighbouring columns of a granulation snapshot are strongly correlated (a granule spans
+#     ~15 pixels of a 504x504 cube), so even a correctly partitioned random column split leaves
+#     near-copies of training columns in the test set. A strip breaks that correlation at a
+#     single boundary.
+# Validation uses a different snapshot entirely (snap530) and so is allowed the whole cube.
+TRAIN_X_FRACTION = 0.8
+
+# Iteration cap handed to lw.iterate_ctx_se. It returns normally when it runs out of iterations
+# rather than raising, so synth_spectrum has to compare against this to notice.
+NMAX_ITER = 2000
 
 
 def smooth(sig, kernel=Box1DKernel, width=2):
@@ -59,12 +79,19 @@ def synth_spectrum(atmos, depthData=False, Nthreads=1, conserveCharge=False, prd
     if depthData:
         ctx.depthData.fill = True
 
-    # Iterate the Context to convergence
-    lw.iterate_ctx_se(ctx, prd=prd, quiet=True)
+    # Iterate the Context to convergence. iterate_ctx_se returns normally after NmaxIter whether
+    # or not it converged, and quiet=True suppresses the message that says so, so a non-converged
+    # solve would otherwise be written into the database as long as the populations stayed finite.
+    # Raising here puts it on slave_work's existing failure path, which reschedules the sample.
+    niter = lw.iterate_ctx_se(ctx, prd=prd, quiet=True, NmaxIter=NMAX_ITER)
+    if niter >= NMAX_ITER - 1:
+        raise RuntimeError(f'statistical equilibrium did not converge in {NMAX_ITER} iterations')
 
     # Update the background populations based on the converged solution and
     eqPops.update_lte_atoms_Hmin_pops(atmos, quiet=True)
-    # compute the final solution for mu=1 on the provided wavelength grid.
+    # compute the final solution on the provided wavelength grid. Note that the emergent
+    # intensity is later evaluated at atmos.muz[-1] = 0.9531 (theta = 17.6 deg), the outermost
+    # node of the 5-point quadrature -- not at disk centre.
     ctx.formal_sol_gamma_matrices()
     if prd:
         ctx.prd_redistribute()
@@ -94,7 +121,7 @@ def iterate_ctx_crd(ctx, prd=False, Nscatter=10, NmaxIter=500):
 
 class Model_generator(object):
 
-    def __init__(self, train, datadir):
+    def __init__(self, train, datadir, seed=1234):
         """Loading of all the data in models of atmospheres (BIFORST + ATMOSREF)"""
 
         self.train = train
@@ -105,28 +132,34 @@ class Model_generator(object):
         else:
             self.bifrost = io.readsav(datadir + 'snap385_rh.save')
 
-        # store the number of models in the bifrost dataset and the current state
-        self.n_bifrost = self.bifrost['tg'][0, :, :].size
+        # Cube layout before flattening: (nz, nx, ny). We need nx/ny to map a flattened column
+        # index back to its (ix, iy) position in the snapshot, which is what defines the split.
+        _, nx, ny = self.bifrost['tg'].shape
 
         self.bifrost['tg'] = np.reshape(self.bifrost['tg'], (self.bifrost['tg'].shape[0], -1))
         self.bifrost['vlos'] = np.reshape(self.bifrost['vlos'], (self.bifrost['vlos'].shape[0], -1))
         self.bifrost['nel'] = np.reshape(self.bifrost['nel'], (self.bifrost['nel'].shape[0], -1))
 
-        # Shufle the bifrost columns
-        index = np.arange(0, self.bifrost['tg'].shape[-1])
-        shuffle(index)
-        self.bifrost['tg'] = self.bifrost['tg'][:, index]
-        self.bifrost['vlos'] = self.bifrost['vlos'][:, index]
-        self.bifrost['nel'] = self.bifrost['nel'][:, index]
-
-        # selecting different parts of the simulation if we are in training or testing
+        # Select which columns of the snapshot this split is allowed to draw from. Flattening is
+        # C-ordered, so the column at flat index i sits at ix = i // ny (see TRAIN_X_FRACTION).
+        columns = np.arange(nx * ny)
         if self.train < 0:
-            self.current_bifrost = 0
-        elif self.train > 0:
-            self.current_bifrost = 0
-            self.n_bifrost = int(self.n_bifrost*0.8)
+            allowed = columns                       # validation: different snapshot, use it all
         else:
-            self.current_bifrost = int(0.8*self.n_bifrost)
+            in_train_strip = (columns // ny) < int(TRAIN_X_FRACTION * nx)
+            allowed = columns[in_train_strip] if self.train > 0 else columns[~in_train_strip]
+
+        # Only the *order* in which the allowed columns are consumed is randomised, and with a
+        # fixed seed, so that a run that is stopped early is still a reproducible and spatially
+        # representative sample of its own strip. Indexing through this array instead of
+        # permuting the cubes also avoids three full copies of the snapshot.
+        self.column_order = np.random.default_rng(seed).permutation(allowed)
+        self.n_bifrost = self.column_order.size
+        self.current_bifrost = 0
+
+        split_name = {-1: 'validation', 0: 'test', 1: 'train'}[int(np.sign(self.train))]
+        print(f"BIFROST split '{split_name}': {self.n_bifrost} of {nx*ny} columns "
+              f"(cube {nx}x{ny}, seed {seed})\n", flush=True)
 
         # Read the semiempirical reference atmospheres for every split, including validation, so
         # that validation samples also get vturb/vlos perturbations instead of being Bifrost-only
@@ -163,9 +196,19 @@ class Model_generator(object):
             # Define the arrays for each reference atmosphere
             for i in range(self.n_ref_atmos):
                 self.ltau[i] = np.log10(self.atmosRef[i].tauRef)
-                self.ltau_nodes[i] = np.array([np.min(self.ltau[i]), -5, -4, -3, -2, -1, 0, np.max(self.ltau[i])])
+                # Knots spread evenly in log(tau) between the two ends of *this* model. The
+                # previous fixed ladder [min, -5, -4, -3, -2, -1, 0, max] assumed the models reach
+                # tau500 = 1; none of them does (they top out between log tau = -2.3 and -2.9), so
+                # the array was not monotonic. interp1d silently re-sorted x and y together, three
+                # of the eight knots fell outside the model and did no work, and the interpolant
+                # near the lower boundary was driven by a knot beyond it. An even spread reproduces
+                # the intended ~1 dex knot spacing while being strictly increasing by construction.
+                self.ltau_nodes[i] = np.linspace(self.ltau[i].min(), self.ltau[i].max(), 8)
                 self.ntau[i] = len(self.ltau_nodes[i])
-                self.ind_ltau[i] = np.searchsorted(self.ltau[i], self.ltau_nodes[i]) - 1
+                # clip: searchsorted returns 0 for the first knot, so the -1 used to wrap round to
+                # the *last* depth point, giving the top knot the vturb of the bottom of the model.
+                self.ind_ltau[i] = np.clip(
+                    np.searchsorted(self.ltau[i], self.ltau_nodes[i]) - 1, 0, len(self.ltau[i]) - 1)
                 self.logT[i] = np.log10(self.atmosRef[i].temperature)
             
             print(f"Finished Model generator initialization\n", flush=True)
@@ -181,11 +224,12 @@ class Model_generator(object):
         if np.random.choice(a=choices) and self.current_bifrost < self.n_bifrost:
 
             # Read the model parameters
+            column = self.column_order[self.current_bifrost]
             heigth = np.float64(self.bifrost['z'][::-1]*1e3)
-            T_new = np.float64(self.bifrost['tg'][:, self.current_bifrost][::-1])
-            vlos_new = np.float64(self.bifrost['vlos'][:, self.current_bifrost][::-1])
+            T_new = np.float64(self.bifrost['tg'][:, column][::-1])
+            vlos_new = np.float64(self.bifrost['vlos'][:, column][::-1])
             vturb_new = vlos_new*0
-            ne = np.float64(self.bifrost['nel'][:, self.current_bifrost][::-1])
+            ne = np.float64(self.bifrost['nel'][:, column][::-1])
 
             # Set the depth as the tau500 and the depth scale acordingly
             depth = heigth
@@ -217,6 +261,11 @@ class Model_generator(object):
             deltas_vturb = np.random.normal(loc=0.0, scale=std, size=self.ntau[i])
             f = interp.interp1d(self.ltau_nodes[i], deltas_vturb, kind='quadratic', bounds_error=False, fill_value="extrapolate")
             vturb_new = self.atmosRef[i].vturb + f(self.ltau[i])
+            # The quadratic interpolation overshoots and can drive vturb negative. Only vturb**2
+            # ever reaches the physics, so a negative value is silently folded to its magnitude by
+            # lightweaver -- but it is fed to the network *signed*, making two identical
+            # atmospheres look like different inputs, and api.compute_dep_coeffs rejects it.
+            vturb_new[vturb_new < 0] = 0.0
             ne = None
 
             # Set the v LOS to 0 + perturbations
@@ -232,10 +281,10 @@ class Model_generator(object):
             return depth_scale, depth, T_new, vlos_new, vturb_new, ne
 
 
-def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_frequency=1):
+def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_frequency=1, seed=1234):
     """ Function to define the work to do by the master """
     # Calling the Model_generator to read the models and initialice the class
-    mg = Model_generator(train, readdir)
+    mg = Model_generator(train, readdir, seed=seed)
 
     # Index of the task to keep track of each job
     task_index = 0
@@ -252,10 +301,23 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
     z_list = [None] * nsamples                  # Column mass
     ne_list = [None] * nsamples                 # density of electrons in the atmosphere
     Iwave_list = [None] * nsamples              # Intensity profile of the model
+    wave_grid = None                            # wavelength grid the Iwave arrays live on
 
     success = True
 
     tasks_status = [0] * nsamples
+    last_dump = 0                               # value of pbar.n at the previous dump
+
+    def dump_all():
+        """Write every array to disk. Dumps the full lists: the old code sliced [0:task_index],
+        which is the index of the last *dispatched* task, so it both trailed the finished work
+        and could include unfinished None entries."""
+        arrays = {'logdeparture': log_departure_list, 'n_Nat': n_Nat_list, 'T': T_list,
+                  'vturb': vturb_list, 'vlos': vlos_list, 'tau': tau_list, 'z': z_list,
+                  'ne': ne_list, 'Iwave': Iwave_list, 'wave': wave_grid}
+        for name, data in arrays.items():
+            with open(savedir + f'{filename}_{name}.pkl', 'wb') as filehandle:
+                pickle.dump(data, filehandle)
 
     print("Master starting loop to distribute the work", flush=True)
 
@@ -312,6 +374,11 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                     tasks_status[index] = 0
 
                 else:
+                    if wave_grid is None:
+                        # Same for every sample (it depends only on the atomic models), but it was
+                        # never stored, which left the Iwave arrays in the database unusable
+                        # without re-deriving the grid by hand.
+                        wave_grid = dataReceived['wave']
                     log_departure_list[index] = dataReceived['log_departure']
                     n_Nat_list[index] = dataReceived['n_Nat']
                     T_list[index] = dataReceived['T']
@@ -331,65 +398,17 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                 # print(" * MASTER : worker {0} exited.".format(source))
                 closed_workers += 1
 
-            # If the number of itterations is multiple with the write frequency dump the data
-            if (pbar.n / write_frequency == pbar.n // write_frequency):
-
-                with open(savedir + f'{filename}_logdeparture.pkl', 'wb') as filehandle:
-                    pickle.dump(log_departure_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_n_Nat.pkl', 'wb') as filehandle:
-                    pickle.dump(n_Nat_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_T.pkl', 'wb') as filehandle:
-                    pickle.dump(T_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_vturb.pkl', 'wb') as filehandle:
-                    pickle.dump(vturb_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_vlos.pkl', 'wb') as filehandle:
-                    pickle.dump(vlos_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_tau.pkl', 'wb') as filehandle:
-                    pickle.dump(tau_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_z.pkl', 'wb') as filehandle:
-                    pickle.dump(z_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_ne.pkl', 'wb') as filehandle:
-                    pickle.dump(ne_list[0:task_index], filehandle)
-
-                with open(savedir + f'{filename}_Iwave.pkl', 'wb') as filehandle:
-                    pickle.dump(Iwave_list[0:task_index], filehandle)
+            # Checkpoint the database once every write_frequency *completed* samples. The old
+            # condition (pbar.n % write_frequency == 0) was re-evaluated after every MPI message,
+            # READY included, so all nine files were rewritten many times over while the counter
+            # sat on a multiple -- at this database's size, hours of pointless I/O.
+            if pbar.n >= last_dump + write_frequency:
+                last_dump = pbar.n
+                dump_all()
 
     # Once finished, dump all the data
     print("Master finishing")
-
-    with open(savedir + f'{filename}_z.pkl', 'wb') as filehandle:
-        pickle.dump(z_list, filehandle)
-
-    with open(savedir + f'{filename}_logdeparture.pkl', 'wb') as filehandle:
-        pickle.dump(log_departure_list, filehandle)
-
-    with open(savedir + f'{filename}_n_Nat.pkl', 'wb') as filehandle:
-        pickle.dump(n_Nat_list, filehandle)
-
-    with open(savedir + f'{filename}_T.pkl', 'wb') as filehandle:
-        pickle.dump(T_list, filehandle)
-
-    with open(savedir + f'{filename}_vturb.pkl', 'wb') as filehandle:
-        pickle.dump(vturb_list, filehandle)
-
-    with open(savedir + f'{filename}_vlos.pkl', 'wb') as filehandle:
-        pickle.dump(vlos_list, filehandle)
-
-    with open(savedir + f'{filename}_tau.pkl', 'wb') as filehandle:
-        pickle.dump(tau_list, filehandle)
-
-    with open(savedir + f'{filename}_ne.pkl', 'wb') as filehandle:
-        pickle.dump(ne_list, filehandle)
-
-    with open(savedir + f'{filename}_Iwave.pkl', 'wb') as filehandle:
-        pickle.dump(Iwave_list, filehandle)
+    dump_all()
 
 
 def slave_work(rank):
@@ -428,6 +447,34 @@ def slave_work(rank):
                 # Compute the new atmosphere and solve the NLTE problem and retrieve the solved parameters
                 atmos = lw.Atmosphere.make_1d(scale=depth_scale, depthScale=depth, temperature=temperature,
                                               vlos=vlos, vturb=vturb, verbose=False, ne=ne)
+
+                if ne is None:
+                    # The reference-atmosphere branch of new_model() hands us ne=None, so the call
+                    # above ran a hydrostatic reconstruction and invented *both* ne and nHTot. We
+                    # only ever store ne, and any consumer of this database (api.py, and any
+                    # inversion built on it) rebuilds the atmosphere by passing that ne back in --
+                    # which sends lightweaver down the other EOS branch, deriving nHTot from the
+                    # electron pressure instead. The two branches disagree (typically 0.01-0.3 dex
+                    # in nHTot, far more for pathological columns), so the departure coefficients
+                    # solved on the hydrostatic atmosphere do not belong to the atmosphere the
+                    # features reconstruct -- a hidden variable the network cannot see.
+                    #
+                    # Rebuilding here from the reconstructed ne puts generation on exactly the same
+                    # code path as inference, so a stored (T, z, ne, vturb, vlos) column now
+                    # determines its own target. The Bifrost branch already supplies ne and so
+                    # already took this path; this makes the two consistent. The cost is that the
+                    # solved atmosphere is no longer in strict hydrostatic equilibrium -- it is the
+                    # EOS's reading of the hydrostatic electron density -- which is the same
+                    # compromise the Bifrost columns have always carried.
+                    atmos = lw.Atmosphere.make_1d(
+                        scale=lw.ScaleType.Geometric,
+                        depthScale=np.ascontiguousarray(atmos.z, dtype=np.float64),
+                        temperature=np.ascontiguousarray(atmos.temperature, dtype=np.float64),
+                        vlos=np.ascontiguousarray(atmos.vlos, dtype=np.float64),
+                        vturb=np.ascontiguousarray(atmos.vturb, dtype=np.float64),
+                        ne=np.ascontiguousarray(atmos.ne, dtype=np.float64),
+                        verbose=False)
+
                 ctx = synth_spectrum(atmos, depthData=True, conserveCharge=False, prd=prd_active)
                 # print(f" * WORKER {rank}: finished NLTE task {task_index}.", flush=True)
                 tau = atmos.tauRef
@@ -449,7 +496,8 @@ def slave_work(rank):
                                           np.log10(ctx.activeAtoms[at].n / ctx.activeAtoms[at].nTotal),
                                           axis=0)
 
-                Iwave = ctx.compute_rays(ctx.spect.wavelength, [atmos.muz[-1]], stokes=False)
+                wave = np.asarray(ctx.spect.wavelength)
+                Iwave = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
 
                 # If the coefficients are not converged (NaN) or blew up to +/-inf
                 # (e.g. a population underflowing to exactly 0 before the log10) set as failure
@@ -467,7 +515,8 @@ def slave_work(rank):
 
             # Send the computed data
             dataToSend = {'index': task_index, 'T': temperature, 'log_departure': log_departure, 'n_Nat': n_Nat,
-                          'tau': tau, 'zz': zz, 'vlos': vlos, 'vturb': vturb, 'ne': ne, 'success': success, 'Iwave': Iwave}
+                          'tau': tau, 'zz': zz, 'vlos': vlos, 'vturb': vturb, 'ne': ne, 'success': success,
+                          'Iwave': Iwave, 'wave': wave}
             comm.send(dataToSend, dest=0, tag=tags.DONE)
             # print(f" * WORKER {rank}: finished task {task_index}.", flush=True)
 
@@ -497,6 +546,9 @@ if (__name__ == '__main__'):
         parser.add_argument('--sav', '--savedir', default=f'../data/{time.strftime("%Y%m%d-%H%M%S")}/', metavar='SAVEDIR', help='directory for output files')
         parser.add_argument('--rd', '--readir', default=f'../data/models_atmos/', metavar='READIR', help='directory for reading files')
         parser.add_argument('--prd', '--prd', default=0, type=int, metavar='PRD', help='partial redistribution flag')
+        parser.add_argument('--seed', '--seed', default=1234, type=int, metavar='SEED',
+                            help='seed for the order in which Bifrost columns are consumed. The train/test '
+                                 'partition itself is spatial and seed-independent (see TRAIN_X_FRACTION)')
         # parser.add_argument('--o', '--out', default='train', metavar='OUTFILE', help='Root of output files')
 
         parsed = vars(parser.parse_args())
@@ -522,7 +574,8 @@ if (__name__ == '__main__'):
         comm.barrier()
         print("Master: Starting work distribution...", flush=True)
 
-        master_work(parsed['n'], parsed['train'], parsed['prd'], parsed['sav'], parsed['rd'], filename, write_frequency=parsed['f'])
+        master_work(parsed['n'], parsed['train'], parsed['prd'], parsed['sav'], parsed['rd'], filename,
+                    write_frequency=parsed['f'], seed=parsed['seed'])
     else:
         # Worker processes wait for master to finish initialization
         print(f"Worker {rank}: Waiting for master to finish initialization...", flush=True)

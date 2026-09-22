@@ -10,7 +10,9 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from Dataset import Dataset as dtst
 import lightweaver as lw
 from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_atom, OI_ord_atom, \
-    Si_atom_custom, Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+    Al_atom, CaII_atom, Fe_atom, FeI_atom, He_9_atom, He_atom, He_large_atom, MgII_atom, N_atom, Na_atom, S_atom
+# Si_atom_custom is not in released lightweaver -- it ships with this repo (si_atom.py).
+from si_atom import Si_atom_custom
 
 
 test = []

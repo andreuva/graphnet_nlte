@@ -16,6 +16,32 @@ from Dataset import Dataset as dtst
 from Dataset import NORM_STATS
 
 
+# Maximum gradient L2 norm allowed through to the optimizer, and Adam's numerical parameters.
+# Per-parameter gradients here are ~3e-6, small enough that the default eps=1e-8 with
+# beta2=0.999 leaves the second-moment estimate stale between updates -- the regime in which one
+# unlucky batch produces an oversized step. A larger eps and a shorter beta2 memory are the
+# standard mitigation; both are conservative and cost nothing.
+GRAD_CLIP_NORM = 0.5
+ADAM_EPS = 1e-6
+ADAM_BETAS = (0.9, 0.95)
+
+
+def masked_mse(out, target, mask=None):
+    """
+    Mean squared error over the unmasked entries only.
+
+    `mask` is a 1/0 float tensor the same shape as `target`, zero on the (depth, level) points
+    whose population is astrophysically negligible -- see Dataset.NEGLIGIBLE_LOG_N_OVER_NTOT.
+    Averaging over the surviving entries rather than over all of them keeps the loss comparable
+    between batches with different amounts of masking.
+    """
+    sq = (out - target) ** 2
+    if mask is None:
+        return sq.mean()
+    mask = mask.view_as(sq)
+    return (sq * mask).sum() / mask.sum().clamp(min=1.0)
+
+
 try:
     import nvidia_smi
     NVIDIA_SMI = True
@@ -101,13 +127,14 @@ class Formal(object):
                         '{0}.model.py'.format(savedir + filename))
 
         # Optimizer
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr,
+                                          betas=ADAM_BETAS, eps=ADAM_EPS)
 
         # Cosine annealing learning rate scheduler. This will reduce the learning rate with a cosing law
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, self.n_epochs)
 
-        # Loss function
-        self.loss_fn = nn.MSELoss()
+        # Loss function: plain MSE restricted to the levels/depths that carry population
+        self.loss_fn = masked_mse
 
         # Now start the training
         self.train_loss = []
@@ -166,12 +193,15 @@ class Formal(object):
             target = data.y
             u = data.u
             batch = data.batch
+            mask = getattr(data, 'mask', None)
 
             # Move them to the GPU
             node, edge_attr, edge_index = node.to(self.device), edge_attr.to(
                 self.device), edge_index.to(self.device)
             u, batch, target = u.to(self.device), batch.to(
                 self.device), target.to(self.device)
+            if mask is not None:
+                mask = mask.to(self.device)
 
             # Reset gradients
             self.optimizer.zero_grad()
@@ -180,10 +210,18 @@ class Formal(object):
             out = self.model(node, edge_attr, edge_index, u, batch)
 
             # Compute loss
-            loss = self.loss_fn(out.squeeze(), target.squeeze())
+            loss = self.loss_fn(out.squeeze(), target.squeeze(), mask)
 
             # Compute backpropagation
             loss.backward()
+
+            # Clip before stepping. The processor is ~600 layers deep (n_message_passing_steps
+            # blocks of two 3-layer MLPs), which makes it prone to the occasional oversized Adam
+            # step: the loss jumps 10-40x for part of an epoch and then recovers, which is what
+            # the spikes in the epoch-loss curve are. Measured gradient norms on a converged
+            # checkpoint are ~0.02 (p99 0.05), so this threshold never binds in normal operation
+            # and only truncates the rare event.
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
 
             # Update the parameters
             self.optimizer.step()
@@ -209,10 +247,17 @@ class Formal(object):
         return loss_avg
 
     def validate(self):
-        # Do a validation of the model and return the loss
+        # Do a validation of the model and return the loss.
+        #
+        # This is a true mean over the whole held-out set, weighted by how many entries each
+        # batch contributes, not the exponentially-smoothed running value used during training.
+        # The smoothed version had a memory of ~20 batches out of ~770 and the loader draws them
+        # in a fresh random order every epoch, so the number that decides which checkpoint gets
+        # saved as "best" was an average over a random ~2.6% of the validation set.
 
         self.model.eval()
-        loss_avg = 0
+        total_loss = 0.0
+        total_weight = 0.0
         t = tqdm(self.validation_loader)
         with torch.no_grad():
             for batch_idx, (data) in enumerate(t):
@@ -223,24 +268,28 @@ class Formal(object):
                 target = data.y
                 u = data.u
                 batch = data.batch
+                mask = getattr(data, 'mask', None)
 
                 node, edge_attr, edge_index = node.to(self.device), edge_attr.to(
                     self.device), edge_index.to(self.device)
                 u, batch, target = u.to(self.device), batch.to(
                     self.device), target.to(self.device)
+                if mask is not None:
+                    mask = mask.to(self.device)
 
                 out = self.model(node, edge_attr, edge_index, u, batch)
 
-                loss = self.loss_fn(out.squeeze(), target.squeeze())
+                loss = self.loss_fn(out.squeeze(), target.squeeze(), mask)
 
-                if (batch_idx == 0):
-                    loss_avg = loss.item()
-                else:
-                    loss_avg = self.smooth * loss.item() + (1.0 - self.smooth) * loss_avg
+                # Each batch's loss is already a mean over its own unmasked entries, so weight by
+                # that count to recover the mean over the whole set.
+                weight = target.numel() if mask is None else mask.sum().item()
+                total_loss += loss.item() * weight
+                total_weight += weight
 
-                t.set_postfix(loss=loss_avg)
+                t.set_postfix(loss=total_loss / max(total_weight, 1.0))
 
-        return loss_avg
+        return total_loss / max(total_weight, 1.0)
 
     def test(self, checkpoint=None, readir='../weights/', savedir='../test/', dtst_type='validation'):
         # test the model with a given dataset and save the results
@@ -260,13 +309,16 @@ class Formal(object):
         self.hyperameters = checkpoint['hyperparameters']
         self.test_model = graphnet.EncodeProcessDecode(**self.hyperameters).to(self.device)
         self.test_model.load_state_dict(checkpoint['state_dict'])
-        self.test_dataset = dtst(self.hyperameters, self.datadir, dtst_type)
+        # Use the constants this checkpoint was trained with, not whatever NORM_STATS currently
+        # holds, so an older checkpoint is still fed the inputs it expects.
+        self.test_dataset = dtst(self.hyperameters, self.datadir, dtst_type,
+                                 norm_stats=checkpoint.get('norm_stats'))
 
         self.test_loader = torch_geometric.loader.DataLoader(
             self.test_dataset, batch_size=self.batch_size, shuffle=False, **self.kwargs)
 
-        # Loss function
-        self.test_loss_fn = nn.MSELoss()
+        # Loss function: same masked MSE the model was trained with
+        self.test_loss_fn = masked_mse
 
         self.test_model.eval()
         tq = tqdm(self.test_loader)
@@ -286,15 +338,18 @@ class Formal(object):
                 target = data.y
                 u = data.u
                 batch = data.batch
+                mask = getattr(data, 'mask', None)
 
                 node, edge_attr, edge_index = node.to(self.device), edge_attr.to(
                     self.device), edge_index.to(self.device)
                 u, batch, target = u.to(self.device), batch.to(
                     self.device), target.to(self.device)
+                if mask is not None:
+                    mask = mask.to(self.device)
 
                 out = self.test_model(node, edge_attr, edge_index, u, batch)
 
-                loss_avg = np.append(loss_avg, self.test_loss_fn(out.squeeze(), target.squeeze()).item())
+                loss_avg = np.append(loss_avg, self.test_loss_fn(out.squeeze(), target.squeeze(), mask).item())
 
                 n = len(data.ptr) - 1
                 for i in range(n):
@@ -303,7 +358,9 @@ class Formal(object):
                     self.test_out.append(out[left:right, :].cpu().numpy())
                     self.test_target.append(target[left:right, :].cpu().numpy())
                     self.test_T.append(node[left:right, :].cpu().numpy())
-                    self.u.append(u[left:right, :].cpu().numpy())
+                    # u carries one row per graph; data.ptr indexes nodes, so slicing u with it
+                    # returned the wrong rows (harmless only while u is identically zero).
+                    self.u.append(u[i, :].cpu().numpy())
 
         print(f'Average test loss: {loss_avg.mean()}\n')
 
@@ -382,7 +439,8 @@ class Formal(object):
             pickle.dump(logdep, filehandle)
 
         print("=> Loading the dataset to predict")
-        self.pred_dataset = dtst(self.hyperameters, directory, prefix)
+        self.pred_dataset = dtst(self.hyperameters, directory, prefix,
+                                 norm_stats=checkpoint.get('norm_stats'))
 
         # Remove the temporary files and directory
         [os.remove(file) for file in glob.glob(directory + '*')]
