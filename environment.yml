@@ -3,9 +3,11 @@
 #     conda env create -f environment.yml
 #     conda activate gph
 #
-# Everything resolves from conda-forge plus two PyPI wheels. Nothing is pinned to a build
-# string, to a CUDA wheel index, or to a locally-built package, so this installs on any
-# x86-64 Linux machine.
+# This describes the environment the code was actually developed and run in (checked
+# 2026-09-22 against `conda list -n gph`): conda-forge for everything except PyTorch, which
+# is the official pip wheel built against CUDA 11.8. NOTE: this file has not been re-solved
+# from scratch since that check -- if `conda env create` fails, compare against `conda list`
+# on the development machine rather than trusting a pin here.
 #
 # NOTE ON LIGHTWEAVER
 # -------------------
@@ -18,13 +20,14 @@
 #
 # GPU / CPU
 # ---------
-# The default below is a CUDA build of PyTorch. conda-forge ships its own CUDA runtime, so
-# only the NVIDIA driver matters -- no system CUDA toolkit is required. Developed against
-# driver 550.90.07 (H100). For a machine with no GPU, swap the `pytorch-gpu` line for:
+# PyTorch comes from the official cu118 pip wheels (bundled CUDA 11.8 runtime, no system
+# toolkit needed), which run on any driver >= 450. Developed against driver 550.90.07
+# (CUDA 12.4, H100). An earlier version of this file asked for conda-forge `pytorch-gpu`
+# with `cuda-version=12.6`; that is not what was ever installed or tested here. For a
+# machine with no GPU replace the `--extra-index-url` line with
 #
-#     - pytorch=2.7.*=cpu*
+#       - --extra-index-url https://download.pytorch.org/whl/cpu
 #
-# and drop the `cuda-version` line.
 name: gph
 channels:
   - conda-forge
@@ -32,14 +35,10 @@ dependencies:
   - python=3.12
   - pip
 
-  # --- PyTorch + graph stack ---------------------------------------------------------
-  # torch_cluster is deliberately absent: nothing in this repo imports it (the old file
-  # listed it, but graphnet.py only needs scatter_mean from torch_scatter).
-  - pytorch-gpu=2.7.*
-  - cuda-version=12.6          # 12.6 runtime works on any >=12.x driver; raise to 12.9 if
-                               # your driver is newer, or drop it for the CPU build
+  # --- graph stack (PyTorch itself is in the pip section below) -----------------------
+  # torch_scatter and torch_cluster are deliberately absent: graphnet.py uses
+  # torch_geometric.utils.scatter, which is native torch.
   - pytorch_geometric=2.6.*
-  - torch-scatter
   - networkx                   # torch_geometric.utils.to_networkx
 
   # --- numerics / IO -----------------------------------------------------------------
@@ -71,9 +70,12 @@ dependencies:
   - parse
 
   - pip:
+      # PyTorch 2.7.1, CUDA 11.8 wheels (the installed build is 2.7.1+cu118).
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.7.1
       # 0.16.3 is the first release containing commit dcb4d26, which is what the
-      # development machine ran as an editable checkout. Prebuilt cp312 manylinux
-      # wheel -- no compiler needed.
+      # development machine ran as an editable checkout (0.16.2.dev1+gdcb4d2664).
+      # Prebuilt cp312 manylinux wheel -- no compiler needed.
       - lightweaver==0.16.3
       - weno4
       # Optional: enables the extra GPU utilisation reporting in Formal.py, which is

@@ -3,7 +3,6 @@ import pickle
 from tqdm import tqdm
 import os
 import numpy as np
-from sklearn import neighbors
 import torch_geometric.data
 
 # Feature normalization statistics (Z-score: (x - mean) / std), computed over the full
@@ -89,32 +88,21 @@ class Dataset(torch.utils.data.Dataset):
         self.target = [None] * self.n_training
         self.mask = [None] * self.n_training
 
+        # The chain connectivity depends only on the number of depth points, so one edge_index
+        # tensor is shared by every column of the same length (int64, 2 x 2(N-1) per column).
+        edge_index_cache = {}
+
         # Loop over all training examples
         for i in tqdm(range(self.n_training), "Preparing graphs..."):
 
             num_nodes = len(self.tau_all[i])
-            index_tau = np.zeros((num_nodes, 1))
 
-            index_tau[:, 0] = np.arange(num_nodes)
-
-            # Build the KDTree
-            self.tree = neighbors.KDTree(index_tau)
-
-            # Get neighbors
-            receivers_list = self.tree.query_radius(index_tau, r=1)
-
-            senders = np.repeat(range(num_nodes), [len(a) for a in receivers_list])
-            receivers = np.concatenate(receivers_list, axis=0)
-
-            # Mask self edges
-            mask = senders != receivers
-
-            # Transform senders and receivers to tensors
-            senders = torch.tensor(senders[mask].astype('long'))
-            receivers = torch.tensor(receivers[mask].astype('long'))
-
-            # Define the graph for this model by using the sender/receiver information
-            self.edge_index[i] = torch.cat([senders[None, :], receivers[None, :]], dim=0)
+            # Chain graph: node j <-> j-1 and j <-> j+1 (same edge set as api._build_graph)
+            if num_nodes not in edge_index_cache:
+                senders = np.concatenate([np.arange(num_nodes - 1), np.arange(1, num_nodes)])
+                receivers = np.concatenate([np.arange(1, num_nodes), np.arange(num_nodes - 1)])
+                edge_index_cache[num_nodes] = torch.tensor(np.stack([senders, receivers]), dtype=torch.long)
+            self.edge_index[i] = edge_index_cache[num_nodes]
 
             n_edges = self.edge_index[i].shape[1]
 
@@ -198,11 +186,13 @@ class Dataset(torch.utils.data.Dataset):
             self.edges[i] = torch.tensor(self.edges[i].astype('float32'))
             self.u[i] = torch.tensor(self.u[i].astype('float32'))
             self.target[i] = torch.tensor(self.target[i].astype('float32'))
-            self.mask[i] = torch.tensor(self.mask[i].astype('float32'))
+            self.mask[i] = torch.tensor(self.mask[i])
 
         # The raw n_Nat arrays are only needed to build the masks above, and they are as large as
-        # the departure coefficients themselves (8.7 GB for the training split).
+        # the departure coefficients themselves (8.7 GB for the training split). The raw
+        # departure coefficients are fully represented by the float32 targets (see __call__).
         self.n_Nat = None
+        self.dep_all = None
 
     def __getitem__(self, index):
 
@@ -226,4 +216,7 @@ class Dataset(torch.utils.data.Dataset):
         return self.n_training
 
     def __call__(self, index):
-        return self.T_all[index], self.z_all[index], self.ne[index], self.vturb_all[index], self.vlos_all[index], self.u[index], self.dep_all[index]
+        # log10(b) in the stored (n_levels, n_depth) layout, recovered from the scaled target
+        # (clipped to +-10, which is what every consumer of this database uses anyway).
+        log_dep = self.target[index].numpy().T * 5.0
+        return self.T_all[index], self.z_all[index], self.ne[index], self.vturb_all[index], self.vlos_all[index], self.u[index], log_dep

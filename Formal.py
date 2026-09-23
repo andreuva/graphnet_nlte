@@ -5,6 +5,7 @@ from tqdm import tqdm
 import glob
 import os
 import pickle
+import random
 
 import torch
 import torch_geometric.data
@@ -25,6 +26,10 @@ GRAD_CLIP_NORM = 0.5
 ADAM_EPS = 1e-6
 ADAM_BETAS = (0.9, 0.95)
 
+# The learning rate ramps linearly from this fraction of --lr to --lr over the first epoch
+# (stepped per batch), then follows a cosine decay to zero over the remaining epochs.
+WARMUP_START_FACTOR = 0.01
+
 
 def masked_mse(out, target, mask=None):
     """
@@ -38,7 +43,7 @@ def masked_mse(out, target, mask=None):
     sq = (out - target) ** 2
     if mask is None:
         return sq.mean()
-    mask = mask.view_as(sq)
+    mask = mask.to(sq.dtype).view_as(sq)
     return (sq * mask).sum() / mask.sum().clamp(min=1.0)
 
 
@@ -52,12 +57,23 @@ except:
 # Class that will containg the GN as well as methods for training, testing and predicting
 class Formal(object):
     def __init__(self, configuration='conf.dat', batch_size=64, gpu=0,
-                 smooth=0.05, validation_split=0.2, datadir='', predict=False):
+                 smooth=0.05, datadir='', predict=False, seed=0, compile=False):
+
+        # Seed everything that draws random numbers in training: parameter init, the shuffle
+        # order of the training loader, and any numpy/python randomness.
+        self.seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
         # Is a GPU available?
         self.cuda = torch.cuda.is_available()
         self.gpu = gpu
         self.device = torch.device(f"cuda:{self.gpu}" if self.cuda else "cpu")
+        if self.cuda:
+            # TF32 tensor cores for fp32 matmuls (~15% on an H100 for this model).
+            torch.set_float32_matmul_precision('high')
+        self.compile = compile
 
         # Factor to be used for smoothing the loss with an exponential window
         self.smooth = smooth
@@ -70,7 +86,7 @@ class Formal(object):
                 self.device, nvidia_smi.nvmlDeviceGetName(self.handle)))
 
         self.batch_size = batch_size
-        self.kwargs = {'num_workers': 1, 'pin_memory': False} if self.cuda else {}
+        self.kwargs = {'num_workers': 12, 'pin_memory': True} if self.cuda else {}
 
         if not predict:
             # Read the configuration file
@@ -85,35 +101,32 @@ class Formal(object):
                 self.hyperparameters[k] = int(q)
 
             self.datadir = datadir
-            self.validation_split = validation_split
 
             # Instantiate the model with the hyperparameters
             self.model = graphnet.EncodeProcessDecode(**self.hyperparameters).to(self.device)
+            # `forward_model` is what train/validate call; `model` keeps the plain module for
+            # state_dict. torch.compile(dynamic=True) takes ~5 min to compile this network
+            # and then runs a training step ~1.5x faster (kernel-launch bound otherwise).
+            self.forward_model = torch.compile(self.model, dynamic=True) if self.compile else self.model
 
-    def optimize(self, savedir, epochs, lr=3e-4):
+    def optimize(self, savedir, epochs, lr=3e-4, resume=None):
 
         # Print the number of trainable parameters
         print('N. total trainable parameters : {0}'.format(sum(p.numel() for p in self.model.parameters() if p.requires_grad)))
 
-        # Instantiate the dataset
-        self.dataset = dtst(self.hyperparameters, self.datadir)
-
-        # Randomly shuffle a vector with the indices to separate between training/validation datasets
-        idx = np.arange(self.dataset.n_training)
-        np.random.shuffle(idx)
-
-        self.train_index = idx[0:int((1-self.validation_split)*self.dataset.n_training)]
-        self.validation_index = idx[int((1-self.validation_split)*self.dataset.n_training):]
-
-        # Define samplers for the training and validation sets
-        self.train_sampler = torch.utils.data.sampler.SubsetRandomSampler(self.train_index)
-        self.validation_sampler = torch.utils.data.sampler.SubsetRandomSampler(self.validation_index)
+        # Instantiate the datasets. Training uses the whole train_* split and validation the
+        # on-disk validation_* split (a different Bifrost snapshot). Carving validation out of
+        # train_* at random put near-copies of spatially correlated training columns into it,
+        # and the loss that selected the best checkpoint read ~2x lower than on the true hold-out.
+        self.dataset = dtst(self.hyperparameters, self.datadir, 'train')
+        self.valid_dataset = dtst(self.hyperparameters, self.datadir, 'validation')
 
         # Define the data loaders
         self.train_loader = torch_geometric.loader.DataLoader(
-            self.dataset, sampler=self.train_sampler, batch_size=self.batch_size, shuffle=False, **self.kwargs)
+            self.dataset, batch_size=self.batch_size, shuffle=True,
+            generator=torch.Generator().manual_seed(self.seed), **self.kwargs)
         self.validation_loader = torch_geometric.loader.DataLoader(
-            self.dataset, sampler=self.validation_sampler, batch_size=self.batch_size, shuffle=False, **self.kwargs)
+            self.valid_dataset, batch_size=self.batch_size, shuffle=False, **self.kwargs)
 
         self.lr = lr
         self.n_epochs = epochs
@@ -130,8 +143,16 @@ class Formal(object):
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr,
                                           betas=ADAM_BETAS, eps=ADAM_EPS)
 
-        # Cosine annealing learning rate scheduler. This will reduce the learning rate with a cosing law
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, self.n_epochs)
+        # Learning rate schedule, stepped once per batch: linear warmup over the first epoch,
+        # then cosine annealing to zero over the remaining steps.
+        n_steps = self.n_epochs * len(self.train_loader)
+        warmup_steps = max(1, min(len(self.train_loader), n_steps // 2))
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            [torch.optim.lr_scheduler.LinearLR(self.optimizer, start_factor=WARMUP_START_FACTOR,
+                                               total_iters=warmup_steps),
+             torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, max(1, n_steps - warmup_steps))],
+            milestones=[warmup_steps])
 
         # Loss function: plain MSE restricted to the levels/depths that carry population
         self.loss_fn = masked_mse
@@ -140,10 +161,21 @@ class Formal(object):
         self.train_loss = []
         self.valid_loss = []
         best_loss = float('inf')
+        first_epoch = 1
 
-        for epoch in range(1, epochs + 1):
+        if resume is not None:
+            print(f"=> resuming from '{resume}'")
+            last = torch.load(resume, map_location=self.device, weights_only=False)
+            self.model.load_state_dict(last['state_dict'])
+            self.optimizer.load_state_dict(last['optimizer'])
+            self.scheduler.load_state_dict(last['scheduler'])
+            self.train_loss = last['train_loss']
+            self.valid_loss = last['valid_loss']
+            best_loss = last['best_loss']
+            first_epoch = last['epoch'] + 1
 
-            filename = time.strftime("%Y%m%d-%H%M%S")
+        for epoch in range(first_epoch, epochs + 1):
+
             # Compute training and validation steps
             train_loss = self.train(epoch)
             valid_loss = self.validate()
@@ -151,30 +183,31 @@ class Formal(object):
             self.train_loss.append(train_loss)
             self.valid_loss.append(valid_loss)
 
-            # If the validation loss improves, save the model as best
+            checkpoint = {
+                'epoch': epoch,
+                'state_dict': self.model.state_dict(),
+                'train_loss': self.train_loss,
+                'valid_loss': self.valid_loss,
+                'best_loss': min(best_loss, valid_loss),
+                'hyperparameters': self.hyperparameters,
+                # Normalization constants used by Dataset.py to build this checkpoint's
+                # training inputs/targets, so inference code can always reproduce the
+                # exact normalization a given checkpoint was trained with, even after
+                # NORM_STATS is later retuned for a new training run.
+                'norm_stats': NORM_STATS,
+            }
+
+            # If the validation loss improves, overwrite best.pth (weights only, no optimizer)
             if (valid_loss < best_loss):
                 best_loss = valid_loss
-
-                checkpoint = {
-                    'epoch': epoch + 1,
-                    'state_dict': self.model.state_dict(),
-                    'train_loss': self.train_loss,
-                    'valid_loss': self.valid_loss,
-                    'best_loss': best_loss,
-                    'hyperparameters': self.hyperparameters,
-                    'optimizer': self.optimizer.state_dict(),
-                    # Normalization constants used by Dataset.py to build this checkpoint's
-                    # training inputs/targets, so inference code can always reproduce the
-                    # exact normalization a given checkpoint was trained with, even after
-                    # NORM_STATS is later retuned for a new training run.
-                    'norm_stats': NORM_STATS,
-                }
-
                 print("Saving best model...")
-                torch.save(checkpoint, savedir + filename + '_best.pth')
+                torch.save(checkpoint, savedir + 'best.pth')
 
-            # Update the learning rate
-            self.scheduler.step()
+            # last.pth is the resume point: weights plus optimizer and scheduler state,
+            # overwritten every epoch (see train.py --resume).
+            checkpoint['optimizer'] = self.optimizer.state_dict()
+            checkpoint['scheduler'] = self.scheduler.state_dict()
+            torch.save(checkpoint, savedir + 'last.pth')
 
     def train(self, epoch):
 
@@ -207,7 +240,7 @@ class Formal(object):
             self.optimizer.zero_grad()
 
             # Evaluate Graphnet
-            out = self.model(node, edge_attr, edge_index, u, batch)
+            out = self.forward_model(node, edge_attr, edge_index, u, batch)
 
             # Compute loss
             loss = self.loss_fn(out.squeeze(), target.squeeze(), mask)
@@ -223,8 +256,9 @@ class Formal(object):
             # and only truncates the rare event.
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
 
-            # Update the parameters
+            # Update the parameters and the learning rate (per-batch schedule)
             self.optimizer.step()
+            self.scheduler.step()
 
             for param_group in self.optimizer.param_groups:
                 current_lr = param_group['lr']
@@ -277,7 +311,7 @@ class Formal(object):
                 if mask is not None:
                     mask = mask.to(self.device)
 
-                out = self.model(node, edge_attr, edge_index, u, batch)
+                out = self.forward_model(node, edge_attr, edge_index, u, batch)
 
                 loss = self.loss_fn(out.squeeze(), target.squeeze(), mask)
 
@@ -295,7 +329,7 @@ class Formal(object):
         # test the model with a given dataset and save the results
 
         if (checkpoint is None):
-            files = glob.glob(readir + '*.pth')
+            files = glob.glob(readir + '*best.pth')
             self.checkpoint = sorted(files)[-1]
         else:
             self.checkpoint = '{0}.pth'.format(checkpoint)
@@ -381,7 +415,8 @@ class Formal(object):
         if not os.path.exists(savedir):
             os.makedirs(savedir)
 
-        with open(savedir + f'{dtst_type}_checkpoint_{self.checkpoint[-24:-9]}_at_{time.strftime("%Y%m%d-%H%M%S")}.pkl', 'wb') as filehandle:
+        run_name = os.path.basename(os.path.dirname(os.path.abspath(self.checkpoint)))
+        with open(savedir + f'{dtst_type}_checkpoint_{run_name}_at_{time.strftime("%Y%m%d-%H%M%S")}.pkl', 'wb') as filehandle:
             pickle.dump(test_dict, filehandle)
 
     def predict(self, TT=[None], tau=[None], vturb=[None], vlos=[None], ne=[None], zz=[None], checkpoint=None, readir=None):
@@ -390,7 +425,7 @@ class Formal(object):
         if (checkpoint is None):
             if readir is None:
                 raise ValueError('Not checkpoint or read directory selected')
-            files = glob.glob(readir + '*.pth')
+            files = glob.glob(readir + '*best.pth')
             self.checkpoint = sorted(files)[-1]
         else:
             self.checkpoint = checkpoint

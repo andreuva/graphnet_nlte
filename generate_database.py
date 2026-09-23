@@ -152,8 +152,12 @@ class Model_generator(object):
         # Only the *order* in which the allowed columns are consumed is randomised, and with a
         # fixed seed, so that a run that is stopped early is still a reproducible and spatially
         # representative sample of its own strip. Indexing through this array instead of
-        # permuting the cubes also avoids three full copies of the snapshot.
-        self.column_order = np.random.default_rng(seed).permutation(allowed)
+        # permuting the cubes also avoids three full copies of the snapshot. The same generator
+        # drives every other draw in new_model() (branch choice, reference-atmosphere choice and
+        # perturbations), so a database is fully determined by (--train, --n, --seed) up to the
+        # order in which workers return; previously those used the unseeded global numpy RNG.
+        self.rng = np.random.default_rng(seed)
+        self.column_order = self.rng.permutation(allowed)
         self.n_bifrost = self.column_order.size
         self.current_bifrost = 0
 
@@ -213,6 +217,19 @@ class Model_generator(object):
             
             print(f"Finished Model generator initialization\n", flush=True)
 
+    def _perturbed_vturb(self, i):
+        """vturb of reference atmosphere i, perturbed by 20% at the knots (on its own depth grid)."""
+        std = 0.2*self.atmosRef[i].vturb[self.ind_ltau[i]]
+        deltas_vturb = self.rng.normal(loc=0.0, scale=std, size=self.ntau[i])
+        f = interp.interp1d(self.ltau_nodes[i], deltas_vturb, kind='quadratic', bounds_error=False, fill_value="extrapolate")
+        vturb_new = self.atmosRef[i].vturb + f(self.ltau[i])
+        # The quadratic interpolation overshoots and can drive vturb negative. Only vturb**2
+        # ever reaches the physics, so a negative value is silently folded to its magnitude by
+        # lightweaver -- but it is fed to the network *signed*, making two identical
+        # atmospheres look like different inputs, and api.compute_dep_coeffs rejects it.
+        vturb_new[vturb_new < 0] = 0.0
+        return vturb_new
+
     def new_model(self):
         """Method to read the parameters of an atmosphere based on 1 random refence atmosphere and perturbing it
         to obtain diferent results or from BIFROST snapshot"""
@@ -221,15 +238,23 @@ class Model_generator(object):
         computed all the bifrost models """
         choices = [True, False]
 
-        if np.random.choice(a=choices) and self.current_bifrost < self.n_bifrost:
+        if self.rng.choice(choices) and self.current_bifrost < self.n_bifrost:
 
             # Read the model parameters
             column = self.column_order[self.current_bifrost]
             heigth = np.float64(self.bifrost['z'][::-1]*1e3)
             T_new = np.float64(self.bifrost['tg'][:, column][::-1])
             vlos_new = np.float64(self.bifrost['vlos'][:, column][::-1])
-            vturb_new = vlos_new*0
             ne = np.float64(self.bifrost['nel'][:, column][::-1])
+
+            # Bifrost resolves its velocity field and carries no microturbulence, while every
+            # reference atmosphere does, so vturb = 0 made this single feature a perfect label for
+            # the data branch. Give the column the perturbed vturb stratification of a random
+            # reference atmosphere instead, interpolated in height (held constant beyond the
+            # reference model's own z range), so both branches draw vturb from the same family.
+            i = self.rng.integers(self.n_ref_atmos)
+            z_ref = self.atmosRef[i].z
+            vturb_new = np.interp(heigth, z_ref[::-1], self._perturbed_vturb(i)[::-1])
 
             # Set the depth as the tau500 and the depth scale acordingly
             depth = heigth
@@ -242,11 +267,11 @@ class Model_generator(object):
 
         else:
             # pick one reference atmosphere
-            i = np.random.randint(low=0, high=self.n_ref_atmos)
+            i = self.rng.integers(self.n_ref_atmos)
 
             # Define the std and compute the normal distribution to perturb the ref.atmosphere
             std = 2500
-            deltas = np.random.normal(loc=0.0, scale=std, size=self.ntau[i])
+            deltas = self.rng.normal(loc=0.0, scale=std, size=self.ntau[i])
 
             # smooth the deltas convolving with a box function of width 2 (func smooth at the begining of file)
             deltas_smooth = smooth(deltas)
@@ -257,20 +282,12 @@ class Model_generator(object):
             T_new[T_new < 2500] = 2500
 
             # Perturb vturb by 20% of the current value
-            std = 0.2*self.atmosRef[i].vturb[self.ind_ltau[i]]
-            deltas_vturb = np.random.normal(loc=0.0, scale=std, size=self.ntau[i])
-            f = interp.interp1d(self.ltau_nodes[i], deltas_vturb, kind='quadratic', bounds_error=False, fill_value="extrapolate")
-            vturb_new = self.atmosRef[i].vturb + f(self.ltau[i])
-            # The quadratic interpolation overshoots and can drive vturb negative. Only vturb**2
-            # ever reaches the physics, so a negative value is silently folded to its magnitude by
-            # lightweaver -- but it is fed to the network *signed*, making two identical
-            # atmospheres look like different inputs, and api.compute_dep_coeffs rejects it.
-            vturb_new[vturb_new < 0] = 0.0
+            vturb_new = self._perturbed_vturb(i)
             ne = None
 
             # Set the v LOS to 0 + perturbations
             std = 2500
-            deltas_vlos = np.random.normal(loc=0.0, scale=std, size=self.ntau[i])
+            deltas_vlos = self.rng.normal(loc=0.0, scale=std, size=self.ntau[i])
             f = interp.interp1d(self.ltau_nodes[i], deltas_vlos, kind='quadratic', bounds_error=False, fill_value="extrapolate")
             vlos_new = 0 + f(self.ltau[i])
 
@@ -547,8 +564,9 @@ if (__name__ == '__main__'):
         parser.add_argument('--rd', '--readir', default=f'../data/models_atmos/', metavar='READIR', help='directory for reading files')
         parser.add_argument('--prd', '--prd', default=0, type=int, metavar='PRD', help='partial redistribution flag')
         parser.add_argument('--seed', '--seed', default=1234, type=int, metavar='SEED',
-                            help='seed for the order in which Bifrost columns are consumed. The train/test '
-                                 'partition itself is spatial and seed-independent (see TRAIN_X_FRACTION)')
+                            help='seed for the order in which Bifrost columns are consumed and for every '
+                                 'perturbation of the reference atmospheres. The train/test partition itself '
+                                 'is spatial and seed-independent (see TRAIN_X_FRACTION)')
         # parser.add_argument('--o', '--out', default='train', metavar='OUTFILE', help='Root of output files')
 
         parsed = vars(parser.parse_args())

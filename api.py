@@ -4,8 +4,12 @@ Minimal interface for using the Si I GraphNet NLTE model from an external invers
 Three functions, all operating on ONE 1D atmospheric column at a time:
 
     compute_dep_coeffs(T, z, ne, vturb, vlos)
-        GraphNet inference only -- fast (ms), no lightweaver dependency. This is the
-        function to call inside the hot loop of an inversion.
+        GraphNet inference only, no lightweaver dependency. One column costs ~170 ms on CPU
+        and ~50 ms on a GPU (600 layers on 211 nodes is launch-bound, not compute-bound).
+
+    compute_dep_coeffs_batch([(T, z, ne, vturb, vlos), ...])
+        Same, for many columns in one forward pass. On a GPU 64 columns take ~80 ms, i.e.
+        ~1.3 ms per column -- this is the function to call inside the hot loop of an inversion.
 
     synthesis_lw(T, z, ne, vturb, vlos)
         Full lightweaver NLTE solve (iterates statistical equilibrium to convergence),
@@ -32,11 +36,12 @@ Usage
     import api
 
     log_dep = api.compute_dep_coeffs(T, z, ne, vturb, vlos)
+    log_deps = api.compute_dep_coeffs_batch([(T, z, ne, vturb, vlos), ...], device='cuda:0')
     wave, Iwave, log_dep = api.intensity_gnn(T, z, ne, vturb, vlos)
 
 Dependencies
 ------------
-    compute_dep_coeffs   : numpy, torch, torch_geometric, torch_scatter
+    compute_dep_coeffs   : numpy, torch, torch_geometric
     synthesis_lw/intensity_gnn : the above, plus lightweaver (imported lazily, only
                                  when one of these two functions is actually called)
 """
@@ -54,9 +59,9 @@ if _MODULE_DIR not in sys.path:
 
 import graphnet
 
-# Points at the checkpoint tree, not a specific file: Formal.py saves a new timestamped
-# '*_best.pth' under a per-run directory each time validation loss improves, so the most recent
-# one anywhere below here is the best checkpoint of the most recent run. Resolved at call time
+# Points at the checkpoint tree, not a specific file: Formal.py overwrites 'best.pth' in a
+# timestamped per-run directory each time validation loss improves, so the last one (sorted by
+# path) anywhere below here is the best checkpoint of the most recent run. Resolved at call time
 # (see _resolve_checkpoint), so this keeps tracking training automatically -- no need to edit it
 # by hand as new runs and checkpoints appear. Point it at a specific *.pth file instead (or pass
 # checkpoint= explicitly) once training is finished and you want to pin a fixed model.
@@ -152,17 +157,18 @@ def _build_graph(T, z, ne, vturb, vlos, norm_stats):
 
 def _resolve_checkpoint(checkpoint):
     """
-    If `checkpoint` is a directory, resolve it to the most recent '*_best.pth' file at or below
-    it (Formal.py timestamps each improved-validation-loss save, so the lexicographically-last
-    filename is always the best checkpoint so far). The search is recursive so that either a
-    single run directory or the whole checkpoint tree can be given. If `checkpoint` is already a
-    file, it is returned unchanged. Directories are re-resolved on every call, so a
-    still-training run always yields its current best checkpoint.
+    If `checkpoint` is a directory, resolve it to the most recent '*best.pth' file at or below
+    it. Formal.py overwrites '<run>/best.pth' on each improvement and run directories are named
+    by timestamp, so the lexicographically-last path is the best checkpoint of the latest run
+    (older trees with one timestamped '<stamp>_best.pth' per improvement are matched too). The
+    search is recursive so that either a single run directory or the whole checkpoint tree can
+    be given. If `checkpoint` is already a file, it is returned unchanged. Directories are
+    re-resolved on every call, so a still-training run always yields its current best checkpoint.
     """
     if os.path.isdir(checkpoint):
-        candidates = sorted(glob.glob(os.path.join(checkpoint, '**', '*_best.pth'), recursive=True))
+        candidates = sorted(glob.glob(os.path.join(checkpoint, '**', '*best.pth'), recursive=True))
         if not candidates:
-            raise FileNotFoundError(f"No '*_best.pth' checkpoint found under directory: {checkpoint}")
+            raise FileNotFoundError(f"No '*best.pth' checkpoint found under directory: {checkpoint}")
         return candidates[-1]
     return checkpoint
 
@@ -208,9 +214,11 @@ def compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=DEFAULT_CHECKPOINT, dev
     """
     Predict NLTE departure coefficients for one atmospheric column with the GraphNet model.
 
-    Pure GNN inference (no lightweaver call) -- milliseconds per column on CPU, safe to
-    call many times per inversion iteration. The model is cached after the first call, so
-    repeated calls with the same `checkpoint` only pay the load cost once per process.
+    Pure GNN inference (no lightweaver call). Measured cost per call: ~170 ms on CPU and
+    ~50 ms on an H100 -- the network is 600 layers deep and one column is far too small to fill
+    a GPU, so the time is kernel-launch overhead. For many columns use `compute_dep_coeffs_batch`
+    instead (~1.3 ms per column on a GPU). The model is cached after the first call, so repeated
+    calls with the same `checkpoint` only pay the load cost once per process.
 
     Parameters
     ----------
@@ -242,19 +250,65 @@ def compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=DEFAULT_CHECKPOINT, dev
     ValueError
         `checkpoint` has no embedded normalization constants (too old / incompatible).
     """
-    T, z, ne, vturb, vlos = _validate_atmosphere(T, z, ne, vturb, vlos)
+    return compute_dep_coeffs_batch([(T, z, ne, vturb, vlos)], checkpoint=checkpoint, device=device)[0]
+
+
+def compute_dep_coeffs_batch(columns, checkpoint=DEFAULT_CHECKPOINT, device='cpu'):
+    """
+    Predict NLTE departure coefficients for many atmospheric columns in one forward pass.
+
+    The columns are concatenated into a single disconnected graph (the same batching the
+    training loop uses), so the cost is one network evaluation regardless of how many columns
+    are passed. On an H100, 64 columns of 211 points take ~80 ms (~1.3 ms per column) against
+    ~50 ms for a single column; on CPU the gain is smaller but still worthwhile. Columns may
+    have different numbers of depth points.
+
+    Parameters
+    ----------
+    columns : sequence of (T, z, ne, vturb, vlos) tuples
+        One tuple per column, each element an array of shape (n_depth,); see the module
+        docstring for units and ordering. Every column is validated as in `compute_dep_coeffs`.
+    checkpoint, device : optional
+        See `compute_dep_coeffs`.
+
+    Returns
+    -------
+    log_deps : list of ndarray, each of shape (n_levels, n_depth)
+        log10(b) for each column, in the order given.
+
+    Raises
+    ------
+    Same as `compute_dep_coeffs`; an invalid column raises before anything is evaluated.
+    """
+    columns = list(columns)
+    if not columns:
+        return []
     model, _, norm_stats = _load_model(checkpoint, device)
 
-    node, edge_index, edge_attr = _build_graph(T, z, ne, vturb, vlos, norm_stats)
-    u = torch.zeros((1, 1), dtype=torch.float32, device=device)
-    batch = torch.zeros(node.shape[0], dtype=torch.long, device=device)
+    nodes, edge_indices, edge_attrs, batch_vec, lengths = [], [], [], [], []
+    offset = 0
+    for g, col in enumerate(columns):
+        T, z, ne, vturb, vlos = _validate_atmosphere(*col)
+        node, edge_index, edge_attr = _build_graph(T, z, ne, vturb, vlos, norm_stats)
+        nodes.append(node)
+        edge_indices.append(edge_index + offset)
+        edge_attrs.append(edge_attr)
+        batch_vec.append(torch.full((len(T),), g, dtype=torch.long))
+        lengths.append(len(T))
+        offset += len(T)
+
+    node = torch.cat(nodes).to(device)
+    edge_index = torch.cat(edge_indices, dim=1).to(device)
+    edge_attr = torch.cat(edge_attrs).to(device)
+    batch = torch.cat(batch_vec).to(device)
+    u = torch.zeros((len(columns), 1), dtype=torch.float32, device=device)
 
     with torch.no_grad():
-        out = model(node.to(device), edge_attr.to(device), edge_index.to(device), u, batch)
+        out = model(node, edge_attr, edge_index, u, batch)
 
-    log_dep = (out.cpu().numpy() * 5.0).T  # (n_depth, n_levels) -> (n_levels, n_depth)
+    out = out.cpu().numpy() * 5.0  # (sum n_depth, n_levels)
 
-    if not np.all(np.isfinite(log_dep)):
+    if not np.all(np.isfinite(out)):
         raise RuntimeError("GraphNet produced non-finite departure coefficients")
 
     # Clamp to the range the targets were clipped to. Inside it this is a no-op; outside it
@@ -263,7 +317,11 @@ def compute_dep_coeffs(T, z, ne, vturb, vlos, checkpoint=DEFAULT_CHECKPOINT, dev
     # there and its raw output can be arbitrary, while 10**log_dep feeds straight into the
     # populations. At +-10 the resulting populations are bounded by what the clipped targets
     # themselves produce, which changes the emergent profile by <= 2e-7.
-    return np.clip(log_dep, -10.0, 10.0)
+    log_deps, start = [], 0
+    for n in lengths:
+        log_deps.append(np.clip(out[start:start + n].T, -10.0, 10.0))  # -> (n_levels, n_depth)
+        start += n
+    return log_deps
 
 
 # Below this wavelength the background coherent-scattering emissivity (sigma * J) is a

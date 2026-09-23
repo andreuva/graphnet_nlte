@@ -18,7 +18,7 @@ from si_atom import Si_atom_custom
 test = []
 
 type_dtst = 'validation'
-files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si_v2/20260912-225035/{type_dtst}_checkpoint_*.pkl'))
+files = sorted(glob(f'/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints_si_v3/20260923-171902/{type_dtst}_checkpoint_*.pkl'))
 dirs = [os.path.split(files[i])[0] for i in range(len(files))]
 plotdirs = [dirs[i] + '/plots/' for i in range(len(files))]
 names = [os.path.split(files[i])[1] for i in range(len(files))]

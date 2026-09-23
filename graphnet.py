@@ -6,7 +6,7 @@ from torch.nn import init
 from torch_geometric.nn import MetaLayer
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
-from torch_scatter import scatter_mean
+from torch_geometric.utils import scatter
 
 
 def kaiming_init(m):
@@ -207,7 +207,7 @@ class NodeModel(torch.nn.Module):
         row, col = edge_index
         out = torch.cat([x[row], edge_attr], dim=-1)
         out = self.node_mlp_1(out)
-        out = scatter_mean(out, col, dim=0, dim_size=x.size(0))
+        out = scatter(out, col, dim=0, dim_size=x.size(0), reduce='mean')
         out = torch.cat([x, out, u[batch]], dim=-1)
         return self.node_mlp_2(out)
 
@@ -284,7 +284,15 @@ class EncodeProcessDecode(nn.Module):
         # ---------------------
         # PROCESSOR
         # ---------------------
+        # Pre-norm residual blocks: each step normalises the node and edge latents it reads, and
+        # its MLPs end in a plain Linear layer whose output is added to the un-normalised residual
+        # stream. The previous post-norm arrangement (LayerNorm at the end of every MLP, added to
+        # the residual) made each block inject a unit-variance increment, so the latent norm grew
+        # ~8x over the 100 steps and the decoder saw inputs of norm ~100 -- the loss oscillated
+        # from epoch to epoch by up to 2x. A final LayerNorm feeds the decoder.
         self.processor_network = nn.ModuleList([])
+        self.node_norms = nn.ModuleList([])
+        self.edge_norms = nn.ModuleList([])
         for i in range(self.n_message_passing_steps):
             edge_model_fn = EdgeModel(
                 node_latent_size=self.latent_size,
@@ -294,7 +302,7 @@ class EncodeProcessDecode(nn.Module):
                 mlp_n_hidden_layers=self.mlp_n_hidden_layers,
                 latent_size=self.latent_size,
                 activation='elu',
-                layernorm=True)
+                layernorm=False)
 
             node_model_fn = NodeModel(
                 node_latent_size=self.latent_size,
@@ -304,10 +312,14 @@ class EncodeProcessDecode(nn.Module):
                 mlp_n_hidden_layers=self.mlp_n_hidden_layers,
                 latent_size=self.latent_size,
                 activation='elu',
-                layernorm=True)
+                layernorm=False)
 
             self.processor_network.append(
                 MetaLayer(edge_model_fn, node_model_fn, None))
+            self.node_norms.append(nn.LayerNorm(self.latent_size))
+            self.edge_norms.append(nn.LayerNorm(self.latent_size))
+
+        self.decoder_norm = nn.LayerNorm(self.latent_size)
 
     def encode(self, node, edge_attr):
         node_out, edge_attr_out, _ = self.encoder_network(
@@ -316,15 +328,15 @@ class EncodeProcessDecode(nn.Module):
         return node_out, edge_attr_out
 
     def decode(self, node):
-        node_out = self.decoder_network(node)
+        node_out = self.decoder_network(self.decoder_norm(node))
 
         return node_out
 
-    def process_step(self, processor_network, node, edge_attr, edge_index, u, batch):
+    def process_step(self, i, node, edge_attr, edge_index, u, batch):
 
-        # One message passing
-        node_k, edge_attr_k, _ = processor_network(
-            node, edge_index, edge_attr, u, batch)
+        # One message passing (step i), reading normalised copies of the latents
+        node_k, edge_attr_k, _ = self.processor_network[i](
+            self.node_norms[i](node), edge_index, self.edge_norms[i](edge_attr), u, batch)
 
         # Add residuals
         node_k = node_k + node
@@ -340,7 +352,7 @@ class EncodeProcessDecode(nn.Module):
 
         for i in range(self.n_message_passing_steps):
             node_k, edge_attr_k = self.process_step(
-                self.processor_network[i], node_prev_k, edge_attr_prev_k, edge_index, u, batch)
+                i, node_prev_k, edge_attr_prev_k, edge_index, u, batch)
 
             node_prev_k = node_k
             edge_attr_prev_k = edge_attr_k

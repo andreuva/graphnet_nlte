@@ -41,13 +41,12 @@ The environment is in `environment.yml`:
     conda env create -f environment.yml
     conda activate gph
 
-It resolves from conda-forge plus a stock `lightweaver` from PyPI, with no build strings and
-no CUDA wheel index, so it installs on any x86-64 Linux machine. The default is a CUDA build
-of PyTorch; see the header of `environment.yml` for the CPU swap and for building `mpi4py`
-against a site MPI instead.
+It resolves from conda-forge plus PyPI wheels for PyTorch (official CUDA 11.8 build, which is
+what the development machine runs) and `lightweaver`. See the header of `environment.yml` for
+the CPU swap and for building `mpi4py` against a site MPI instead.
 
 To build one by hand instead, the packages that matter are `lightweaver`, `pytorch`,
-`pytorch_geometric` (with `torch_scatter`), `mpi4py`, `configobj`, `scipy`, `scikit-learn`,
+`pytorch_geometric`, `mpi4py`, `configobj`, `scipy`, `scikit-learn`,
 `astropy`, `numpy`, `matplotlib` and `tqdm`.
 
 The 16-level Si I/II/III model atom this project is built on is **not** part of any released
@@ -95,7 +94,7 @@ Three separate runs, one per split. They are independent and can be run one afte
 | `--rd` | Input directory (see above) |
 | `--sav` | Output directory; created if missing |
 | `--prd` | Partial redistribution, `0` (default) for this line |
-| `--seed` | Order in which each split consumes its own Bifrost columns (default 1234) |
+| `--seed` | Order in which each split consumes its own Bifrost columns, and every perturbation of the reference atmospheres (default 1234) |
 
 `mpiexec -n K` uses one master and `K-1` workers, so ask for one more process than the number of
 solves you want in flight. This machine has 192 cores. Each NLTE solve takes roughly 0.2–1.5 s
@@ -141,8 +140,12 @@ consumes its own columns, so a run stopped early is still a reproducible, repres
 `--train -1` reads `snap530_rh.save` instead and uses all of it, which makes validation the
 cleanest of the three splits: a different snapshot, sharing nothing with either of the others.
 
-Two details worth knowing about the atmospheres themselves:
+Three details worth knowing about the atmospheres themselves:
 
+* Bifrost columns carry no microturbulence of their own, while every reference atmosphere
+  does; with `vturb = 0` that one feature identified the data branch exactly. Each Bifrost
+  column is therefore given the (perturbed) `vturb` stratification of a randomly chosen
+  reference atmosphere, interpolated in height, before the NLTE solve.
 * The reference-atmosphere branch hands lightweaver `ne=None` and lets it reconstruct hydrostatic
   equilibrium, which invents both `ne` and `nHTot`; only `ne` is stored. The atmosphere is
   therefore rebuilt from that reconstructed `ne` before the NLTE solve, so the column that is
@@ -172,14 +175,30 @@ It rewrites in place — copy the directory first if you want to keep the raw ou
     python train.py --epochs 300 --batch 64 --lr 1e-4 --gpu 0 \
         --conf conf.dat --rd ../data_1d_si_v3/ --sav ./checkpoints_si_v3/
 
-This reads `<rd>/train_*.pkl` and splits it internally into train and validation fractions with
-`--split` (0.2 by default) — the on-disk `validation_*` split is *not* used here, it is for
-step 4. Other flags: `--smooth` (training-loss display only) and `--conf` (the hyperparameters).
+This trains on `<rd>/train_*.pkl` and validates on `<rd>/validation_*.pkl` (the snap530
+split), so the loss that selects the best checkpoint is measured on a genuine hold-out. An
+earlier version carved validation out of `train_*` at random; because neighbouring Bifrost
+columns are near-copies of each other, that number read about 2× lower than the true hold-out
+loss for the same checkpoint. Other flags: `--seed` (parameter initialisation and batch order,
+default 0), `--compile` (`torch.compile`, about 5 min of compilation for a ~1.5× faster step),
+`--smooth` (training-loss display only) and `--conf` (the hyperparameters).
 
 `train.py` creates a timestamped run directory under `--sav`, copies `conf.dat`, `Dataset.py`,
-`Formal.py`, `graphnet.py` and `train.py` into it, and writes a new `<timestamp>_best.pth` every
-time the validation loss improves. Each checkpoint carries its hyperparameters and the exact
-normalisation constants it was trained with, so it can always be reproduced later.
+`Formal.py`, `graphnet.py` and `train.py` into it, and keeps two checkpoints there:
+`best.pth`, overwritten whenever the validation loss improves (weights only), and `last.pth`,
+overwritten every epoch with the optimizer and scheduler state as well. To continue an
+interrupted run in place:
+
+    python train.py --resume ./checkpoints_si_v3/<run>/ --epochs 300 --batch 64 --lr 1e-4 --gpu 0 --rd ../data_1d_si_v3/
+
+Each checkpoint carries its hyperparameters and the exact normalisation constants it was
+trained with, so it can always be reproduced later.
+
+The learning rate warms up linearly over the first epoch and then follows a cosine decay to
+zero, stepped per batch. The processor uses pre-norm residual blocks (LayerNorm on the inputs of
+each message-passing step, and one before the decoder); the previous post-norm layout let the
+latent norm grow ~8× over the 100 steps and the validation loss oscillated by up to 2× between
+epochs.
 
 Network size is set by `conf.dat`:
 
@@ -212,9 +231,9 @@ output to the same ±10 the targets are clipped to.
 Two consequences for reading the numbers:
 
 * **the reported MSE is not comparable to runs from before masking** — it will read higher;
-* the MSE is only a proxy in any case. The validation loss is a true mean over the whole held-out
-  fraction (so `_best.pth` is selected on a stable number), but whether a checkpoint actually
-  improves the *profiles* is what step 4b measures.
+* the MSE is only a proxy in any case. The validation loss is a true mean over the whole
+  `validation_*` split (so `best.pth` is selected on a stable number), but whether a checkpoint
+  actually improves the *profiles* is what step 4b measures.
 
 ---
 
@@ -226,8 +245,9 @@ Two consequences for reading the numbers:
         --rd ../data_1d_si_v3/ --sav ./checkpoints_si_v3/<run>/ --testdir ./checkpoints_si_v3/<run>/
 
 Note the flag names: `--sav` is where the **checkpoint is read from** and `--testdir` is where
-the **result is written**. `--sav` must be a single run directory *with a trailing slash*; the
-lexicographically last `*.pth` directly inside it is used, and the search is not recursive.
+the **result is written**. `--sav` must be a single run directory *with a trailing slash*; its
+`best.pth` is used (older runs with several `<stamp>_best.pth` files: the last one), and the
+search is not recursive.
 
 This writes `<dtst>_checkpoint_<stamp>.pkl` holding the predictions, the targets, the normalised
 input features and the loss per batch.
@@ -252,7 +272,7 @@ LTE — and reports how much closer to the reference the network gets than LTE d
     python evaluate_intensity.py --rd ../data_1d_si_v3/ --dtst validation \
         --ck ./checkpoints_si_v3/<run>/ --n 120
 
-`--ck` takes either a `*_best.pth` file or a directory, in which case the most recent checkpoint
+`--ck` takes either a `best.pth` file or a directory, in which case the most recent checkpoint
 at or below it is used. Output goes to `<run>/acceptance/` as a pickle and a three-panel figure,
 and it prints, for example:
 
@@ -272,15 +292,20 @@ predicted populations do not conserve the Si total the way the lightweaver targe
 
 ## 5. Inference from your own code
 
-`api.py` is the interface for an external inversion. Three functions, all on one column at a
-time, all in SI units, with `z` **strictly decreasing** (index 0 = top of the atmosphere):
+`api.py` is the interface for an external inversion. Four functions, all in SI units, with `z`
+**strictly decreasing** (index 0 = top of the atmosphere):
 
 ```python
 import sys; sys.path.insert(0, '/path/to/graphnet_nlte')
 import api
 
-# GraphNet only -- milliseconds, no lightweaver. For the hot loop.
+# GraphNet only, one column, no lightweaver. ~170 ms on CPU, ~50 ms on a GPU: the network is
+# 600 layers deep and a single column cannot fill a GPU, so this is launch overhead.
 log_dep = api.compute_dep_coeffs(T, z, ne, vturb, vlos)
+
+# GraphNet only, many columns in ONE forward pass. ~1.3 ms per column on an H100 at 64 columns.
+# This is the call for the hot loop of an inversion: batch every pixel of an iteration.
+log_deps = api.compute_dep_coeffs_batch([(T, z, ne, vturb, vlos), ...], device='cuda:0')
 
 # GraphNet + one formal solution. Drop-in replacement for the full solve.
 wave, Iwave, log_dep = api.intensity_gnn(T, z, ne, vturb, vlos)
@@ -290,7 +315,7 @@ wave, Iwave, log_dep = api.synthesis_lw(T, z, ne, vturb, vlos)
 ```
 
 `api.DEFAULT_CHECKPOINT` points at the `checkpoints_si_v2/` tree and resolves to the most recent
-`*_best.pth` below it on every call, so it follows training automatically; pass `checkpoint=`
+`best.pth` below it on every call, so it follows training automatically; pass `checkpoint=`
 explicitly to pin a model. Point it at your new tree once step 3 is running.
 
 Two limits to be aware of:
