@@ -20,9 +20,9 @@ script is for looking at individual columns.
 
 Usage
 -----
-    python explore_tests.py --ck checkpoints_si_v3/20260923-171902
-    python explore_tests.py --ck checkpoints_si_v3/            # every run below this tree
-    python explore_tests.py --ck <run>/validation_checkpoint_<run>_at_<stamp>.pkl
+    python plot_scripts/explore_tests.py --ck checkpoints_si_v3/20260923-171902
+    python plot_scripts/explore_tests.py --ck checkpoints_si_v3/    # every run below this tree
+    python plot_scripts/explore_tests.py --ck <run>/validation_checkpoint_<run>_at_<stamp>.pkl
 
 `--ck` takes a run directory, a checkpoint tree, a *.pth file or a prediction pickle. The
 database is read from the directory recorded in the pickle unless `--rd` overrides it.
@@ -37,9 +37,12 @@ import time
 import numpy as np
 from tqdm import tqdm
 
+# This script lives in plot_scripts/; api.py and evaluate_intensity.py live one level up.
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-if _MODULE_DIR not in sys.path:
-    sys.path.insert(0, _MODULE_DIR)
+_REPO_DIR = os.path.dirname(_MODULE_DIR)
+for _d in (_REPO_DIR, _MODULE_DIR):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 import api
 from evaluate_intensity import (LINE_CORE_NM, LOWER_LEVEL, UPPER_LEVEL, CORE_SEARCH_NM, column_arrays,
@@ -86,8 +89,8 @@ def load_test(path):
 
 def synthesise(T, z, ne, vturb, vlos, wave, log_dep_target, log_dep_pred):
     """
-    Emergent intensity for the LTE, target and predicted populations of one column, each from a
-    single formal solution on the same atmosphere (the api.intensity_gnn path), plus the height
+    Emergent intensity for the LTE, target and predicted populations of one column, each with
+    the api.intensity_gnn synthesis on the same atmosphere, plus the height
     range holding 90% of the 1083.0 nm line-core contribution function of the target.
     """
     import lightweaver as lw
@@ -100,6 +103,7 @@ def synthesise(T, z, ne, vturb, vlos, wave, log_dep_target, log_dep_pred):
     for name, log_dep in (('lte', None), ('target', log_dep_target), ('prediction', log_dep_pred)):
         si.n[:] = nstar if log_dep is None else (10.0 ** log_dep) * nstar
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
+        ctx.formal_sol_gamma_matrices()          # J for the scattering term, as api.intensity_gnn
         I, rc = ctx.compute_rays(wave, [mu], stokes=False, returnCtx=True)
         out[name] = np.asarray(I, dtype=np.float64)
         if name == 'target':

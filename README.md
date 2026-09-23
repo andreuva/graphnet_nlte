@@ -23,7 +23,7 @@ statistical-equilibrium iteration.
 | `Formal.py` | Training / validation / test loops, checkpointing |
 | `train.py` | Training entry point |
 | `test_prediction.py` | Runs a checkpoint over a split and dumps predictions vs. targets |
-| `explore_tests.py` | Plots those predictions and the profiles they imply |
+| `plot_scripts/explore_tests.py` | Plots those predictions and the profiles they imply |
 | `evaluate_intensity.py` | **Acceptance test**: how much closer to the truth the network gets than LTE, in intensity |
 | `api.py` | Minimal interface for calling the trained network from an inversion code |
 | `si_atom.py` | The custom 16-level Si I/II/III model atom (not in released lightweaver) |
@@ -258,7 +258,7 @@ any database generated before the spatial-split fix shares ~80% of its Bifrost c
 
 Then plot 25 random columns and the profiles they imply:
 
-    python explore_tests.py --ck ./checkpoints_si_v3/<run>/
+    python plot_scripts/explore_tests.py --ck ./checkpoints_si_v3/<run>/
 
 `--ck` takes a run directory, a whole checkpoint tree (every run below it), a `*.pth` file or a
 prediction pickle; the database is read from the directory recorded in each pickle (`--rd`

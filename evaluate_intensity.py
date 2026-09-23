@@ -15,17 +15,18 @@ For every column four profiles are synthesised on a common fine grid (2 pm, +-0.
 
     converged : full lightweaver NLTE solve (statistical equilibrium iterated to convergence,
                 J self-consistent). This is the ground truth an inversion would compute.
-    formal    : the stored, converged departure coefficients + ONE formal solution with J = 0.
-                Same synthesis path as api.intensity_gnn, but with perfect populations.
-    graphnet  : the network's departure coefficients + one formal solution (the deployed path).
-    lte       : b = 1 everywhere, one formal solution (no NLTE correction at all).
+    formal    : the stored, converged departure coefficients + the api.intensity_gnn synthesis
+                (one formal solution for the mean radiation field, then the emergent rays; no
+                statistical-equilibrium iteration). Perfect populations, deployed solver.
+    graphnet  : the network's departure coefficients + the same synthesis (the deployed path).
+    lte       : b = 1 everywhere, same synthesis (no NLTE correction at all).
 
 which gives a complete error budget:
 
     deployed error   graphnet - converged   what a user of api.intensity_gnn actually gets
     network error    graphnet - formal      the part due to the GraphNet alone
-    solver floor     formal   - converged   the part due to skipping the NLTE iteration (J = 0,
-                                            i.e. no background scattering emissivity)
+    solver floor     formal   - converged   the part due to skipping the NLTE iteration (the
+                                            mean radiation field from one formal solution)
     LTE baseline     lte      - converged   the error of doing nothing; the skill of the network
                                             is measured against this
 
@@ -40,7 +41,7 @@ the 90th and 99th percentiles and the maximum, so the tail is never hidden by th
                 quantity that must sit below the observational noise for the acceleration to be
                 invisible to the inversion.
     rms_shape   Same, after normalising each profile to its OWN continuum. This removes any pure
-                continuum offset (the J = 0 floor is one) and isolates the profile shape.
+                continuum offset and isolates the profile shape.
     max_norm    Worst-wavelength |dI|/I_c. core_norm: the same at the reference line core.
     chi2nu      Reduced chi^2 against the reference for a photon-noise level sigma (in I_c units;
                 default 1e-3 for ground-based spectropolarimetry, and 3e-4 for deep DKIST-class
@@ -148,7 +149,7 @@ BIFROST_NDEPTH = 211
 
 TRIALS = ('graphnet', 'network', 'floor', 'lte')
 TRIAL_LABEL = {'graphnet': 'GraphNet (deployed)', 'network': 'GraphNet vs formal (network only)',
-               'floor': 'formal solution floor (J = 0)', 'lte': 'LTE (no NLTE correction)'}
+               'floor': 'formal solution floor (no SE iteration)', 'lte': 'LTE (no NLTE correction)'}
 
 # Colours: neutral ink for the reference (truth, not a series) and the first three slots of a
 # colour-vision-deficiency validated categorical palette for the three competing series.
@@ -271,15 +272,18 @@ def _worker_init(wave):
 
 def _formal_solution(atmos, spect, eqPops, log_dep, nstar, mu, wave, depth_data):
     """
-    One formal solution with the Si populations set from log_dep (LTE if None), on a Context
-    that has never iterated (J = 0). Optionally returns the emergent-ray opacity and emissivity
-    at every depth (for the contribution function and tau = 1 height).
+    The api.intensity_gnn synthesis with the Si populations set from log_dep (LTE if None): one
+    formal solution on the full grid to fill the mean radiation field (a fresh Context has
+    J = 0), then the emergent rays; no statistical-equilibrium iteration. Optionally returns
+    the emergent-ray opacity and emissivity at every depth (for the contribution function and
+    the tau = 1 height).
     """
     lw = _W['lw']
     pops = nstar if log_dep is None else (10.0 ** log_dep) * nstar
     eqPops.atomicPops['Si'].n[:] = pops
     t0 = time.perf_counter()
     ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
+    ctx.formal_sol_gamma_matrices()
     I, rc = ctx.compute_rays(wave, [mu], stokes=False, returnCtx=True)
     dt = time.perf_counter() - t0
     chi = eta = None
@@ -330,8 +334,8 @@ def synthesise_column(task):
                                        dtype=np.float64)
         del ctx
 
-        # --- single formal solutions (J = 0), reusing the atmosphere; nStar is untouched by
-        #     Context construction, so writing n[:] in place is equivalent to a fresh build.
+        # --- deployed-path syntheses, reusing the atmosphere; nStar is untouched by Context
+        #     construction, so writing n[:] in place is equivalent to a fresh build.
         I_form, chi_ref, eta_ref, t_f1 = _formal_solution(atmos, spect, eqPops, dep_ref, nstar, mu, wave, True)
         I_gnn, chi_gnn, _, t_f2 = _formal_solution(atmos, spect, eqPops, dep_gnn, nstar, mu, wave, True)
         I_lte, _, _, t_f3 = _formal_solution(atmos, spect, eqPops, None, nstar, mu, wave, False)
@@ -770,7 +774,7 @@ def build_report(rows, args, checkpoint, source, timing, hyperparams, noise_leve
         im = values(rows, 'consistency', 'I_conv_vs_stored_max')
         P(f'   converged solve here vs stored emergent intensity (database grid): |dI/I| median {np.median(ic):.1e}, '
           f'worst column max {np.max(im):.1e}')
-    P(f'   formal-solution floor (J = 0) vs converged: median RMS {np.median(values(rows, "floor", "rms_norm")):.1e} I_c, '
+    P(f'   formal-solution floor (no SE iteration) vs converged: median RMS {np.median(values(rows, "floor", "rms_norm")):.1e} I_c, '
       f'shape-only {np.median(values(rows, "floor", "rms_shape")):.1e} I_c -- the irreducible error of the deployed path')
     return '\n'.join(L)
 
@@ -841,7 +845,7 @@ def fig_profiles(rows, residuals, profiles, wave, noise, path, plt):
         b.axhspan(-noise * 1e3, noise * 1e3, color=COLOR['grid'], alpha=0.18, lw=0)
         b.axhline(0, color=COLOR['reference'], lw=0.8)
         b.plot(wave, residuals[k]['lte'] * 1e3, lw=1.6, color=COLOR['lte'], ls=(0, (5, 2)), label='LTE')
-        b.plot(wave, residuals[k]['floor'] * 1e3, lw=1.6, color=COLOR['floor'], label='formal floor (J = 0)')
+        b.plot(wave, residuals[k]['floor'] * 1e3, lw=1.6, color=COLOR['floor'], label='formal floor')
         b.plot(wave, residuals[k]['graphnet'] * 1e3, lw=1.8, color=COLOR['graphnet'], label='GraphNet')
         lim = max(3 * noise * 1e3, 1.2 * np.max(np.abs(residuals[k]['graphnet'])) * 1e3)
         b.set_ylim(-lim, lim)
@@ -1140,7 +1144,7 @@ def main():
     rows, residuals, profiles, failures = [], [], [], []
     t_start = time.time()
     workers = max(1, min(args.workers, len(tasks)))
-    print(f'=> synthesising 4 profiles per column (converged NLTE + 3 formal solutions) on {workers} processes')
+    print(f'=> synthesising 4 profiles per column (converged NLTE + 3 deployed-path syntheses) on {workers} processes')
     for var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
         os.environ.setdefault(var, '1')       # one thread per lightweaver process
     ctx = mp.get_context('spawn')

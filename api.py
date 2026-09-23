@@ -17,9 +17,11 @@ Three functions, all operating on ONE 1D atmospheric column at a time:
         validating the GraphNet, not inside an inversion loop.
 
     intensity_gnn(T, z, ne, vturb, vlos)
-        NLTE-accelerated synthesis: GraphNet for the departure coefficients + a single
-        lightweaver formal solution (no NLTE iteration). Same (wave, Iwave, log_dep)
-        return signature as `synthesis_lw`, so it is a drop-in, much faster replacement.
+        NLTE-accelerated synthesis: GraphNet for the departure coefficients + two lightweaver
+        formal solutions (one to obtain the mean radiation field for the background scattering
+        term, one for the emergent rays), with no statistical-equilibrium iteration. Same
+        (wave, Iwave, log_dep) return signature as `synthesis_lw`, so it is a drop-in, much
+        faster replacement.
 
 Units (SI, matching how the training set was generated)
 ---------------------------------------------------------
@@ -59,13 +61,20 @@ if _MODULE_DIR not in sys.path:
 
 import graphnet
 
-# Points at the checkpoint tree, not a specific file: Formal.py overwrites 'best.pth' in a
-# timestamped per-run directory each time validation loss improves, so the last one (sorted by
-# path) anywhere below here is the best checkpoint of the most recent run. Resolved at call time
-# (see _resolve_checkpoint), so this keeps tracking training automatically -- no need to edit it
-# by hand as new runs and checkpoints appear. Point it at a specific *.pth file instead (or pass
-# checkpoint= explicitly) once training is finished and you want to pin a fixed model.
-DEFAULT_CHECKPOINT = os.path.join(_MODULE_DIR, 'checkpoints_si_v2')
+# Default model, chosen when this module is imported:
+#
+#   * a file 'checkpoint.pth' next to api.py, if there is one. This is the layout of the
+#     standalone distribution (api_standalone/), which ships one pinned model;
+#   * otherwise the checkpoint tree 'checkpoints_si_v3' next to api.py, i.e. the development
+#     layout. That is a directory, not a file: Formal.py overwrites '<run>/best.pth' each time
+#     the validation loss improves, so the last '*best.pth' (sorted by path) anywhere below it is
+#     the best checkpoint of the most recent run. It is resolved at call time (see
+#     _resolve_checkpoint), so it keeps tracking training without being edited by hand.
+#
+# Pass checkpoint= explicitly to pin a specific model in either layout.
+_STANDALONE_CHECKPOINT = os.path.join(_MODULE_DIR, 'checkpoint.pth')
+DEFAULT_CHECKPOINT = (_STANDALONE_CHECKPOINT if os.path.isfile(_STANDALONE_CHECKPOINT)
+                      else os.path.join(_MODULE_DIR, 'checkpoints_si_v3'))
 
 # Si I 10827 A window (the line sits at 1083.0038 nm in vacuum). The sampling has to resolve the
 # Doppler width, which for Si at the coolest temperature in the training set (2500 K, vturb=0)
@@ -324,10 +333,12 @@ def compute_dep_coeffs_batch(columns, checkpoint=DEFAULT_CHECKPOINT, device='cpu
     return log_deps
 
 
-# Below this wavelength the background coherent-scattering emissivity (sigma * J) is a
-# significant part of the source function, and intensity_gnn's single formal solution runs on a
-# Context that has never iterated, so J = 0. Measured against the converged reference: 1.6e-4
-# median error at 800-1100 nm, but 1.3e-2 median and up to 0.68 at 100-200 nm.
+# Below this wavelength intensity_gnn is not accurate: its mean radiation field comes from a
+# single formal solution, which is enough where scattering is a small perturbation but not in
+# the ultraviolet, where the background scattering emissivity and the Si I bound-free edges make
+# J far from its converged value. Measured against the converged solve (|dI/I| median / max):
+# 6e-8 / 8e-8 in the 1083 nm window, 7e-7 / 2e-5 at 400-800 nm, 2e-4 / 2e-2 at 200-400 nm and
+# 4e-4 / 0.8 at 100-200 nm.
 _SCATTERING_SAFE_MIN_NM = 400.0
 
 
@@ -336,12 +347,11 @@ def _warn_if_scattering_matters(wave):
     wave = np.asarray(wave)
     if wave.size and wave.min() < _SCATTERING_SAFE_MIN_NM:
         warnings.warn(
-            f"intensity_gnn takes a single formal solution on a Context that has not been "
-            f"iterated, so the mean intensity J is zero and the background coherent-scattering "
-            f"emissivity is missing. This is accurate in the near-IR (~1e-4 relative) but not "
-            f"below {_SCATTERING_SAFE_MIN_NM:.0f} nm (up to ~0.7 relative at 100-200 nm), and "
-            f"the requested grid reaches {wave.min():.1f} nm. Use synthesis_lw for those "
-            f"wavelengths.",
+            f"intensity_gnn obtains the mean radiation field from a single formal solution "
+            f"instead of iterating it. This is accurate above {_SCATTERING_SAFE_MIN_NM:.0f} nm "
+            f"(|dI/I| below 2e-5) but not in the ultraviolet (up to ~2e-2 at 200-400 nm and "
+            f"~0.8 at 100-200 nm), and the requested grid reaches {wave.min():.1f} nm. Use "
+            f"synthesis_lw for those wavelengths.",
             RuntimeWarning, stacklevel=3)
 
 
@@ -435,9 +445,10 @@ def intensity_gnn(T, z, ne, vturb, vlos, log_dep=None, wave=None, mu=None,
                    checkpoint=DEFAULT_CHECKPOINT, device='cpu'):
     """
     NLTE-accelerated synthesis: GraphNet for the departure coefficients (unless already
-    supplied) + a single lightweaver formal solution (no NLTE iteration). Returns the same
-    (wave, Iwave, log_dep) triple as `synthesis_lw`, so the two are interchangeable -- this
-    is the fast function to use inside an inversion.
+    supplied) + one lightweaver formal solution for the mean radiation field + the emergent
+    rays, with no statistical-equilibrium iteration. Returns the same (wave, Iwave, log_dep)
+    triple as `synthesis_lw`, so the two are interchangeable -- this is the fast function to
+    use inside an inversion.
 
     Parameters
     ----------
@@ -484,6 +495,12 @@ def intensity_gnn(T, z, ne, vturb, vlos, log_dep=None, wave=None, mu=None,
 
     import lightweaver as lw
     ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
+    # One formal solution on the full grid before the rays: a fresh Context has J = 0, so the
+    # background coherent-scattering emissivity (sigma J) would be missing from the source
+    # function. This pass fills J from the populations just set and leaves them untouched.
+    # Measured against the converged solve in the Si I 1083 nm window: the RMS error of the
+    # emergent profile drops from ~2e-4 to ~5e-8 of the continuum, for 10-25 ms per column.
+    ctx.formal_sol_gamma_matrices()
     Iwave = ctx.compute_rays(wave, [mu], stokes=False)
 
     return np.asarray(wave), np.asarray(Iwave), log_dep
