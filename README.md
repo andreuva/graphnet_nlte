@@ -258,32 +258,47 @@ any database generated before the spatial-split fix shares ~80% of its Bifrost c
 
 Then plot 25 random columns and the profiles they imply:
 
-    python explore_tests.py
+    python explore_tests.py --ck ./checkpoints_si_v3/<run>/
 
-Edit the two variables at the top of the file first — `type_dtst` and the `glob` path — to point
-at the run you just tested. It writes into `<run>/plots/`.
+`--ck` takes a run directory, a whole checkpoint tree (every run below it), a `*.pth` file or a
+prediction pickle; the database is read from the directory recorded in each pickle (`--rd`
+overrides it). It writes the loss curves, a grid of departure coefficients and the corresponding
+Si I profiles into `<run>/plots/` (`--sav` overrides), and with more than one pickle also a
+loss-vs-architecture scatter.
 
 ### 4b. Acceptance test in intensity
 
-This is the number to quote. `evaluate_intensity.py` synthesises the Si I 1083.0 nm profile three
-times per column — from the stored converged departure coefficients, from the network, and from
-LTE — and reports how much closer to the reference the network gets than LTE does:
+This is the number to quote. `evaluate_intensity.py` synthesises the Si I 1083.0 nm profile four
+times per column — a fully converged NLTE solve (the truth), the stored departure coefficients
+with a single formal solution, the network's coefficients with a single formal solution (the
+deployed path of `api.intensity_gnn`), and LTE — and measures the network where an inversion
+would feel it:
 
-    python evaluate_intensity.py --rd ../data_1d_si_v3/ --dtst validation \
-        --ck ./checkpoints_si_v3/<run>/ --n 120
+    # run the checkpoint through the deployed feature construction
+    python evaluate_intensity.py --rd ../data_1d_si_v3/ --ck ./checkpoints_si_v3/<run>/ --n 1000
 
-`--ck` takes either a `best.pth` file or a directory, in which case the most recent checkpoint
-at or below it is used. Output goes to `<run>/acceptance/` as a pickle and a three-panel figure,
-and it prints, for example:
+    # or evaluate exactly the predictions test_prediction.py dumped
+    python evaluate_intensity.py --rd ../data_1d_si_v3/ \
+        --pred ./checkpoints_si_v3/<run>/validation_checkpoint_<run>_at_<stamp>.pkl
 
-      metric (median over columns)                LTE     GraphNet       gain
-      line-core rel. intensity error           1.4308       0.1329      10.8x
-      equivalent-width rel. error              0.3765       0.0412       9.1x
-      GraphNet beats LTE on  95.8% of columns  (line core)
+The report (printed, and written to `<run>/acceptance/` with a JSON of headline numbers, a pickle
+of every per-column row and six figures) contains:
 
-      line depth 1 - I/Ic at core:  reference 0.795   GraphNet 0.768   LTE 0.519
-      log10(b) MAE below 800 km:    0.0326 dex
-      |sum n_i / n_Total - 1|:      0.0164 median below 800 km
+* an **error budget** — RMS of `(I - I_conv)/I_c` for the deployed network, the network alone,
+  the J = 0 formal-solution floor and LTE, as median with bootstrap CI, p90, p99 and max;
+* an **observational-noise test** — fraction of columns whose error is below 1e-3 and 3e-4 `I_c`
+  and whose reduced chi^2 against the truth is <= 1 at that noise;
+* **line parameters** an inversion would infer — line depth, equivalent width, core velocity and
+  FWHM — with the skill score `1 - GNN/LTE` and the paired win fraction;
+* **departure coefficients weighted by the line-core contribution function** — `log10 b_lower`
+  (opacity) and `log10 b_u/b_l` (source function), the loss-mask MAE, population conservation and
+  the shift of the tau = 1 height;
+* results **per column origin** (Bifrost vs semi-empirical) and per line depth, the worst columns
+  by index, the **speed-up** of the NLTE step and end to end, and consistency checks proving the
+  converged solve here reproduces the database.
+
+Synthesis runs on `--workers` CPU processes (about 1.5 min for 1000 columns on 32); the network
+runs on `--device` (CPU by default, which is plenty for evaluation).
 
 The last line is a diagnostic, not an error: the 16 levels are decoded independently, so the
 predicted populations do not conserve the Si total the way the lightweaver targets do.
