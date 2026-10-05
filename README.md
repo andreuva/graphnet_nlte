@@ -244,7 +244,11 @@ checkpoint as `edge_ladder_levels`, and `Formal.test` and `api._build_graph` reb
 from them, so older chain-only checkpoints still evaluate on the graph they were trained with.
 With `edge_input_size = 2` every edge also carries log10 of the number of depth points it
 spans (0 on the chain, 1-2 on the rungs), so the edge encoder can tell a rung from a chain edge
-by an order-one input; the delta-z feature alone reaches ~100 on the rungs.
+by an order-one input, and the delta-z feature is divided by that span, i.e. it is the mean
+spacing along the edge: unchanged on the chain, order one on the rungs instead of the ~100 the
+raw height difference reaches there, and the full delta z is still the product of the two.
+This is recorded in each checkpoint as `edge_span_scaled`; the runs started on 2026-10-01 saw
+the raw value and their checkpoints, lacking the key, are evaluated that way.
 
 `--node-drop 0.3` (off by default) is a z-resolution augmentation: every time a training column
 is fetched, a random fraction of its interior depth points, uniform in [0, 0.3], is dropped and

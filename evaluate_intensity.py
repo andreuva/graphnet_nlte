@@ -204,13 +204,13 @@ def predict_with_model(checkpoint, data, indices, device, batch_size):
     import torch
     import api
 
-    model, hyperparams, norm_stats = api._load_model(checkpoint, device)
+    model, hyperparams, norm_stats, graph_kwargs = api._load_model(checkpoint, device)
     is_cuda = str(device).startswith('cuda')
 
     def forward(cols):
         nodes, eidx, eattr, bvec, lengths, offset = [], [], [], [], [], 0
         for g, (T, z, ne, vturb, vlos) in enumerate(cols):
-            node, edge_index, edge_attr = api._build_graph(T, z, ne, vturb, vlos, norm_stats)
+            node, edge_index, edge_attr = api._build_graph(T, z, ne, vturb, vlos, norm_stats, **graph_kwargs)
             nodes.append(node)
             eidx.append(edge_index + offset)
             eattr.append(edge_attr)

@@ -244,6 +244,7 @@ class Formal(object):
                 # Graph connectivity the inputs were built with (Dataset.EDGE_LADDER_LEVELS), so
                 # that evaluation and api.py rebuild the same graph.
                 'edge_ladder_levels': self.dataset.edge_ladder_levels,
+                'edge_span_scaled': self.dataset.edge_span_scaled,
             }
 
             # If the validation loss improves, overwrite best.pth (weights only, no optimizer)
@@ -408,7 +409,8 @@ class Formal(object):
         # holds, so an older checkpoint is still fed the inputs it expects.
         self.test_dataset = dtst(self.hyperameters, self.datadir, dtst_type,
                                  norm_stats=checkpoint.get('norm_stats'),
-                                 edge_ladder_levels=checkpoint.get('edge_ladder_levels', ()))
+                                 edge_ladder_levels=checkpoint.get('edge_ladder_levels', ()),
+                                 edge_span_scaled=checkpoint.get('edge_span_scaled', False))
 
         self.test_loader = torch_geometric.loader.DataLoader(
             self.test_dataset, batch_size=self.batch_size, shuffle=False, **self.kwargs)
@@ -539,7 +541,8 @@ class Formal(object):
         print("=> Loading the dataset to predict")
         self.pred_dataset = dtst(self.hyperameters, directory, prefix,
                                  norm_stats=checkpoint.get('norm_stats'),
-                                 edge_ladder_levels=checkpoint.get('edge_ladder_levels', ()))
+                                 edge_ladder_levels=checkpoint.get('edge_ladder_levels', ()),
+                                 edge_span_scaled=checkpoint.get('edge_span_scaled', False))
 
         # Remove the temporary files and directory
         [os.remove(file) for file in glob.glob(directory + '*')]

@@ -5,17 +5,26 @@ import os
 import numpy as np
 import torch_geometric.data
 
-# Feature normalization statistics (Z-score: (x - mean) / std), computed over the full
-# data_1d_si/train_* set (493391 columns, ~6.8e7 depth points). Recompute if the training
-# set changes materially (different atom/species, different atmosphere mix, etc.).
+# Feature normalization statistics (Z-score: (x - mean) / std), computed on 2026-10-02 with
+# normalization_compute.py over every depth point of the full data_1d_si_v4/train_* split
+# (996042 columns, 50.3% of them 211-point Bifrost columns, 1.49e8 depth points). Recompute if
+# the training set changes materially (different atom/species, different atmosphere mix, etc.);
+# every checkpoint stores the values it was trained with, so retuning these never affects an
+# existing checkpoint. Previous values (data_1d_si, 493391 columns, 20% Bifrost; used by every
+# run started before 2026-10-02): T_log10 4.10228/0.600127, z 1.30265e6/1.09178e6, tau_log10
+# -7.75738/4.37718, ne_log10 17.5785/2.35518, vturb_km 2.88109/6.14624, vlos_km
+# -0.603487/4.86515, delta_z 17706.5.
 NORM_STATS = {
-    'T_log10': {'mean': 4.10228, 'std': 0.600127},
-    'z': {'mean': 1.30265e6, 'std': 1.09178e6},      # height in meters
-    'tau_log10': {'mean': -7.75738, 'std': 4.37718},
-    'ne_log10': {'mean': 17.5785, 'std': 2.35518},
-    'vturb_km': {'mean': 2.88109, 'std': 6.14624},   # vturb in km/s (scaled by 1e3)
-    'vlos_km': {'mean': -0.603487, 'std': 4.86515},  # vlos in km/s (scaled by 1e3)
-    'delta_z': {'std': 17706.5},                     # std of z differences between adjacent nodes (edge feature)
+    'T_log10': {'mean': 4.13, 'std': 0.632214},
+    'z': {'mean': 1.3246e6, 'std': 1.11838e6},       # height in meters
+    'tau_log10': {'mean': -7.89841, 'std': 4.06044},
+    'ne_log10': {'mean': 17.511, 'std': 2.41168},
+    'vturb_km': {'mean': 8.17848, 'std': 8.44839},   # vturb in km/s (scaled by 1e3)
+    'vlos_km': {'mean': -0.838815, 'std': 4.05366},  # vlos in km/s (scaled by 1e3)
+    # RMS of the z difference between adjacent depth points (edge feature). The feature is built
+    # for both directions of every edge, so it has zero mean and the RMS makes it unit variance;
+    # the previous value was the plain std of the one-directional differences.
+    'delta_z': {'std': 26053.7},
 }
 
 # Levels and depths whose population falls below this fraction of the species total,
@@ -58,7 +67,7 @@ def build_edge_index(num_nodes, ladder_levels=EDGE_LADDER_LEVELS):
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, hyperparameters, datadir='../data/', prefix='train', norm_stats=None,
-                 edge_ladder_levels=EDGE_LADDER_LEVELS, node_drop=0.0):
+                 edge_ladder_levels=EDGE_LADDER_LEVELS, edge_span_scaled=True, node_drop=0.0):
         """
         Dataset for the depth stratification
 
@@ -69,6 +78,11 @@ class Dataset(torch.utils.data.Dataset):
         edge_ladder_levels : tuple of int, optional
             Ladder levels of long-range edges added to the chain, see EDGE_LADDER_LEVELS. Pass
             a checkpoint's embedded 'edge_ladder_levels' when evaluating it.
+        edge_span_scaled : bool, optional
+            With edge_input_size 2, divide the delta-z edge feature by the number of depth points
+            the edge spans, i.e. use the mean spacing along the edge (see _edge_attr). True for
+            new runs; pass a checkpoint's embedded 'edge_span_scaled' when evaluating it (False
+            when absent: runs started before 2026-10-02 saw the raw delta z on the rungs).
         node_drop : float, optional
             Training-time augmentation. Each time a column is fetched, a random fraction of its
             interior depth points, uniform in [0, node_drop], is dropped and the graph is rebuilt
@@ -82,6 +96,7 @@ class Dataset(torch.utils.data.Dataset):
         ns = NORM_STATS if norm_stats is None else norm_stats
         self.ns = ns
         self.edge_ladder_levels = tuple(edge_ladder_levels)
+        self.edge_span_scaled = bool(edge_span_scaled)
         self.node_drop = float(node_drop)
         self.edge_input_size = hyperparameters['edge_input_size']
 
@@ -224,16 +239,24 @@ class Dataset(torch.utils.data.Dataset):
         edges = np.zeros((edge_index.shape[1], self.edge_input_size))
 
         if self.edge_input_size == 2:
-            # Feature 0: delta z, in units of the std of the adjacent spacing; on the ladder rungs
-            # this reaches ~100. Feature 1: log10 of the number of depth points the edge spans in
-            # the current graph, exactly 0 on the chain and ~1-2 on the rungs, so the edge encoder
-            # can tell a rung from a chain edge with an order-one input whatever the column's
-            # resolution. (Before 2026-09-30 the second feature was delta log10 tau, which
-            # inference cannot compute.) Same construction as api._build_graph.
+            # Feature 1: log10 of the number of depth points the edge spans in the current graph
+            # (between survivors under node dropping): exactly 0 on the chain, ~1-2 on the ladder
+            # rungs, so the edge encoder can tell a rung from a chain edge by an order-one input
+            # at any resolution. Feature 0: delta z in units of the RMS adjacent spacing and,
+            # with edge_span_scaled, divided by that span, i.e. the mean spacing along the edge:
+            # unchanged on the chain (span 1), order one on the rungs instead of ~100, and the
+            # full delta z is still feature 0 times 10**feature 1. Runs started before 2026-10-02
+            # saw the undivided value on the rungs; their checkpoints carry no 'edge_span_scaled'
+            # key and are evaluated with edge_span_scaled=False. (Before 2026-09-30 the second
+            # feature was delta log10 tau, which inference cannot compute.) Same construction as
+            # api._build_graph.
             if not self.z_activated:
                 raise ValueError("No z data available for edge features")
+            span = np.abs(edge_index[1] - edge_index[0])
             edges[:, 0] = (self.z_all[i][src] - self.z_all[i][dst]) / ns['delta_z']['std']
-            edges[:, 1] = np.log10(np.abs(edge_index[1] - edge_index[0]))
+            if self.edge_span_scaled:
+                edges[:, 0] /= span
+            edges[:, 1] = np.log10(span)
         elif self.edge_input_size == 1:
             if self.z_activated:
                 edges[:, 0] = (self.z_all[i][src] - self.z_all[i][dst]) / ns['delta_z']['std']
