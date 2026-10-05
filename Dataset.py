@@ -27,8 +27,38 @@ NORM_STATS = {
 # Requires the *_n_Nat.pkl files; without them nothing is masked.
 NEGLIGIBLE_LOG_N_OVER_NTOT = -9.0
 
+# Long-range "ladder" edges on top of the nearest-neighbour chain. For each level k, hub nodes
+# are placed at the k+1 points j*(N-1)/k of an N-point column and consecutive hubs are linked:
+# with (2, 3, 10) a 100-point column gets 0-50-99, 0-33-66-99 and 0-10-20-...-99. On the chain
+# alone information travels one point per message-passing step, so with 128 steps the top of a
+# 211-point Bifrost column never sees the photosphere whose radiation field sets its
+# populations; along the ladder any two points are a handful of steps apart, while all but a
+# few nodes keep their plain chain neighbourhood (linking every node to far-away points would
+# blur the local transfer). The levels a checkpoint was trained with are stored in it as
+# 'edge_ladder_levels' (Formal.py), so Formal.test and api._build_graph rebuild exactly the
+# graph the checkpoint expects; () is the plain chain of older checkpoints.
+EDGE_LADDER_LEVELS = (2, 3, 10)
+
+
+def build_edge_index(num_nodes, ladder_levels=EDGE_LADDER_LEVELS):
+    """
+    Chain graph of a column (node j <-> j-1 and j <-> j+1) plus the ladder rungs of
+    `ladder_levels` (see EDGE_LADDER_LEVELS), as a (2, n_edges) int64 array of
+    [senders, receivers] with every edge in both directions. Kept identical to
+    api._build_edge_index.
+    """
+    pairs = {(j, j + 1) for j in range(num_nodes - 1)}
+    for k in ladder_levels:
+        hubs = np.unique(np.round(np.linspace(0, num_nodes - 1, k + 1)).astype(int))
+        pairs.update((int(a), int(b)) for a, b in zip(hubs[:-1], hubs[1:]))
+    pairs = sorted(pairs)
+    a = np.array([p[0] for p in pairs], dtype=np.int64)
+    b = np.array([p[1] for p in pairs], dtype=np.int64)
+    return np.stack([np.concatenate([a, b]), np.concatenate([b, a])])
+
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, hyperparameters, datadir='../data/', prefix='train', norm_stats=None):
+    def __init__(self, hyperparameters, datadir='../data/', prefix='train', norm_stats=None,
+                 edge_ladder_levels=EDGE_LADDER_LEVELS, node_drop=0.0):
         """
         Dataset for the depth stratification
 
@@ -36,10 +66,24 @@ class Dataset(torch.utils.data.Dataset):
             Normalization constants to build the features with. Defaults to the module-level
             NORM_STATS; pass a checkpoint's embedded 'norm_stats' when reproducing the exact
             inputs an older checkpoint was trained with.
+        edge_ladder_levels : tuple of int, optional
+            Ladder levels of long-range edges added to the chain, see EDGE_LADDER_LEVELS. Pass
+            a checkpoint's embedded 'edge_ladder_levels' when evaluating it.
+        node_drop : float, optional
+            Training-time augmentation. Each time a column is fetched, a random fraction of its
+            interior depth points, uniform in [0, node_drop], is dropped and the graph is rebuilt
+            on the remaining points (the two ends always stay). The departure coefficients are
+            per depth point, so the targets of the surviving points are unchanged; the network
+            just sees the same atmosphere at a different z resolution. 0 (default) disables it;
+            keep it 0 for validation and test.
         """
         super(Dataset, self).__init__()
 
         ns = NORM_STATS if norm_stats is None else norm_stats
+        self.ns = ns
+        self.edge_ladder_levels = tuple(edge_ladder_levels)
+        self.node_drop = float(node_drop)
+        self.edge_input_size = hyperparameters['edge_input_size']
 
         # Read the training database
         with open(datadir + prefix + '_tau.pkl', 'rb') as filehandle:
@@ -97,14 +141,11 @@ class Dataset(torch.utils.data.Dataset):
 
             num_nodes = len(self.tau_all[i])
 
-            # Chain graph: node j <-> j-1 and j <-> j+1 (same edge set as api._build_graph)
+            # Chain plus ladder edges (same edge set as api._build_graph, see build_edge_index)
             if num_nodes not in edge_index_cache:
-                senders = np.concatenate([np.arange(num_nodes - 1), np.arange(1, num_nodes)])
-                receivers = np.concatenate([np.arange(1, num_nodes), np.arange(num_nodes - 1)])
-                edge_index_cache[num_nodes] = torch.tensor(np.stack([senders, receivers]), dtype=torch.long)
+                edge_index_cache[num_nodes] = torch.tensor(
+                    build_edge_index(num_nodes, self.edge_ladder_levels), dtype=torch.long)
             self.edge_index[i] = edge_index_cache[num_nodes]
-
-            n_edges = self.edge_index[i].shape[1]
 
             # Define normalized node features (mean=0, std=1)
             node_input_size = hyperparameters['node_input_size']
@@ -133,31 +174,7 @@ class Dataset(torch.utils.data.Dataset):
                 self.nodes[i][:, 4] = (self.vlos_all[i] / 1e3 - ns['vlos_km']['mean']) / ns['vlos_km']['std']
 
             # Define normalized edge features
-            edge_input_size = hyperparameters['edge_input_size']
-            self.edges[i] = np.zeros((n_edges, edge_input_size))
-
-            if edge_input_size == 2:
-                if not self.z_activated:
-                    raise ValueError("No z data available for edge features")
-                else:
-                    z_0 = self.z_all[i][self.edge_index[i][0, :]]
-                    z_1 = self.z_all[i][self.edge_index[i][1, :]]
-                    self.edges[i][:, 0] = (z_0 - z_1) / ns['delta_z']['std']
-
-                tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
-                tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                self.edges[i][:, 1] = (tau0 - tau1) / ns['tau_log10']['std']
-            elif edge_input_size == 1:
-                if self.z_activated:
-                    z_0 = self.z_all[i][self.edge_index[i][0, :]]
-                    z_1 = self.z_all[i][self.edge_index[i][1, :]]
-                    self.edges[i][:, 0] = (z_0 - z_1) / ns['delta_z']['std']
-                else:
-                    tau0 = np.log10(self.tau_all[i][self.edge_index[i][0, :]])
-                    tau1 = np.log10(self.tau_all[i][self.edge_index[i][1, :]])
-                    self.edges[i][:, 0] = (tau0 - tau1) / ns['tau_log10']['std']
-            else:
-                raise ValueError("Incompatible edge input size")
+            self.edges[i] = self._edge_attr(i, self.edge_index[i].numpy())
 
             # We don't use at the moment any global property of the graph, so we set it to zero.
             self.u[i] = np.zeros((1, 1))
@@ -194,6 +211,40 @@ class Dataset(torch.utils.data.Dataset):
         self.n_Nat = None
         self.dep_all = None
 
+    def _edge_attr(self, i, edge_index, keep=None):
+        """
+        Normalized edge features of column i for a (2, n_edges) edge_index. `keep`, if given, is
+        the sorted array of the column's depth points that edge_index refers to (node dropping in
+        __getitem__); otherwise the edges index the full column.
+        """
+        ns = self.ns
+        src, dst = edge_index[0], edge_index[1]
+        if keep is not None:
+            src, dst = keep[src], keep[dst]
+        edges = np.zeros((edge_index.shape[1], self.edge_input_size))
+
+        if self.edge_input_size == 2:
+            # Feature 0: delta z, in units of the std of the adjacent spacing; on the ladder rungs
+            # this reaches ~100. Feature 1: log10 of the number of depth points the edge spans in
+            # the current graph, exactly 0 on the chain and ~1-2 on the rungs, so the edge encoder
+            # can tell a rung from a chain edge with an order-one input whatever the column's
+            # resolution. (Before 2026-09-30 the second feature was delta log10 tau, which
+            # inference cannot compute.) Same construction as api._build_graph.
+            if not self.z_activated:
+                raise ValueError("No z data available for edge features")
+            edges[:, 0] = (self.z_all[i][src] - self.z_all[i][dst]) / ns['delta_z']['std']
+            edges[:, 1] = np.log10(np.abs(edge_index[1] - edge_index[0]))
+        elif self.edge_input_size == 1:
+            if self.z_activated:
+                edges[:, 0] = (self.z_all[i][src] - self.z_all[i][dst]) / ns['delta_z']['std']
+            else:
+                tau0 = np.log10(self.tau_all[i][src])
+                tau1 = np.log10(self.tau_all[i][dst])
+                edges[:, 0] = (tau0 - tau1) / ns['tau_log10']['std']
+        else:
+            raise ValueError("Incompatible edge input size")
+        return edges
+
     def __getitem__(self, index):
 
         # When we are asked to return the information of a graph, we encode
@@ -206,9 +257,26 @@ class Dataset(torch.utils.data.Dataset):
         target = self.target[index]
         u = self.u[index]
         edge_index = self.edge_index[index]
+        mask = self.mask[index]
+
+        if self.node_drop > 0:
+            # Drop a random fraction, uniform in [0, node_drop], of the interior depth points and
+            # rebuild the graph on the survivors; the two ends stay (they bound the column). Uses
+            # torch's RNG, which the DataLoader seeds per worker and per epoch from its own
+            # generator, so --seed still fixes the augmentation.
+            n = node.shape[0]
+            n_drop = int(torch.rand(()).item() * self.node_drop * (n - 2))
+            if n_drop > 0:
+                drop = torch.randperm(n - 2)[:n_drop] + 1
+                keep = np.setdiff1d(np.arange(n), drop.numpy())
+                new_edge_index = build_edge_index(len(keep), self.edge_ladder_levels)
+                edge_attr = torch.tensor(self._edge_attr(index, new_edge_index, keep).astype('float32'))
+                edge_index = torch.tensor(new_edge_index, dtype=torch.long)
+                keep = torch.from_numpy(keep)
+                node, target, mask = node[keep], target[keep], mask[keep]
 
         data = torch_geometric.data.Data(x=node, edge_index=edge_index, edge_attr=edge_attr, y=target, u=u,
-                                         mask=self.mask[index])
+                                         mask=mask)
 
         return data
 

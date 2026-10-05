@@ -29,6 +29,8 @@ ADAM_BETAS = (0.9, 0.95)
 # The learning rate ramps linearly from this fraction of --lr to --lr over the first epoch
 # (stepped per batch), then follows a cosine decay to zero over the remaining epochs.
 WARMUP_START_FACTOR = 0.01
+WEIGHT_DECAY = 0.01
+EMA_DECAY = 0.9998
 
 
 def masked_mse(out, target, mask=None):
@@ -57,7 +59,7 @@ except:
 # Class that will containg the GN as well as methods for training, testing and predicting
 class Formal(object):
     def __init__(self, configuration='conf.dat', batch_size=64, gpu=0,
-                 smooth=0.05, datadir='', predict=False, seed=0, compile=False):
+                 smooth=0.05, datadir='', predict=False, seed=0, compile=False, node_drop=0.0):
 
         # Seed everything that draws random numbers in training: parameter init, the shuffle
         # order of the training loader, and any numpy/python randomness.
@@ -74,6 +76,8 @@ class Formal(object):
             # TF32 tensor cores for fp32 matmuls (~15% on an H100 for this model).
             torch.set_float32_matmul_precision('high')
         self.compile = compile
+        # Training-time z-resolution augmentation, see Dataset(node_drop=...)
+        self.node_drop = node_drop
 
         # Factor to be used for smoothing the loss with an exponential window
         self.smooth = smooth
@@ -86,7 +90,7 @@ class Formal(object):
                 self.device, nvidia_smi.nvmlDeviceGetName(self.handle)))
 
         self.batch_size = batch_size
-        self.kwargs = {'num_workers': 12, 'pin_memory': True} if self.cuda else {}
+        self.kwargs = {'num_workers': 32, 'pin_memory': True} if self.cuda else {}
 
         if not predict:
             # Read the configuration file
@@ -109,7 +113,7 @@ class Formal(object):
             # and then runs a training step ~1.5x faster (kernel-launch bound otherwise).
             self.forward_model = torch.compile(self.model, dynamic=True) if self.compile else self.model
 
-    def optimize(self, savedir, epochs, lr=3e-4, resume=None):
+    def optimize(self, savedir, epochs, lr=3e-4, resume=None, weight_decay=WEIGHT_DECAY, ema_decay=EMA_DECAY):
 
         # Print the number of trainable parameters
         print('N. total trainable parameters : {0}'.format(sum(p.numel() for p in self.model.parameters() if p.requires_grad)))
@@ -118,7 +122,7 @@ class Formal(object):
         # on-disk validation_* split (a different Bifrost snapshot). Carving validation out of
         # train_* at random put near-copies of spatially correlated training columns into it,
         # and the loss that selected the best checkpoint read ~2x lower than on the true hold-out.
-        self.dataset = dtst(self.hyperparameters, self.datadir, 'train')
+        self.dataset = dtst(self.hyperparameters, self.datadir, 'train', node_drop=self.node_drop)
         self.valid_dataset = dtst(self.hyperparameters, self.datadir, 'validation')
 
         # Define the data loaders
@@ -139,12 +143,38 @@ class Formal(object):
         shutil.copyfile(graphnet.__file__,
                         '{0}.model.py'.format(savedir + filename))
 
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr,
-                                          betas=ADAM_BETAS, eps=ADAM_EPS)
+        # Optimizer: AdamW, decoupled weight decay on the weight matrices only (see WEIGHT_DECAY);
+        # Adam's numerics (betas, eps) unchanged.
+        decay, no_decay = [], []
+        for p in self.model.parameters():
+            if p.requires_grad:
+                (decay if p.ndim > 1 else no_decay).append(p)
+        self.optimizer = torch.optim.AdamW(
+            [{'params': decay, 'weight_decay': weight_decay},
+             {'params': no_decay, 'weight_decay': 0.0}],
+            lr=self.lr, betas=ADAM_BETAS, eps=ADAM_EPS)
+
+        # Exponential moving average of the weights, updated after every optimizer step (see
+        # EMA_DECAY). The decay ramps up with the number of updates n as min(decay, (1+n)/(10+n)),
+        # the usual warmup: a fixed 0.9998 would keep 37% of the random initial weights after a
+        # whole epoch of 5000 steps, whereas with the ramp the average always spans roughly the
+        # last 10% of the updates until it reaches the nominal horizon. AveragedModel copies the
+        # parameters on its first update; the update count is kept on the Python side so that
+        # no per-step GPU synchronisation is needed.
+        self.ema = None
+        self.ema_updates = 0
+        if ema_decay > 0:
+            def ema_avg_fn(averaged, current, num_averaged):
+                decay = min(ema_decay, (1.0 + self.ema_updates) / (10.0 + self.ema_updates))
+                torch._foreach_lerp_(averaged, current, 1.0 - decay)
+            self.ema = torch.optim.swa_utils.AveragedModel(self.model, multi_avg_fn=ema_avg_fn)
 
         # Learning rate schedule, stepped once per batch: linear warmup over the first epoch,
-        # then cosine annealing to zero over the remaining steps.
+        # then cosine annealing to zero over the remaining steps. On the two si_v3 runs (peak
+        # 1e-3 and 5e-4) the validation loss improved at the same rate per epoch once past the
+        # first ~20 epochs and stalled in both once the learning rate fell below ~1e-4, so a
+        # peak of 5e-4 (train.py default) loses nothing and the last ~30% of a cosine run mainly
+        # serves the EMA. Choose --epochs accordingly rather than lengthening the tail.
         n_steps = self.n_epochs * len(self.train_loader)
         warmup_steps = max(1, min(len(self.train_loader), n_steps // 2))
         self.scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -160,6 +190,7 @@ class Formal(object):
         # Now start the training
         self.train_loss = []
         self.valid_loss = []
+        self.valid_loss_ema = []
         best_loss = float('inf')
         first_epoch = 1
 
@@ -171,42 +202,64 @@ class Formal(object):
             self.scheduler.load_state_dict(last['scheduler'])
             self.train_loss = last['train_loss']
             self.valid_loss = last['valid_loss']
+            self.valid_loss_ema = last.get('valid_loss_ema', [None] * len(self.valid_loss))
+            if self.ema is not None and 'ema' in last:
+                self.ema.load_state_dict(last['ema'])
+                self.ema_updates = int(self.ema.n_averaged.item())
             best_loss = last['best_loss']
             first_epoch = last['epoch'] + 1
 
         for epoch in range(first_epoch, epochs + 1):
 
-            # Compute training and validation steps
+            # Compute training and validation steps; the EMA weights are validated as well
             train_loss = self.train(epoch)
             valid_loss = self.validate()
+            valid_loss_ema = self.validate(model=self.ema.module) if self.ema is not None else None
 
             self.train_loss.append(train_loss)
             self.valid_loss.append(valid_loss)
+            self.valid_loss_ema.append(valid_loss_ema)
+            print(f"Epoch {epoch}: train {train_loss:.3e}  valid {valid_loss:.3e}"
+                  + (f"  valid(EMA) {valid_loss_ema:.3e}" if valid_loss_ema is not None else "")
+                  + f"  lr {self.optimizer.param_groups[0]['lr']:.2e}", flush=True)
+
+            # best.pth holds the EMA weights whenever they validate better than the raw ones
+            use_ema = valid_loss_ema is not None and valid_loss_ema < valid_loss
+            candidate_loss = valid_loss_ema if use_ema else valid_loss
 
             checkpoint = {
                 'epoch': epoch,
-                'state_dict': self.model.state_dict(),
+                'state_dict': (self.ema.module if use_ema else self.model).state_dict(),
+                'weights': 'ema' if use_ema else 'raw',
                 'train_loss': self.train_loss,
                 'valid_loss': self.valid_loss,
-                'best_loss': min(best_loss, valid_loss),
+                'valid_loss_ema': self.valid_loss_ema,
+                'best_loss': min(best_loss, candidate_loss),
                 'hyperparameters': self.hyperparameters,
                 # Normalization constants used by Dataset.py to build this checkpoint's
                 # training inputs/targets, so inference code can always reproduce the
                 # exact normalization a given checkpoint was trained with, even after
                 # NORM_STATS is later retuned for a new training run.
                 'norm_stats': NORM_STATS,
+                # Graph connectivity the inputs were built with (Dataset.EDGE_LADDER_LEVELS), so
+                # that evaluation and api.py rebuild the same graph.
+                'edge_ladder_levels': self.dataset.edge_ladder_levels,
             }
 
             # If the validation loss improves, overwrite best.pth (weights only, no optimizer)
-            if (valid_loss < best_loss):
-                best_loss = valid_loss
-                print("Saving best model...")
+            if (candidate_loss < best_loss):
+                best_loss = candidate_loss
+                print(f"Saving best model ({checkpoint['weights']} weights)...")
                 torch.save(checkpoint, savedir + 'best.pth')
 
-            # last.pth is the resume point: weights plus optimizer and scheduler state,
+            # last.pth is the resume point: raw weights plus optimizer, scheduler and EMA state,
             # overwritten every epoch (see train.py --resume).
+            checkpoint['state_dict'] = self.model.state_dict()
+            checkpoint['weights'] = 'raw'
             checkpoint['optimizer'] = self.optimizer.state_dict()
             checkpoint['scheduler'] = self.scheduler.state_dict()
+            if self.ema is not None:
+                checkpoint['ema'] = self.ema.state_dict()
             torch.save(checkpoint, savedir + 'last.pth')
 
     def train(self, epoch):
@@ -259,6 +312,9 @@ class Formal(object):
             # Update the parameters and the learning rate (per-batch schedule)
             self.optimizer.step()
             self.scheduler.step()
+            if self.ema is not None:
+                self.ema.update_parameters(self.model)
+                self.ema_updates += 1
 
             for param_group in self.optimizer.param_groups:
                 current_lr = param_group['lr']
@@ -280,7 +336,8 @@ class Formal(object):
 
         return loss_avg
 
-    def validate(self):
+    def validate(self, model=None):
+        # `model`: module to evaluate instead of the trained one (used for the EMA weights).
         # Do a validation of the model and return the loss.
         #
         # This is a true mean over the whole held-out set, weighted by how many entries each
@@ -289,7 +346,11 @@ class Formal(object):
         # in a fresh random order every epoch, so the number that decides which checkpoint gets
         # saved as "best" was an average over a random ~2.6% of the validation set.
 
-        self.model.eval()
+        if model is None:
+            self.model.eval()
+            model = self.forward_model
+        else:
+            model.eval()
         total_loss = 0.0
         total_weight = 0.0
         t = tqdm(self.validation_loader)
@@ -311,7 +372,7 @@ class Formal(object):
                 if mask is not None:
                     mask = mask.to(self.device)
 
-                out = self.forward_model(node, edge_attr, edge_index, u, batch)
+                out = model(node, edge_attr, edge_index, u, batch)
 
                 loss = self.loss_fn(out.squeeze(), target.squeeze(), mask)
 
@@ -346,7 +407,8 @@ class Formal(object):
         # Use the constants this checkpoint was trained with, not whatever NORM_STATS currently
         # holds, so an older checkpoint is still fed the inputs it expects.
         self.test_dataset = dtst(self.hyperameters, self.datadir, dtst_type,
-                                 norm_stats=checkpoint.get('norm_stats'))
+                                 norm_stats=checkpoint.get('norm_stats'),
+                                 edge_ladder_levels=checkpoint.get('edge_ladder_levels', ()))
 
         self.test_loader = torch_geometric.loader.DataLoader(
             self.test_dataset, batch_size=self.batch_size, shuffle=False, **self.kwargs)
@@ -407,6 +469,7 @@ class Formal(object):
                      'loss': loss_avg,
                      'checkpoint': self.checkpoint,
                      'train_loss': checkpoint.get('train_loss', None),
+                     'valid_loss_ema': checkpoint.get('valid_loss_ema', None),
                      'valid_loss': checkpoint.get('valid_loss', None),
                      'datadir': self.datadir,
                      'hyperparams': self.hyperameters
@@ -475,7 +538,8 @@ class Formal(object):
 
         print("=> Loading the dataset to predict")
         self.pred_dataset = dtst(self.hyperameters, directory, prefix,
-                                 norm_stats=checkpoint.get('norm_stats'))
+                                 norm_stats=checkpoint.get('norm_stats'),
+                                 edge_ladder_levels=checkpoint.get('edge_ladder_levels', ()))
 
         # Remove the temporary files and directory
         [os.remove(file) for file in glob.glob(directory + '*')]

@@ -25,12 +25,14 @@ statistical-equilibrium iteration.
 | `test_prediction.py` | Runs a checkpoint over a split and dumps predictions vs. targets |
 | `plot_scripts/explore_tests.py` | Plots those predictions and the profiles they imply |
 | `evaluate_intensity.py` | **Acceptance test**: how much closer to the truth the network gets than LTE, in intensity |
+| `run_tests.sh` | Runs steps 4a and 4b below on one run directory |
 | `api.py` | Minimal interface for calling the trained network from an inversion code |
 | `si_atom.py` | The custom 16-level Si I/II/III model atom (not in released lightweaver) |
 | `conf.dat` | Network hyperparameters |
 
-The steps below assume you run everything from inside `graphnet_nlte/`, with the databases one
-level up (`../data_1d_si_v3/` and so on). Nothing depends on that layout — every path is a flag.
+The steps below assume you run everything from inside `graphnet_nlte/`. In the commands,
+`<models_atmos>/` is the directory of input atmospheres, `<database>/` a generated database,
+`<checkpoints>/` a checkpoint tree and `<run>/` one timestamped run inside it. Every path is a flag.
 
 ---
 
@@ -64,8 +66,7 @@ Database generation needs **one directory** containing both:
 * the two Bifrost snapshots, `snap385_rh.save` (train and test) and `snap530_rh.save`
   (validation), as IDL save files.
 
-In this installation that directory is `../data_1d_old/data/models_atmos/`. The originals, along
-with an already-generated database and pretrained checkpoints, are at
+The originals, along with an already-generated database and pretrained checkpoints, are at
 [data and pretrained models](https://cloud.iac.es/index.php/s/JR3GQym9mgNk4mL).
 
 ---
@@ -76,15 +77,15 @@ Three separate runs, one per split. They are independent and can be run one afte
 
     # training split  (Bifrost snap385, first 80% of the cube in x)
     mpiexec -n 48 python generate_database.py --train  1 --n 500000 --f 20000 \
-        --rd ../data_1d_old/data/models_atmos/ --sav ../data_1d_si_v3/
+        --rd <models_atmos>/ --sav <database>/
 
     # test split      (Bifrost snap385, remaining 20% in x)
     mpiexec -n 48 python generate_database.py --train  0 --n 120000 --f 20000 \
-        --rd ../data_1d_old/data/models_atmos/ --sav ../data_1d_si_v3/
+        --rd <models_atmos>/ --sav <database>/
 
     # validation split (Bifrost snap530, a different snapshot entirely)
     mpiexec -n 48 python generate_database.py --train -1 --n  25000 --f 20000 \
-        --rd ../data_1d_old/data/models_atmos/ --sav ../data_1d_si_v3/
+        --rd <models_atmos>/ --sav <database>/
 
 | Flag | Meaning |
 |---|---|
@@ -101,10 +102,15 @@ solves you want in flight. This machine has 192 cores. Each NLTE solve takes rou
 of single-core CPU, so 500k training samples on 48 processes is a few hours.
 
 **Choosing `--n`.** Each sample is drawn 50/50 from a Bifrost column or a perturbed reference
-atmosphere, until the Bifrost columns for that split run out; after that everything comes from
-the reference atmospheres. The 504×504 cube gives 203,112 columns to train and 50,904 to test,
-so `--n` of about 2× those numbers consumes all of them. For reference, the previous database
-came out as:
+atmosphere, until the Bifrost columns for that split run out. After that the training split
+keeps the 50/50 mix with *perturbed copies* of random Bifrost columns (T and vlos perturbed at
+8 knots, even in depth index, with the reference-atmosphere amplitudes; the electron density is
+recomputed by the equation of state for the new temperature at the column's own density), so a
+large `--n` no longer dilutes the Bifrost columns: in the previous database they were 20% of
+the samples and carried 99% of the held-out loss. The test and validation splits fall back to
+the reference atmospheres only, as before, so they stay clean hold-outs. The 504×504 cube gives
+203,112 columns to train and 50,904 to test, so `--n` of about 2× those numbers consumes all of
+them. For reference, the previous database came out as:
 
 | split | samples | Bifrost | reference-derived |
 |---|---|---|---|
@@ -162,7 +168,7 @@ Three details worth knowing about the atmospheres themselves:
 Samples whose NLTE solve fails are stored as `None` and rescheduled, but a run that ends while
 some are outstanding leaves holes. Remove them from every file at once:
 
-    python dataset_scripts/clean_dataset.py --dir ../data_1d_si_v3/
+    python dataset_scripts/clean_dataset.py --dir <database>/
 
 It finds every prefix in the directory, takes the union of the indices that are `None` or
 non-finite in *any* file, and drops those indices from *all* of them, so the files stay aligned.
@@ -172,8 +178,8 @@ It rewrites in place — copy the directory first if you want to keep the raw ou
 
 ## 3. Train
 
-    python train.py --epochs 300 --batch 64 --lr 1e-4 --gpu 0 \
-        --conf conf.dat --rd ../data_1d_si_v3/ --sav ./checkpoints_si_v3/
+    python train.py --epochs 200 --batch 200 --lr 5e-4 --node-drop 0.3 --gpu 0 --compile \
+        --conf conf.dat --rd <database>/ --sav <checkpoints>/
 
 This trains on `<rd>/train_*.pkl` and validates on `<rd>/validation_*.pkl` (the snap530
 split), so the loss that selects the best checkpoint is measured on a genuine hold-out. An
@@ -189,13 +195,29 @@ default 0), `--compile` (`torch.compile`, about 5 min of compilation for a ~1.5�
 overwritten every epoch with the optimizer and scheduler state as well. To continue an
 interrupted run in place:
 
-    python train.py --resume ./checkpoints_si_v3/<run>/ --epochs 300 --batch 64 --lr 1e-4 --gpu 0 --rd ../data_1d_si_v3/
+    python train.py --resume <checkpoints>/<run>/ --epochs 200 --batch 200 --lr 5e-4 --gpu 0 --rd <database>/
+
+(with the same `--epochs`, `--batch`, `--lr`, `--wd` and `--ema` as the original run, since they
+define the schedule). A run started before the switch to AdamW + EMA (2026-09-30) cannot be
+resumed with the current `Formal.py`; resume it with the copies in its own directory,
+`python <run>/train.py --resume <run>/ ...`.
 
 Each checkpoint carries its hyperparameters and the exact normalisation constants it was
 trained with, so it can always be reproduced later.
 
-The learning rate warms up linearly over the first epoch and then follows a cosine decay to
-zero, stepped per batch. The processor uses pre-norm residual blocks (LayerNorm on the inputs of
+The optimizer is AdamW (betas 0.9/0.95, eps 1e-6, gradient norm clipped at 0.5) with a
+decoupled weight decay of `--wd` (default 0.01) on the weight matrices only. The learning rate
+warms up linearly over the first epoch and then follows a cosine decay to zero, stepped per
+batch. An exponential moving average of the weights (`--ema`, default 0.9998, a horizon of about
+one epoch) is validated every epoch next to the raw weights, both are printed and stored in the
+checkpoints (`valid_loss`, `valid_loss_ema`), and `best.pth` takes whichever is better (its
+`weights` key says which). The defaults come from two runs of September 2026, peak
+1e-3 and 5e-4 with cosine to zero over 300 epochs: past epoch 20 both improved the validation
+loss at the same rate per epoch, both had a loss spike at ~1e-3 to 4e-4, and in both the
+validation loss stopped improving once the learning rate fell below ~1e-4 while the training
+loss kept falling, i.e. the plateau is generalization-limited. So the peak is 5e-4, the run is
+shorter (200 epochs), and the tail of the cosine is used through the EMA instead of being
+lengthened. The processor uses pre-norm residual blocks (LayerNorm on the inputs of
 each message-passing step, and one before the decoder); the previous post-norm layout let the
 latent norm grow ~8× over the 100 steps and the validation loss oscillated by up to 2× between
 epochs.
@@ -203,7 +225,7 @@ epochs.
 Network size is set by `conf.dat`:
 
     node_input_size = 5          # log10 T, z, log10 ne, vturb, vlos
-    edge_input_size = 1          # delta z between neighbouring depth points
+    edge_input_size = 2          # delta z between the two depth points, log10 of the number of points spanned (0 on the chain)
     global_input_size = 1
     latent_size = 128
     mlp_hidden_size = 128
@@ -211,9 +233,24 @@ Network size is set by `conf.dat`:
     n_message_passing_steps = 100
     output_size = 16             # one departure coefficient per level
 
-`n_message_passing_steps` is the one to think about: the graph is a nearest-neighbour chain, so
-after K steps a node has seen exactly K depth points either side. Bifrost columns have 211
-points, so K = 100 couples about half a column.
+`n_message_passing_steps` is the one to think about. On the nearest-neighbour chain alone a node
+sees K depth points either side after K steps, so with K = 128 the top of a 211-point Bifrost
+column never sees the photosphere. The chain therefore carries a sparse *ladder* of long-range
+edges (`Dataset.EDGE_LADDER_LEVELS = (2, 3, 10)`): hub nodes at the halves, thirds and tenths of
+the column are linked to their neighbouring hubs, so a 100-point column gets 0-50-99,
+0-33-66-99 and 0-10-20-...-99 on top of the chain. Any two points are then a handful of steps
+apart while almost every node keeps its plain local neighbourhood. The levels are stored in each
+checkpoint as `edge_ladder_levels`, and `Formal.test` and `api._build_graph` rebuild the graph
+from them, so older chain-only checkpoints still evaluate on the graph they were trained with.
+With `edge_input_size = 2` every edge also carries log10 of the number of depth points it
+spans (0 on the chain, 1-2 on the rungs), so the edge encoder can tell a rung from a chain edge
+by an order-one input; the delta-z feature alone reaches ~100 on the rungs.
+
+`--node-drop 0.3` (off by default) is a z-resolution augmentation: every time a training column
+is fetched, a random fraction of its interior depth points, uniform in [0, 0.3], is dropped and
+the graph is rebuilt on the survivors. The targets are per depth point, so nothing needs
+re-solving; the network just sees the same atmosphere on a coarser grid, which is what an
+inversion code will feed it.
 
 ### About the loss
 
@@ -239,10 +276,14 @@ Two consequences for reading the numbers:
 
 ## 4. Test
 
+`run_tests.sh` runs 4a and 4b in one go on a run directory:
+
+    ./run_tests.sh <checkpoints>/<run>/ [gpu] [<database>/]
+
 ### 4a. Predictions against a held-out split
 
     python test_prediction.py --dtst validation --batch 64 --gpu 0 \
-        --rd ../data_1d_si_v3/ --sav ./checkpoints_si_v3/<run>/ --testdir ./checkpoints_si_v3/<run>/
+        --rd <database>/ --sav <checkpoints>/<run>/ --testdir <checkpoints>/<run>/
 
 Note the flag names: `--sav` is where the **checkpoint is read from** and `--testdir` is where
 the **result is written**. `--sav` must be a single run directory *with a trailing slash*; its
@@ -258,7 +299,7 @@ any database generated before the spatial-split fix shares ~80% of its Bifrost c
 
 Then plot 25 random columns and the profiles they imply:
 
-    python plot_scripts/explore_tests.py --ck ./checkpoints_si_v3/<run>/
+    python plot_scripts/explore_tests.py --ck <checkpoints>/<run>/
 
 `--ck` takes a run directory, a whole checkpoint tree (every run below it), a `*.pth` file or a
 prediction pickle; the database is read from the directory recorded in each pickle (`--rd`
@@ -275,11 +316,11 @@ deployed path of `api.intensity_gnn`), and LTE — and measures the network wher
 would feel it:
 
     # run the checkpoint through the deployed feature construction
-    python evaluate_intensity.py --rd ../data_1d_si_v3/ --ck ./checkpoints_si_v3/<run>/ --n 1000
+    python evaluate_intensity.py --rd <database>/ --ck <checkpoints>/<run>/ --n 1000
 
     # or evaluate exactly the predictions test_prediction.py dumped
-    python evaluate_intensity.py --rd ../data_1d_si_v3/ \
-        --pred ./checkpoints_si_v3/<run>/validation_checkpoint_<run>_at_<stamp>.pkl
+    python evaluate_intensity.py --rd <database>/ \
+        --pred <checkpoints>/<run>/validation_checkpoint_<run>_at_<stamp>.pkl
 
 The report (printed, and written to `<run>/acceptance/` with a JSON of headline numbers, a pickle
 of every per-column row and six figures) contains:
@@ -329,9 +370,10 @@ wave, Iwave, log_dep = api.intensity_gnn(T, z, ne, vturb, vlos)
 wave, Iwave, log_dep = api.synthesis_lw(T, z, ne, vturb, vlos)
 ```
 
-`api.DEFAULT_CHECKPOINT` points at the `checkpoints_si_v2/` tree and resolves to the most recent
-`best.pth` below it on every call, so it follows training automatically; pass `checkpoint=`
-explicitly to pin a model. Point it at your new tree once step 3 is running.
+`api.DEFAULT_CHECKPOINT` is a `checkpoint.pth` next to `api.py` if there is one, otherwise the
+checkpoint tree named in `api.py`, resolved to the most recent `best.pth` below it on every call
+so that it follows training automatically; pass `checkpoint=` explicitly to pin a model. Point
+it at your own tree once step 3 is running.
 
 Two limits to be aware of:
 

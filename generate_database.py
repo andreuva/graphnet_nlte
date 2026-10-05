@@ -17,6 +17,29 @@ from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_ato
 # Si_atom_custom is not in released lightweaver -- it ships with this repo (si_atom.py).
 from si_atom import Si_atom_custom
 import lightweaver as lw
+import lightweaver.wittmann as _lw_wittmann
+import builtins
+import io as _io
+
+# lightweaver's Wittmann EOS, built by every Atmosphere.make_1d call (1-3 per sample here),
+# re-reads Data/pf_Kurucz.input from disk each time. The Lightweaver checkout lives on NFS, and
+# NFSv4 serialises concurrent opens of one file on the client, so with ~128 workers each
+# sample spent most of its time queued in that open (workers in the D state, 8 samples/s on a
+# 256-core machine, CPU 80% idle). Read the file once per process and hand lightweaver an
+# in-memory copy; the parsing itself is unchanged.
+_LW_DATA_CACHE = {}
+
+
+def _lw_cached_open(file, mode='r', *args, **kwargs):
+    if mode == 'rb' and str(file).endswith('pf_Kurucz.input'):
+        if file not in _LW_DATA_CACHE:
+            with builtins.open(file, 'rb') as f:
+                _LW_DATA_CACHE[file] = f.read()
+        return _io.BytesIO(_LW_DATA_CACHE[file])
+    return builtins.open(file, mode, *args, **kwargs)
+
+
+_lw_wittmann.open = _lw_cached_open
 
 
 class tags(IntEnum):
@@ -230,6 +253,27 @@ class Model_generator(object):
         vturb_new[vturb_new < 0] = 0.0
         return vturb_new
 
+    def _bifrost_perturbation(self, n):
+        """
+        Draw the perturbation of a Bifrost column copy, the way new_model() perturbs a reference
+        atmosphere: Gaussian deltas at 8 knots, interpolated quadratically to the n depth
+        points, with the same amplitudes (2500 K for T, smoothed; 2500 m/s for vlos). The
+        reference knots are even in log tau, which is not known before the solve, so here they
+        are even in depth index. Returns {'dT', 'dvlos'}; the worker applies them and recomputes
+        the electron density (perturb_bifrost_atmosphere), so that the master, which feeds 64
+        workers, only draws random numbers.
+        """
+        idx = np.arange(n)
+        knots = np.linspace(0, n - 1, 8)
+        std = 2500
+        deltas_T = smooth(self.rng.normal(loc=0.0, scale=std, size=len(knots)))
+        f = interp.interp1d(knots, deltas_T, kind='quadratic', bounds_error=False, fill_value="extrapolate")
+        dT = f(idx)
+        deltas_vlos = self.rng.normal(loc=0.0, scale=std, size=len(knots))
+        f = interp.interp1d(knots, deltas_vlos, kind='quadratic', bounds_error=False, fill_value="extrapolate")
+        dvlos = f(idx)
+        return {'dT': dT, 'dvlos': dvlos}
+
     def new_model(self):
         """Method to read the parameters of an atmosphere based on 1 random refence atmosphere and perturbing it
         to obtain diferent results or from BIFROST snapshot"""
@@ -238,14 +282,30 @@ class Model_generator(object):
         computed all the bifrost models """
         choices = [True, False]
 
-        if self.rng.choice(choices) and self.current_bifrost < self.n_bifrost:
+        if self.rng.choice(choices) and (self.current_bifrost < self.n_bifrost or self.train > 0):
+
+            if self.current_bifrost < self.n_bifrost:
+                column = self.column_order[self.current_bifrost]
+                perturb = False
+            else:
+                # Training split only: the snapshot is used up, so keep the 50/50 mix going with
+                # perturbed copies of random columns (_bifrost_perturbation, applied by the worker
+                # in perturb_bifrost_atmosphere). Before, everything past
+                # this point came from the reference atmospheres, and the Bifrost columns -- one
+                # snapshot, spatially correlated -- ended up as 20% of the database while carrying
+                # 99% of the held-out loss. Validation and test stay unperturbed hold-outs.
+                if self.current_bifrost == self.n_bifrost:
+                    print(f"BIFROST columns exhausted after {self.n_bifrost} samples; further Bifrost "
+                          "draws are perturbed copies of random columns\n", flush=True)
+                column = self.column_order[self.rng.integers(self.n_bifrost)]
+                perturb = True
 
             # Read the model parameters
-            column = self.column_order[self.current_bifrost]
             heigth = np.float64(self.bifrost['z'][::-1]*1e3)
             T_new = np.float64(self.bifrost['tg'][:, column][::-1])
             vlos_new = np.float64(self.bifrost['vlos'][:, column][::-1])
             ne = np.float64(self.bifrost['nel'][:, column][::-1])
+            perturbation = self._bifrost_perturbation(len(T_new)) if perturb else None
 
             # Bifrost resolves its velocity field and carries no microturbulence, while every
             # reference atmosphere does, so vturb = 0 made this single feature a perfect label for
@@ -260,10 +320,10 @@ class Model_generator(object):
             depth = heigth
             depth_scale = lw.ScaleType.Geometric
 
-            # increase the number of processed bifrost models
+            # count the Bifrost-derived samples (raw columns first, perturbed copies afterwards)
             self.current_bifrost += 1
 
-            return depth_scale, depth, T_new, vlos_new, vturb_new, ne
+            return depth_scale, depth, T_new, vlos_new, vturb_new, ne, perturbation
 
         else:
             # pick one reference atmosphere
@@ -295,7 +355,28 @@ class Model_generator(object):
             depth = self.atmosRef[i].z
             depth_scale = lw.ScaleType.Geometric
 
-            return depth_scale, depth, T_new, vlos_new, vturb_new, ne
+            return depth_scale, depth, T_new, vlos_new, vturb_new, ne, None
+
+
+def perturb_bifrost_atmosphere(depth_scale, depth, temperature, vlos, vturb, ne, perturbation):
+    """
+    Apply a Model_generator._bifrost_perturbation to a Bifrost column and return the perturbed
+    (temperature, vlos, ne). The column's density structure (nHTot) is first recovered from its
+    (T, ne) through the same EOS path inference takes, the T and vlos deltas are applied (T
+    floored at 2500 K as for the reference atmospheres), and the EOS then gives the electron
+    density of the new temperature at that fixed density. (T, ne, nHTot) are thus mutually
+    consistent, instead of Bifrost's ne being paired with a temperature it never had.
+    """
+    atmos = lw.Atmosphere.make_1d(scale=depth_scale, depthScale=depth, temperature=temperature,
+                                  vlos=vlos, vturb=vturb, verbose=False, ne=ne)
+    nHTot = np.ascontiguousarray(atmos.nHTot, dtype=np.float64)
+    temperature = temperature + perturbation['dT']
+    temperature[temperature < 2500] = 2500
+    vlos = vlos + perturbation['dvlos']
+    atmos = lw.Atmosphere.make_1d(scale=depth_scale, depthScale=depth, temperature=temperature,
+                                  vlos=vlos, vturb=vturb, verbose=False, nHTot=nHTot)
+    ne = np.ascontiguousarray(atmos.ne, dtype=np.float64)
+    return temperature, vlos, ne
 
 
 def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_frequency=1, seed=1234):
@@ -357,10 +438,11 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                     task_index = tasks_status.index(0)
 
                     # Ask the model generator for a new model and send the data to the process to compute the atmos. and NLTE pop.
-                    depth_scale, depth, T, vlos, vturb, ne = mg.new_model()
+                    depth_scale, depth, T, vlos, vturb, ne, perturbation = mg.new_model()
 
                     dataToSend = {'index': task_index, 'prd_active': prd_active, 'ne': ne,
-                                  'depth_scale': depth_scale, 'depth': depth, 'T': T, 'vlos': vlos, 'vturb': vturb}
+                                  'depth_scale': depth_scale, 'depth': depth, 'T': T, 'vlos': vlos, 'vturb': vturb,
+                                  'perturb': perturbation}
 
                     # send the data of the task and put the status tu 1 (done)
                     # print(f" * MASTER: sending task {task_index} to worker {source}.", flush=True)
@@ -369,7 +451,7 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
 
                 # If this not work set the tag of the worker to exit and kill it
                 except ValueError as e:
-                    # print(f"!!! MASTER: no more tasks to distribute, telling worker {source} to exit. !!!", flush=True)
+                    print(f" * MASTER: no more tasks to distribute, telling worker {source} to exit. !!!", flush=True)
                     comm.send(None, dest=source, tag=tags.EXIT)
                 except Exception as e:
                     import traceback
@@ -408,7 +490,7 @@ def master_work(nsamples, train, prd_active, savedir, readdir, filename, write_f
                     pbar.update(1)
                     # pbar.refresh()
                     # sys.stdout.flush()
-                    print(f" * MASTER: task {index} completed from worker {source} ({pbar.n}/{nsamples})", flush=True)
+                    # print(f" * MASTER: task {index} completed from worker {source} ({pbar.n}/{nsamples})", flush=True)
 
             # if the worker has the exit tag mark it as closed.
             elif tag == tags.EXIT:
@@ -449,6 +531,7 @@ def slave_work(rank):
             vlos = dataReceived['vlos']
             vturb = dataReceived['vturb']
             ne = dataReceived['ne']
+            perturbation = dataReceived.get('perturb')
 
             # Initialice the variables in case the convergence fails send None
             log_departure = None
@@ -461,6 +544,13 @@ def slave_work(rank):
             # print(f" * WORKER {rank}: starting task {task_index}.", flush=True)
 
             try:
+                if perturbation is not None:
+                    # Perturbed copy of a Bifrost column: apply the deltas with a self-consistent
+                    # electron density (see perturb_bifrost_atmosphere). The atmosphere is then
+                    # rebuilt from (T, z, ne, vturb, vlos) below, the path every consumer takes.
+                    temperature, vlos, ne = perturb_bifrost_atmosphere(
+                        depth_scale, depth, temperature, vlos, vturb, ne, perturbation)
+
                 # Compute the new atmosphere and solve the NLTE problem and retrieve the solved parameters
                 atmos = lw.Atmosphere.make_1d(scale=depth_scale, depthScale=depth, temperature=temperature,
                                               vlos=vlos, vturb=vturb, verbose=False, ne=ne)

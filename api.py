@@ -137,12 +137,32 @@ def _validate_atmosphere(T, z, ne, vturb, vlos):
     return T, z, ne, vturb, vlos
 
 
-def _build_graph(T, z, ne, vturb, vlos, norm_stats):
+def _build_edge_index(num_nodes, ladder_levels=()):
+    """
+    Chain graph of a column (node j <-> j-1 and j <-> j+1) plus, for each level k in
+    `ladder_levels`, "ladder" edges between consecutive hub nodes placed at the k+1 points
+    j*(N-1)/k (e.g. 0-50-99 for k=2 on 100 points), as a (2, n_edges) int64 array of
+    [senders, receivers] with every edge in both directions. Kept identical to
+    Dataset.build_edge_index; the levels come from the checkpoint (see _load_model).
+    """
+    pairs = {(j, j + 1) for j in range(num_nodes - 1)}
+    for k in ladder_levels:
+        hubs = np.unique(np.round(np.linspace(0, num_nodes - 1, k + 1)).astype(int))
+        pairs.update((int(a), int(b)) for a, b in zip(hubs[:-1], hubs[1:]))
+    pairs = sorted(pairs)
+    a = np.array([p[0] for p in pairs], dtype=np.int64)
+    b = np.array([p[1] for p in pairs], dtype=np.int64)
+    return np.stack([np.concatenate([a, b]), np.concatenate([b, a])])
+
+
+def _build_graph(T, z, ne, vturb, vlos, norm_stats, ladder_levels=(), edge_input_size=1):
     """
     Build the normalized node/edge tensors for one atmosphere column. Mirrors the feature
-    construction in Dataset.py (same chain-graph connectivity) for the node_input_size=5 /
-    edge_input_size=1 configuration, without any pickle/KDTree overhead. `norm_stats` must
-    be the exact NORM_STATS dict the target checkpoint was trained with (see _load_model).
+    construction in Dataset.py (same connectivity) for the node_input_size=5 configuration
+    with edge_input_size 1 (delta z) or 2 (delta z and log10 of the number of depth points the
+    edge spans, 0 on the chain), without any pickle/KDTree overhead. `norm_stats`,
+    `ladder_levels` and `edge_input_size` must be exactly what the target checkpoint was trained
+    with (see _load_model).
     """
     n = len(T)
 
@@ -153,13 +173,15 @@ def _build_graph(T, z, ne, vturb, vlos, norm_stats):
     node[:, 3] = (vturb / 1e3 - norm_stats['vturb_km']['mean']) / norm_stats['vturb_km']['std']
     node[:, 4] = (vlos / 1e3 - norm_stats['vlos_km']['mean']) / norm_stats['vlos_km']['std']
 
-    # Chain graph: node i <-> i-1 and i <-> i+1 (equivalent to Dataset.py's radius=1 KDTree
-    # query on a 1D index array, without the KDTree).
-    senders = np.concatenate([np.arange(n - 1), np.arange(1, n)])
-    receivers = np.concatenate([np.arange(1, n), np.arange(n - 1)])
-    edge_index = np.stack([senders, receivers]).astype(np.int64)
+    # Chain graph plus the ladder edges the checkpoint was trained with (Dataset.py's
+    # build_edge_index; `ladder_levels` is () for checkpoints that predate them).
+    edge_index = _build_edge_index(n, ladder_levels)
+    senders, receivers = edge_index
 
-    edge_attr = ((z[senders] - z[receivers]) / norm_stats['delta_z']['std']).astype(np.float32).reshape(-1, 1)
+    edge_attr = np.empty((edge_index.shape[1], edge_input_size), dtype=np.float32)
+    edge_attr[:, 0] = (z[senders] - z[receivers]) / norm_stats['delta_z']['std']
+    if edge_input_size == 2:
+        edge_attr[:, 1] = np.log10(np.abs(receivers - senders))
 
     return torch.from_numpy(node), torch.from_numpy(edge_index), torch.from_numpy(edge_attr)
 
@@ -184,8 +206,9 @@ def _resolve_checkpoint(checkpoint):
 
 def _load_model(checkpoint, device):
     """
-    Load (and cache) a GraphNet checkpoint, along with the exact normalization constants it
-    was trained with. Repeated calls are free after the first (per resolved checkpoint file).
+    Load (and cache) a GraphNet checkpoint, along with the exact normalization constants and
+    graph connectivity (edge ladder levels, () for older chain-only checkpoints) it was trained
+    with. Repeated calls are free after the first (per resolved checkpoint file).
     """
     checkpoint = _resolve_checkpoint(checkpoint)
     key = (os.path.abspath(checkpoint), device)
@@ -197,11 +220,12 @@ def _load_model(checkpoint, device):
 
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     hyperparams = dict(ckpt['hyperparameters'])
-    if hyperparams.get('node_input_size') != 5 or hyperparams.get('edge_input_size') != 1:
+    if hyperparams.get('node_input_size') != 5 or hyperparams.get('edge_input_size') not in (1, 2):
         raise NotImplementedError(
             "api.py only supports checkpoints trained with node_input_size=5 (T, z, ne, "
-            f"vturb, vlos) and edge_input_size=1 (delta z); got node_input_size="
-            f"{hyperparams.get('node_input_size')}, edge_input_size={hyperparams.get('edge_input_size')}."
+            f"vturb, vlos) and edge_input_size=1 (delta z) or 2 (delta z, log10 span); got "
+            f"node_input_size={hyperparams.get('node_input_size')}, "
+            f"edge_input_size={hyperparams.get('edge_input_size')}."
         )
     norm_stats = ckpt.get('norm_stats')
     if norm_stats is None:
@@ -215,7 +239,9 @@ def _load_model(checkpoint, device):
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
-    _MODEL_CACHE[key] = (model, hyperparams, norm_stats)
+    ladder_levels = tuple(ckpt.get('edge_ladder_levels', ()))
+
+    _MODEL_CACHE[key] = (model, hyperparams, norm_stats, ladder_levels)
     return _MODEL_CACHE[key]
 
 
@@ -292,13 +318,14 @@ def compute_dep_coeffs_batch(columns, checkpoint=DEFAULT_CHECKPOINT, device='cpu
     columns = list(columns)
     if not columns:
         return []
-    model, _, norm_stats = _load_model(checkpoint, device)
+    model, hyperparams, norm_stats, ladder_levels = _load_model(checkpoint, device)
 
     nodes, edge_indices, edge_attrs, batch_vec, lengths = [], [], [], [], []
     offset = 0
     for g, col in enumerate(columns):
         T, z, ne, vturb, vlos = _validate_atmosphere(*col)
-        node, edge_index, edge_attr = _build_graph(T, z, ne, vturb, vlos, norm_stats)
+        node, edge_index, edge_attr = _build_graph(T, z, ne, vturb, vlos, norm_stats, ladder_levels,
+                                                   hyperparams['edge_input_size'])
         nodes.append(node)
         edge_indices.append(edge_index + offset)
         edge_attrs.append(edge_attr)

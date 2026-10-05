@@ -15,7 +15,9 @@ except:
 if (__name__ == '__main__'):
     parser = argparse.ArgumentParser(description='Train neural network')
 
-    parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float, metavar='LR', help='Learning rate')
+    parser.add_argument('--lr', '--learning-rate', default=5e-4, type=float, metavar='LR', help='Peak learning rate (linear warmup over the first epoch, then cosine decay to zero)')
+    parser.add_argument('--wd', '--weight-decay', default=0.01, type=float, metavar='WD', help='AdamW decoupled weight decay on the weight matrices (0 = off)')
+    parser.add_argument('--ema', default=0.9998, type=float, metavar='DECAY', help='decay of the exponential moving average of the weights, validated every epoch next to the raw weights (0 = off)')
     parser.add_argument('--gpu', '--gpu', default=0, type=int, metavar='GPU', help='GPU')
     parser.add_argument('--smooth', '--smoothing-factor', default=0.05, type=float, metavar='SM', help='Smoothing factor for loss')
     parser.add_argument('--epochs', '--epochs', default=100, type=int, metavar='EPOCHS', help='Number of epochs')
@@ -26,6 +28,9 @@ if (__name__ == '__main__'):
     parser.add_argument('--seed', default=0, type=int, metavar='SEED', help='seed for parameter init and batch order')
     parser.add_argument('--compile', action='store_true', help='torch.compile the network (~5 min compile, ~1.5x faster steps)')
     parser.add_argument('--resume', default=None, metavar='RUN_DIR', help='existing run directory to resume from its last.pth')
+    parser.add_argument('--node-drop', default=0.0, type=float, metavar='FRAC',
+                        help='z-resolution augmentation: drop up to this fraction of the interior depth points of '
+                             'each training column and rebuild its graph (0 = off; 0.3 is a reasonable value)')
 
     parsed = vars(parser.parse_args())
 
@@ -68,7 +73,9 @@ if (__name__ == '__main__'):
                      smooth=parsed['smooth'],
                      datadir=parsed['rd'],
                      seed=parsed['seed'],
-                     compile=parsed['compile'])
+                     compile=parsed['compile'],
+                     node_drop=parsed['node_drop'])
 
-    network.optimize(savedir_run, parsed['epochs'], lr=parsed['lr'], resume=resume)
+    network.optimize(savedir_run, parsed['epochs'], lr=parsed['lr'], resume=resume,
+                     weight_decay=parsed['wd'], ema_decay=parsed['ema'])
 
