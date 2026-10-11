@@ -8,7 +8,8 @@ from tqdm import tqdm
 from graphnet import *
 from configobj import ConfigObj
 from Dataset import *
-from normalization import normalize_pops, denormalize_pops, normalize_features, denormalize_features
+from normalization import normalize_pops, normalize_features
+from vertical_grids import training_grid
 import matplotlib.pyplot as plt
 import os, time, shutil, sys, csv, hashlib
 from datetime import datetime
@@ -52,7 +53,7 @@ warmup_start_factor = config['training'].get('warmup_start_factor', 0.01)
 grad_clip = config['training'].get('grad_clip', 0.0)                    # 0 = off
 ema_decay = config['training'].get('ema_decay', 0.0)                    # 0 = off; 0.9998 with the (1+n)/(10+n) ramp
 fresh_subset = config['training'].get('fresh_subset', False)           # a new random subset of the training columns every epoch
-features_labels = list(config['data'].get('features', ['vel', 'b', 'temp', 'n_e', 'rho', 'press']))
+features_labels = list(config['data']['features'])                      # input quantities: 'vel', 'temp', 'n_e', 'rho', 'press' (or 'n_h', 'n_p')
 
 datadir = config['data']['datadir']
 grid_file = config['data']['grid_file']
@@ -61,21 +62,10 @@ ny = config['data']['ny']
 nz = config['data']['nz_orig']
 nlev = config['data']['nlev']
 
-nz_linear = config['dataset']['nz_linear']
-nz_log = config['dataset']['nz_log']
-new_nz = nz_linear + nz_log
-logspace_fraction = config['dataset']['logspace_fraction']
-interp_log = config['dataset'].get('interp_log', False)                 # WP4.3: interpolate scalars and populations in log10
+interp_log = config['dataset']['interp_log']                            # interpolate scalars and populations in log10 (WP4.3)
 log_offset = config['normalization']['log_offset']
-normalization_type = config['normalization'].get('type', 'log')
-# ---- rungs 2-4 of the v2 ladder (plan D-4..D-7); every default reproduces rung 0 ----
-features_type = config['normalization'].get('features', normalization_type)    # rung 2: 'v2' = global log10 standardization, v/10 km/s, no B
-targets_type = config['normalization'].get('targets', normalization_type)      # rung 3: 'logf' = log10(f + log_offset), factor 1
-use_zpos = config['dataset'].get('use_zpos', True)                              # rung 2: False = no raw height feature
-edge_features = config['dataset'].get('edge_features', 'dist')                  # rung 2: 'rel3' = (dz, d_h, |dr|) in Mm
-augment_rotation = config['dataset'].get('augment_rotation', False)            # rung 4: random rotation about z per training sample
-loss_name = config['training'].get('loss', 'smoothl1')                          # rung 3: 'weighted_mse' on log10 f (D-6)
-relevance_threshold = config['training'].get('relevance_threshold', 1e-2)      # w = clip(f_CaII / threshold, 0, 1) per node ...
+augment_rotation = config['dataset'].get('augment_rotation', False)    # rung 4 (D-7): random rotation about z per training sample
+relevance_threshold = config['training'].get('relevance_threshold', 1e-2)      # loss weight w = clip(f_CaII / threshold, 0, 1) per node ...
 coronal_weight = config['training'].get('coronal_weight', 0.1)                  # ... floored at this value (coronal nodes down-weighted, not dropped)
 
 # ---- Code snapshot and git state at start-up, before any data is loaded (WP4.2) ----
@@ -92,39 +82,25 @@ if not load_checkpoint:
     shutil.copy('graphnet.py', os.path.join(savedir, f'graphnet_{start_stamp}.py'))
 
 # ---- memory–mapped arrays ----
+FILE_OF = {'vel': ('AR_385_veloc.dat', 3), 'temp': ('AR_385_temp.dat', 1), 'n_e': ('AR_385_ne.dat', 1), 'rho': ('AR_385_mass.dat', 1),
+           'press': ('AR_385_press.dat', 1), 'n_h': ('AR_385_nh.dat', 1), 'n_p': ('AR_385_np.dat', 1)}
 pops = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
-b_xyz = np.memmap(f'{datadir}/AR_385_B.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 3))
-temp = np.memmap(f'{datadir}/AR_385_temp.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 1))
-vel = np.memmap(f'{datadir}/AR_385_veloc.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 3))
-n_e = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-if 'n_h' in features_labels:
-    n_p = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
-    n_h = np.memmap(f'{datadir}/AR_385_nh.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-rho = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
-press = np.memmap(f'{datadir}/AR_385_press.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-for arr in [pops, b_xyz, temp, vel, n_e, rho, press] + ([n_h, n_p] if 'n_h' in features_labels else []):
+raw = {l: np.memmap(f'{datadir}/{FILE_OF[l][0]}', dtype='<f4', mode='r', shape=(nz, ny, nx, FILE_OF[l][1])) for l in features_labels}
+for arr in [pops] + list(raw.values()):
     assert os.path.getsize(arr.filename) == arr.size * 4, f'{arr.filename}: file size does not match the declared shape (WP4.2)'
 manifest_path = os.path.join(datadir, 'MANIFEST.json')
 data_manifest_sha256 = hashlib.sha256(open(manifest_path, 'rb').read()).hexdigest() if os.path.exists(manifest_path) else None
 
 print('Populations shape:\t', pops.shape)
-print('Temperature shape:\t', temp.shape)
-print('Mag, field shape:\t', b_xyz.shape)
-print('Velocity shape:\t\t', vel.shape)
-print('N_elec shape:\t\t', n_e.shape)
-# print('N_nh shape:\t\t', n_h.shape)
-# print('N_p shape:\t\t', n_p.shape)
-print('Rho shape:\t\t', rho.shape)
-print('Press shape:\t\t', press.shape)
+for l, a in raw.items():
+    print(f'{l} shape:\t\t', a.shape)
 print('#'*60+'\n')
 
 # ---- Interpolate data to the new grid ----
 z, y, x = (np.arange(d) for d in (nz, ny, nx))
-new_z_log = np.concatenate([
-    np.linspace(0, nz * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz * logspace_fraction), np.log10(nz - 1), nz_log)
-])
-new_z = np.clip(new_z_log, 0, nz - 1)
+z_native = np.load(grid_file)['z']                                      # native level heights [Mm]
+zz_levels, new_z, z_transition = training_grid(config, z_native)       # training grid: heights, fractional native indices
+new_nz = len(new_z)
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
@@ -135,68 +111,51 @@ def to_grid(a, log=False):           # log10 for the scalars and populations whe
         return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
     return interpn((z, y, x), a, new_points)
 pops = to_grid(pops, interp_log)
-temp = to_grid(temp, interp_log)
-b_xyz = to_grid(b_xyz) if 'b' in features_labels else None                     # B is dropped from the inputs in rung 2 (D-4)
-vel = to_grid(vel)
-n_e = to_grid(n_e, interp_log)
-if 'n_h' in features_labels:
-    n_h = to_grid(n_h, interp_log)
-    n_p = to_grid(n_p, interp_log)
-rho = to_grid(rho, interp_log)
-press = to_grid(press, interp_log)
+features_data = [to_grid(raw[l], interp_log and l != 'vel') for l in features_labels]
 
 print("Interpolation complete.")
 print('\n'+'#'*60)
 print('Populations shape INTERPOLATED:\t', pops.shape)
-print('Temperature shape INTERPOLATED:\t', temp.shape)
-print('Mag, field shape INTERPOLATED:\t', None if b_xyz is None else b_xyz.shape)
-print('Velocity shape INTERPOLATED:\t', vel.shape)
-print('N_elec shape INTERPOLATED:\t', n_e.shape)
-# print('N_nh shape INTERPOLATED:\t', n_h.shape)
-# print('N_p shape INTERPOLATED:\t\t', n_p.shape)
-print('Rho shape INTERPOLATED:\t\t', rho.shape)
-print('Press shape INTERPOLATED:\t\t', press.shape)
+for l, a in zip(features_labels, features_data):
+    print(f'{l} shape INTERPOLATED:\t', a.shape)
 print('#'*60+'\n')
 
 model_params = config['model']
 model = EncodeProcessDecode(**model_params).to(device)
-if model_params.get('head', 'linear') == 'log_softmax':   # rung 3: the head's floor is the targets' log_offset
-    assert targets_type == 'logf' and model_params.get('head_log_offset', 1e-12) == log_offset, "the 'log_softmax' head needs 'logf' targets with the same log_offset"
-assert model_params['edge_input_size'] == (3 if edge_features == 'rel3' else 1), (edge_features, model_params['edge_input_size'])
+assert model_params['head'] == 'log_softmax' and model_params.get('head_log_offset', 1e-12) == log_offset, \
+    "the targets are log10(f + log_offset): the model needs head = 'log_softmax' with the same head_log_offset"
+assert model_params['edge_input_size'] == 3, model_params['edge_input_size']
 print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
 # ---- Normalization ----
-features_data = [{'vel': vel, 'b': b_xyz, 'temp': temp, 'n_e': n_e, 'rho': rho, 'press': press,
-                  'n_h': n_h if 'n_h' in features_labels else None, 'n_p': n_p if 'n_p' in features_labels else None}[l] for l in features_labels]
-
-normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=features_type)
-pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=targets_type)
+normalized_features, feature_norm_params = normalize_features(features_data, features_labels)
+pops_normalized, pop_norm_params = normalize_pops(pops, log_offset)
 
 features_list = normalized_features
 targets_list = [pops_normalized]
-features_labels_expanded = [f'{l}{c}' for l in features_labels for c in (['x', 'y', 'z'] if l in ('vel', 'b') else [''])] + (['z_pos'] if use_zpos else [])
+features_labels_expanded = [f'{l}{c}' for l in features_labels for c in (['x', 'y', 'z'] if l == 'vel' else [''])]
 assert len(features_labels_expanded) == model_params['node_input_size'], (features_labels_expanded, model_params['node_input_size'])
-rot_pairs = [(i, i + 1) for i, l in enumerate(features_labels_expanded) if l in ('velx', 'bx')]   # (x, y) columns rotated as vectors (D-7)
+rot_pairs = [(i, i + 1) for i, l in enumerate(features_labels_expanded) if l == 'velx']   # (x, y) columns rotated as vectors (D-7)
 
 # ---- Create Datasets ----
+pixel_Mm = float(np.median(np.diff(np.load(grid_file)['x'])))          # horizontal pixel size [Mm] (uniform, dx = dy)
+assert np.allclose(np.diff(np.load(grid_file)['x']), pixel_Mm) and np.allclose(np.diff(np.load(grid_file)['y']), pixel_Mm)
 dataset_params = {
     'list_X': features_list,
     'list_Y': targets_list,
-    'radius_neighbors': config['dataset']['radius_neighbors'],
     'xdim': config['dataset']['x_range_graph'],
     'ydim': config['dataset']['y_range_graph'],
-    'fully_connected': config['dataset']['fully_connected'],
-    'pos_file': grid_file,
+    'z_levels': zz_levels,
+    'pixel_Mm': pixel_Mm,
     'seed': config['system']['seed'],
     'train_ratio': config['dataset']['train_ratio'],
-    'nz_linear': nz_linear,
-    'nz_log': nz_log,
-    'logspace_fraction': logspace_fraction,
     'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1),
     "max_stride": config["dataset"].get("max_stride", 1),
     "random_stride": config["dataset"].get("random_stride", False),
-    'use_zpos': use_zpos,
-    'edge_features': edge_features,
+    'edge_rule': config['dataset'].get('edge_rule', 'index'),
+    'radius_neighbors': config['dataset'].get('radius_neighbors', 6.01),
+    'stencil_radius': config['dataset'].get('stencil_radius', 4.01),
+    'edge_reach_Mm': config['dataset'].get('edge_reach_Mm', 0.5),
     'augment_rotation': augment_rotation,
     'rot_pairs': rot_pairs,
 }
@@ -265,18 +224,12 @@ else:
         milestones=config['training']['milestones'],
         gamma=config['training']['gamma']
     )
-loss_fn = nn.SmoothL1Loss(beta=1.0) # beta acts as the threshold between L1 and L2 behavior
-assert loss_name in ('smoothl1', 'weighted_mse'), loss_name
-if loss_name == 'weighted_mse':
-    assert targets_type == 'logf', "'weighted_mse' derives the Ca II fraction of each node from 'logf' targets"
-def relevance_weights(target):     # rung 3 (D-6): w = clip(f_CaII / threshold, 0, 1) per node, floored at coronal_weight; levels 0-4 are Ca II
+def relevance_weights(target):     # D-6: w = clip(f_CaII / threshold, 0, 1) per node, floored at coronal_weight; levels 0-4 are Ca II
     f_caii = (10.0 ** target[:, :5]).sum(dim=1)
     return torch.clamp(f_caii / relevance_threshold, 0.0, 1.0).clamp_min(coronal_weight)
-def compute_loss(o, t):            # o, t: (n_central_nodes, nlev) in the target representation
-    if loss_name == 'weighted_mse':
-        w = relevance_weights(t)
-        return (w[:, None] * (o - t) ** 2).sum() / (w.sum() * o.shape[1])
-    return loss_fn(o, t)
+def compute_loss(o, t):            # weighted MSE on log10 f; o, t: (n_central_nodes, nlev)
+    w = relevance_weights(t)
+    return (w[:, None] * (o - t) ** 2).sum() / (w.sum() * o.shape[1])
 ema, ema_updates = None, 0
 if ema_decay > 0:                  # EMA of the weights with the (1+n)/(10+n) ramp, validated next to the raw weights
     def ema_avg_fn(averaged, current, num_averaged):
@@ -284,8 +237,8 @@ if ema_decay > 0:                  # EMA of the weights with the (1+n)/(10+n) ra
         torch._foreach_lerp_(averaged, current, 1.0 - d)
     ema = torch.optim.swa_utils.AveragedModel(model, multi_avg_fn=ema_avg_fn)
 print(f"Recipe: optimizer {optimizer_name} (wd {weight_decay}), schedule {schedule}, grad clip {grad_clip}, EMA {ema_decay}, fresh subset {fresh_subset}")
-print(f"Representation: features {features_type}, targets {targets_type}, z_pos {use_zpos}, edges {edge_features}, head {model_params.get('head', 'linear')}, "
-      f"loss {loss_name}, rotation augmentation {augment_rotation}")
+print(f"Representation: inputs {features_labels_expanded}, targets log10(f + {log_offset}), edges (dz, d_h, |dr|), "
+      f"grid {config['dataset'].get('grid', 'index')} ({new_nz} levels), rotation augmentation {augment_rotation}")
 
 # ---- Initialize Training State Variables ----
 start_epoch = 1
@@ -293,12 +246,10 @@ best_loss = float('inf')
 best_dex = float('inf')
 train_loss, valid_loss, valid_dex, lrs = [], [], [], []
 meta = {'conf_path': os.path.abspath(conf_path), 'features_labels': features_labels, 'features_labels_expanded': features_labels_expanded,
-        'loss': {'smoothl1': 'SmoothL1Loss(beta=1)', 'weighted_mse': f'MSE on log10 f with node weights max(clip(f_CaII / {relevance_threshold}, 0, 1), {coronal_weight})'}[loss_name],
-        'target_transform': ('log10(f + log_offset)' if targets_type == 'logf' else f"log10(f / <f>_z) / ({config['normalization']['factor']})") + '; dex = |factor| * |d normalized|',
-        'features_type': features_type, 'targets_type': targets_type, 'use_zpos': use_zpos, 'edge_features': edge_features,
-        'augment_rotation': augment_rotation, 'rot_pairs': rot_pairs, 'head': model_params.get('head', 'linear'),
-        'interp_log': interp_log, 'datadir': datadir, 'data_manifest_sha256': data_manifest_sha256, 'grid_file': grid_file,
-        'z_grid_Mm': np.interp(new_z, z, np.load(grid_file)['z']).tolist(), 'new_z_indices': new_z.tolist(),
+        'loss': f'MSE on log10 f with node weights max(clip(f_CaII / {relevance_threshold}, 0, 1), {coronal_weight})',
+        'target_transform': 'log10(f + log_offset); errors are dex', 'augment_rotation': augment_rotation, 'rot_pairs': rot_pairs,
+        'grid': config['dataset'].get('grid', 'index'), 'edge_rule': config['dataset'].get('edge_rule', 'index'), 'interp_log': interp_log, 'datadir': datadir, 'data_manifest_sha256': data_manifest_sha256,
+        'grid_file': grid_file, 'z_grid_Mm': zz_levels.tolist(), 'new_z_indices': new_z.tolist(),
         'validation': {'split': 'test', 'stride': datast_test.max_stride, 'guard': valid_guard, 'n_columns': len(datast_test.sample_centers),
                        'metric': 'RMS dex over central nodes, plain mean'},
         'recipe': {'optimizer': optimizer_name, 'weight_decay': weight_decay, 'adam_betas': adam_betas, 'adam_eps': adam_eps, 'schedule': schedule,
@@ -357,10 +308,8 @@ if not os.path.exists(csv_path) or not load_checkpoint:
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'muram_comparison'))
     import muram_common as mc
-    z_native_grid = np.load(grid_file)['z']
-    zz_training = np.interp(new_z, z, z_native_grid)
-    mc.plot_grids([('native Bifrost', z_native_grid, 'royalblue'), ('training grid', zz_training, 'forestgreen')],
-                  bands=[(l, lo, hi) for l, lo, hi in mc.FORMATION_BANDS_BIFROST_FRAME], transition=zz_training[nz_linear],
+    mc.plot_grids([('native Bifrost', z_native, 'royalblue'), ('training grid', zz_levels, 'forestgreen')],
+                  bands=[(l, lo, hi) for l, lo, hi in mc.FORMATION_BANDS_BIFROST_FRAME], transition=z_transition,
                   path=os.path.join(savedir, 'grids.png'), title='Vertical grids (Bifrost FITS frame)', xlim=(-0.8, 13.0))
 except Exception as exc:                 # noqa: BLE001  (a check figure is never a reason to stop training)
     print(f'grids.png not written: {exc}')
@@ -409,7 +358,7 @@ for epoch in range(start_epoch, n_epochs + 1):
                 o, t = out.squeeze()[central_mask], target.squeeze()[central_mask]
                 loss_sum += compute_loss(o, t).item(); n_batches += 1
                 sq_sum += ((o - t) ** 2).sum().item(); n_nodes += o.numel()
-        return loss_sum / max(n_batches, 1), abs(config['normalization']['factor']) * np.sqrt(sq_sum / max(n_nodes, 1))
+        return loss_sum / max(n_batches, 1), np.sqrt(sq_sum / max(n_nodes, 1))
 
     val_loss_avg, val_dex = validate(model)
     val_dex_ema = validate(ema.module)[1] if ema is not None else None

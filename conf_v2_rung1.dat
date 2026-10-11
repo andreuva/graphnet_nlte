@@ -1,4 +1,6 @@
 # conf.dat
+# HISTORICAL CONFIG of rung 1 (per-height normalization, 11 inputs, SmoothL1): its representation was removed from the code after commit 4b1ebbf;
+# check out that commit to re-run or re-score it.
 
 # ===================================================================
 # Rung 1 of the v2 ladder: rung 0 + optimizer/schedule/EMA/sampling recipe (plan D-8)

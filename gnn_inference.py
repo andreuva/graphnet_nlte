@@ -11,7 +11,8 @@ import multiprocessing
 
 from graphnet import EncodeProcessDecode
 from Dataset import EfficientDataset
-from normalization import denormalize_pops, normalize_features, normalize_features_with_params, normalize_pops
+from normalization import denormalize_pops, normalize_features, normalize_pops
+from vertical_grids import training_grid
 from provenance import make_run_dir, write_meta
 
 # %%
@@ -37,14 +38,13 @@ device = torch.device(device_name)
 print(f"Using device: {device}\n")
 
 # %%
-# The parameters to set manually: checkpoint, inference stride (None = the training max_stride), split and the input
-# quantities ('press' or 'nh'); all can be given positionally:  python gnn_inference.py <checkpoint> <stride> <split> <device> <press|nh> [zero_features]
-checkpoint_path = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+# The parameters to set manually: checkpoint, inference stride (None = the training max_stride) and split; all can be
+# given positionally:  python gnn_inference.py <checkpoint> <stride> <split> <device> [zero_features]
+checkpoint_path = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/v2_rung4_rotation_seed777/2026.10.08-15:09:03_best.pth'
 stride = int(sys.argv[2]) if len(sys.argv) > 2 else None
 split = sys.argv[3] if len(sys.argv) > 3 else 'test'          # held-out columns only (audit E4); 'full' and 'train' still possible
-features = sys.argv[5] if len(sys.argv) > 5 else 'press'
 # ablation: expanded input labels set to zero after normalization, e.g. 'velx,vely' (what an inversion cannot provide); '' = none
-zero_features = [s for s in (sys.argv[6] if len(sys.argv) > 6 else '').split(',') if s]
+zero_features = [s for s in (sys.argv[5] if len(sys.argv) > 5 else '').split(',') if s]
 guard = 32                                                     # px next to the training region excluded from the metrics (E4)
 
 # Load the entire checkpoint
@@ -56,40 +56,22 @@ datadir = config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
 nlev = config['data']['nlev']
 
-nz_linear = config['dataset']['nz_linear']
-nz_log = config['dataset']['nz_log']
-new_nz = nz_linear + nz_log
-logspace_fraction = config['dataset']['logspace_fraction']
 log_offset = config['normalization']['log_offset']
-normalization_type = config['normalization'].get('type', 'log')
-factor = config['normalization']['factor']
 train_stride = config['dataset'].get('max_stride', 1)
 stride = stride or train_stride
-# representation of the training run (rungs 2-4 are config-gated; old checkpoints have none of these keys)
-features_type = config['normalization'].get('features', normalization_type)
-targets_type = config['normalization'].get('targets', normalization_type)
-use_zpos = config['dataset'].get('use_zpos', True)
-edge_features = config['dataset'].get('edge_features', 'dist')
-interp_log = config['dataset'].get('interp_log', False)
-if 'meta' in checkpoint:          # the input quantities are recorded in the checkpoint since rung 0 (the positional argument is for old runs)
-    features = 'nh' if 'n_h' in checkpoint['meta']['features_labels'] else 'press'
-print(f"Representation: features {features_type} ({features}), targets {targets_type}, z_pos {use_zpos}, edges {edge_features}, log interpolation {interp_log}")
+interp_log = config['dataset']['interp_log']
+features_labels_simple = list(checkpoint['meta']['features_labels'])      # the input quantities of the run
+print(f"Inputs {features_labels_simple}, grid {config['dataset'].get('grid', 'index')}, log interpolation {interp_log}")
 
 print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
 # %%
 # ---- memory–mapped arrays ----
+FILE_OF = {'vel': ('AR_385_veloc.dat', 3), 'temp': ('AR_385_temp.dat', 1), 'n_e': ('AR_385_ne.dat', 1), 'rho': ('AR_385_mass.dat', 1),
+           'press': ('AR_385_press.dat', 1), 'n_h': ('AR_385_nh.dat', 1), 'n_p': ('AR_385_np.dat', 1)}
 pops_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
-b_xyz_orig = np.memmap(f'{datadir}/AR_385_B.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
-temp_orig = np.memmap(f'{datadir}/AR_385_temp.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-vel_orig = np.memmap(f'{datadir}/AR_385_veloc.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
-n_e_orig = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-if features == 'nh':
-    n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-    n_p_orig = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-rho_orig = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-press_orig = np.memmap(f'{datadir}/AR_385_press.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-for arr in (pops_orig, b_xyz_orig, temp_orig, vel_orig, n_e_orig, rho_orig, press_orig):
+raw = {l: np.memmap(f'{datadir}/{FILE_OF[l][0]}', dtype='<f4', mode='r', shape=(nz, ny, nx, FILE_OF[l][1])) for l in features_labels_simple}
+for arr in [pops_orig] + list(raw.values()):
     assert os.path.getsize(arr.filename) == arr.size * 4, f'{arr.filename}: file size does not match the declared shape'
 
 # %%
@@ -97,21 +79,15 @@ print(f"Original data shape: {pops_orig.shape}")
 print("Creating new Z grid")
 
 z, y, x = (np.arange(d) for d in (nz, ny, nx))
-new_z_log = np.concatenate([
-    np.linspace(0, nz * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz * logspace_fraction), np.log10(nz - 1), nz_log)
-])
-new_z = np.clip(new_z_log, 0, nz - 1)
+geometry_grid = np.load(config["data"]["grid_file"])["z"]              # native level heights [Mm]
+zz_grid, new_z, _ = training_grid(config, geometry_grid)               # the training grid of the run
+new_nz = len(new_z)
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
 # %%
-geometry_file = config["data"]["grid_file"]
-geometry_grid = np.load(geometry_file)["z"]
-zz_grid = np.interp(new_z, z, geometry_grid)
-
 # %%
-print(f"Loaded geometry grid from {geometry_file} with shape {zz_grid.shape}.")
+print(f"Training grid: {zz_grid.shape} levels.")
 plt.figure(figsize=(20, 2))
 plt.plot(zz_grid, zz_grid * 0, '|', markersize=20, label='Interpolated grid')
 plt.plot(geometry_grid, geometry_grid * 0, '|', label='Original grid')
@@ -129,15 +105,7 @@ def to_grid(a, log=False):           # as in gnn_train.py: log10 for the scalars
         return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
     return interpn((z, y, x), a, new_points)
 pops = to_grid(pops_orig, interp_log)
-temp = to_grid(temp_orig, interp_log)
-b_xyz = to_grid(b_xyz_orig)
-vel = to_grid(vel_orig)
-n_e = to_grid(n_e_orig, interp_log)
-if features == 'nh':
-    n_h = to_grid(n_h_orig, interp_log)
-    n_p = to_grid(n_p_orig, interp_log)
-rho = to_grid(rho_orig, interp_log)
-press = to_grid(press_orig, interp_log)
+features_data = [to_grid(raw[l], interp_log and l != 'vel') for l in features_labels_simple]
 print("Interpolation complete.")
 print(f"New shape: {pops.shape}")
 
@@ -147,51 +115,40 @@ print(f"New shape: {pops.shape}")
 feature_norm_params = checkpoint['feature_norm_params']
 pop_norm_params = checkpoint['normalization_params']
 
-if 'meta' in checkpoint:                # the exact input list of the run (rung 2 drops B)
-    features_labels_simple = list(checkpoint['meta']['features_labels'])
-elif features == 'nh':
-    features_labels_simple = ['vel', 'b', 'temp', 'n_e', 'n_h', 'n_p']
-else:
-    features_labels_simple = ['vel', 'b', 'temp', 'n_e', 'rho', 'press']
-features_data = [{'vel': vel, 'b': b_xyz, 'temp': temp, 'n_e': n_e, 'rho': rho, 'press': press,
-                  'n_h': n_h if features == 'nh' else None, 'n_p': n_p if features == 'nh' else None}[l] for l in features_labels_simple]
-features_labels = [f'{l}{c}' for l in features_labels_simple for c in (['x', 'y', 'z'] if l in ('vel', 'b') else [''])]
+features_labels = [f'{l}{c}' for l in features_labels_simple for c in (['x', 'y', 'z'] if l == 'vel' else [''])]
 
-# The saved statistics of the training run (for the per-height 'log' type this equals re-computing them on the full cube)
-# normalized_features, _ = normalize_features(features_data, features_labels_simple, log_offset, normalization_type)
-normalized_features = normalize_features_with_params(features_data, features_labels_simple, feature_norm_params, features_type)
-for zf in zero_features:               # zero is zero in both normalizations for velocities and B (no centring)
+normalized_features = normalize_features(features_data, features_labels_simple, feature_norm_params)[0]   # the saved statistics of the training run
+for zf in zero_features:               # ablation (zero is zero: the velocities are not centred)
+    assert zf in features_labels, (zf, features_labels)
     l = next(l for l in features_labels_simple if zf.startswith(l))
     normalized_features[features_labels_simple.index(l)][..., {'x': 0, 'y': 1, 'z': 2}.get(zf[len(l):], 0)] = 0.0
     print(f"Ablation: input '{zf}' set to zero")
-pops_normalized, _ = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=targets_type)
+pops_normalized, _ = normalize_pops(pops, log_offset)
 
 # ---- Create Test Dataset ----
 # All parameters are now from the loaded config object
+pixel_Mm = float(np.median(np.diff(np.load(config['data']['grid_file'])['x'])))     # horizontal pixel size [Mm]
 dataset_params = {
     'list_X': normalized_features,
     'list_Y': [pops_normalized],
-    'radius_neighbors': config['dataset']['radius_neighbors'],
     'xdim': config['dataset']['x_range_graph'],
     'ydim': config['dataset']['y_range_graph'],
-    'fully_connected': config['dataset']['fully_connected'],
-    'pos_file': config['data']['grid_file'],
+    'z_levels': zz_grid,
+    'pixel_Mm': pixel_Mm,
     'seed': config['system']['seed'],
     'train_ratio': config['dataset']['train_ratio'],
-    'nz_linear': config['dataset']['nz_linear'],
-    'nz_log': config['dataset']['nz_log'],
-    'logspace_fraction': config['dataset']['logspace_fraction'],
     'epoch_size_fraction': 1.0,  # Use full dataset for testing
     'max_stride': stride,
     'random_stride': False,
     'split_stride': train_stride,     # the test region is the one of the training run, whatever the inference stride (E4/E5)
-    'use_zpos': use_zpos,
-    'edge_features': edge_features,
+    'edge_rule': config['dataset'].get('edge_rule', 'index'),
+    'radius_neighbors': config['dataset'].get('radius_neighbors', 6.01),
+    'stencil_radius': config['dataset'].get('stencil_radius', 4.01),
+    'edge_reach_Mm': config['dataset'].get('edge_reach_Mm', 0.5),
     'split': split
 }
 
 datast_test = EfficientDataset(**dataset_params)
-assert np.allclose(datast_test.zz, zz_grid, atol=1e-6), 'dataset z grid != interpolation grid'
 run_dir = make_run_dir(__file__)                                # results/gnn_inference/<stamp>/ (never overwrites)
 # loader_test = DataLoader(datast_test, batch_size=config['training']['batch_size']*6, shuffle=False)
 
@@ -328,8 +285,8 @@ pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.y0:datast_t
 # %%
 # --- Denormalized Analysis ---
 print("Denormalizing populations...")
-predictions_denorm = denormalize_pops(predictions_spatial, pop_norm_params, targets_type)
-targets_denorm = denormalize_pops(targets_spatial, pop_norm_params, targets_type)
+predictions_denorm = denormalize_pops(predictions_spatial, pop_norm_params)
+targets_denorm = denormalize_pops(targets_spatial, pop_norm_params)
 
 # %%
 test_mask = np.zeros((ny_size, nx_size), dtype=bool)
@@ -398,10 +355,10 @@ with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
     json.dump(metrics, f, indent=1)
 write_meta(run_dir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride,
            train_stride=train_stride, split=split, split_stride=train_stride, guard=guard, x0=int(datast_test.x0), x1=int(datast_test.x1),
-           y0=int(datast_test.y0), y1=int(datast_test.y1), nx_size=int(nx_size), ny_size=int(ny_size), normalization_type=normalization_type,
-           factor=factor, totals_source='checkpoint normalization_params[totals] (Bifrost sum of levels), sliced [:, y0:y1, x0:x1]',
-           feature_set=features, features_labels=features_labels_simple, features_labels_expanded=features_labels + (['z_pos'] if use_zpos else []), datadir=datadir,
-           features_type=features_type, targets_type=targets_type, edge_features=edge_features, interp_log=interp_log, zero_features=zero_features,
+           y0=int(datast_test.y0), y1=int(datast_test.y1), nx_size=int(nx_size), ny_size=int(ny_size),
+           totals_source='checkpoint normalization_params[totals] (Bifrost sum of levels), sliced [:, y0:y1, x0:x1]',
+           features_labels=features_labels_simple, features_labels_expanded=features_labels, datadir=datadir,
+           grid=config['dataset'].get('grid', 'index'), interp_log=interp_log, zero_features=zero_features,
            z_grid_Mm=zz_grid, new_z_indices=new_z, device=device_name,
            files={'predictions': f'predictions_patch_{tag}.npy', 'targets': f'targets_patch_{tag}.npy'})
 print(f"Saved arrays, metrics.json and meta.json to {run_dir}")

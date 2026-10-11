@@ -68,13 +68,6 @@ meta = json.load(open(os.path.join(results_dir, 'meta.json')))
 # Number of CPU cores to use
 n_jobs = 32
 
-# Config parameters from training (saved in conf.dat)
-nz_b = 425
-logspace_fraction = 0.33
-nz_linear = 30
-nz_log = 20
-
-bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
 pathsource = '/dat/milic/MURaM_enhanced_network/'
 snap_number = 499000
 fits_path = "/dat/milic/MURaM_enhanced_network/che_full_499000_lwsynth_200.0.fits"
@@ -84,20 +77,6 @@ pred_path = os.path.join(results_dir, meta['files']['predictions'])
 # 1. SETUP GRIDS AND VERTICAL COORDINATES
 # ==============================================================================
 print("1. Constructing grids and setting up vertical coordinates...")
-
-if not os.path.exists(bifrost_grid_file):
-    print(f"Error: Bifrost grid file not found at {bifrost_grid_file}")
-    sys.exit(1)
-bifrost_z_grid = np.load(bifrost_grid_file)["z"]
-
-# Grid setup for Bifrost
-z_b = np.arange(nz_b)
-new_z_b_log = np.concatenate([
-    np.linspace(0, nz_b * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz_b * logspace_fraction), np.log10(nz_b - 1), nz_log)
-])
-new_z_b = np.clip(new_z_b_log, 0, nz_b - 1)
-zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
 
 # Load MURaM snap; the vertical coordinate and the alignment come from the inference run (grid.npz, meta.json)
 cube = mio.MuramSnap(pathsource, snap_number)

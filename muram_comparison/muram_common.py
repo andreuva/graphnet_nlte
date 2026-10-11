@@ -58,22 +58,6 @@ def muram_heights(cube, step=4):
     return (np.arange(cube.Temp.shape[0]) - idx) * dz, idx
 
 
-def bifrost_training_grid(config, grid_file=None):
-    """(zz_grid_bifrost [50, Mm, FITS frame], z_native [425], new_z_b [fractional native indices]) as in gnn_train.py."""
-    grid_file = grid_file or BIFROST_GRID
-    z_native = np.load(grid_file)['z']
-    nz = config['data']['nz_orig']
-    d = config['dataset']
-    new_z_b = np.clip(np.concatenate([np.linspace(0, nz * d['logspace_fraction'], d['nz_linear'], endpoint=False),
-                                      np.logspace(np.log10(nz * d['logspace_fraction']), np.log10(nz - 1), d['nz_log'])]), 0, nz - 1)
-    return np.interp(new_z_b, np.arange(nz), z_native), z_native, new_z_b
-
-
-def align_bifrost_levels_to_muram(zz_grid_bifrost, idx_tau1, dz_mm):
-    """Fractional MURaM z indices at which the Bifrost training levels sit, both simulations aligned at tau500 = 1."""
-    return idx_tau1 + (zz_grid_bifrost - ZTAU51_BIFROST) / dz_mm
-
-
 def muram_si_on_levels(cube, new_z, labels=('temp', 'vel', 'b', 'n_e', 'rho', 'press')):
     """Interpolate MURaM variables linearly to fractional z indices `new_z`; SI, Bifrost layout (z, y, x)."""
     nz, nx, ny = cube.Temp.shape

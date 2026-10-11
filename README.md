@@ -98,23 +98,47 @@ The code expects data in BIFROST format, but easy adaptation to other formats is
 
 ## 🚀 Usage
 
+### Representation (v2, since 2026-10)
+
+* **Inputs per node (7):** vx, vy, vz in units of 10 km/s; log10 T, log10 n_e, log10 rho, log10 P standardized by one global
+  mean and standard deviation of the training cube (clipped at +-5 sigma). No magnetic field, no height coordinate.
+  The statistics are stored in the checkpoint and re-applied to any other atmosphere (`normalization.py`).
+* **Edges:** star topology around the central column; features (dz, horizontal distance, |dr|) in Mm. Two rules
+  (`[dataset] edge_rule`): `index` (ladder rungs 0-4: radius in index units, the vertical reach grows with the stride) and
+  `physical` (rung 5a: fixed vertical reach in Mm, the same receptive field for every stride and grid).
+* **Vertical grid** (`[dataset] grid`, `vertical_grids.training_grid`): `index` (30 + 20 levels in native index) or `two_zone`
+  (rung 6: 80 km steps from tau500 = 1 to 4.5 Mm plus 7 coronal levels, defined in physical height for Bifrost and MURaM alike).
+* **Outputs:** log10 fractions of the 6 Ca levels through a log_softmax head (fractions sum to one exactly); loss = MSE on
+  log10 f weighted by the Ca II relevance of each node. Absolute populations = fractions x 9.65e14 x rho [kg m^-3] cm^-3.
+
+The per-height normalizations, the height input, the magnetic field and the linear head of the earlier models were removed
+from the code after commit 4b1ebbf (check it out to re-run those configurations).
+
 ### 1. Training
 
-To train a new 3D model (e.g., for Calcium II), configure the parameters in `conf.dat` (self explanatory fields) and run:
+Configure `conf.dat` (the default is rung 4 of the v2 ladder; `conf_v2_rung*.dat` document the ladder) and run
 
 ```bash
-python gnn_train.py
-
+python gnn_train.py [conf.dat]
 ```
 
-The training process optimizes the Mean Squared Error (MSE) between the predicted and computed populations normalized properly.
+Every epoch writes `last.pth`, `training_log.csv` and, on improvement of the held-out RMS dex, a `*_best.pth` with the
+configuration, normalization statistics, metadata and git state inside (`checkpoints/<savedir>/`).
 
-### 2. Inference (Prediction)
+### 2. Evaluation on Bifrost
 
-Generate level populations for a new 3D snapshot:
-
+```bash
+python gnn_inference.py <checkpoint> <stride> <split> <device> [zero_features]   # results/gnn_inference/<stamp>/
+python synthesis.py [run_dir]                                                     # Ca II 8542 synthesis of a run
+python plot_scripts/stride_table.py > results/stride_table.md
 ```
-gnn_inference.ipynb
+
+### 3. MURaM
+
+```bash
+python muram_comparison/muram_inference.py <checkpoint> <stride> <crop|full> <device>   # results/muram_inference/<stamp>/
+python muram_comparison/compare_populations.py [run_dir]; python muram_comparison/ood_table.py [run_dir]
+python muram_comparison/muram_synthesis.py [run_dir] [n_side]; python muram_comparison/muram_report.py
 ```
 
 ## 📄 Citation

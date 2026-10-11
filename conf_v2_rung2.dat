@@ -1,4 +1,6 @@
 # conf.dat
+# HISTORICAL CONFIG of rung 2 (v2 inputs but per-height targets, linear head, SmoothL1): its representation was removed from the code after commit 4b1ebbf;
+# check out that commit to re-run or re-score it.
 
 # ===================================================================
 # Rung 2 of the v2 ladder: rung 1 + code-independent inputs (plan D-4): global log10 standardization of

@@ -45,22 +45,7 @@ targets_denorm = np.load(targets_path)
 new_nz, ny_size, nx_size, nlev = targets_denorm.shape
 print(f"Loaded spatial cubes of shape: {targets_denorm.shape}")
 
-print("Reconstructing geometry grid from checkpoint config...")
-checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-config = checkpoint['config']
-nz = config['data']['nz_orig']
-nz_linear = config['dataset']['nz_linear']
-nz_log = config['dataset']['nz_log']
-logspace_fraction = config['dataset']['logspace_fraction']
-
-z = np.arange(nz)
-new_z_log = np.concatenate([
-    np.linspace(0, nz * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz * logspace_fraction), np.log10(nz - 1), nz_log)
-])
-new_z = np.clip(new_z_log, 0, nz - 1)
-geometry_grid = np.load(config["data"]["grid_file"])["z"]
-zz_grid = np.interp(new_z, z, geometry_grid)
+zz_grid = np.load(os.path.join(run_dir, 'zz_grid.npy'))      # the training grid of the run, saved by gnn_inference.py
 
 # ==========================================
 # 3. DATA FLATTENING & FILTERING

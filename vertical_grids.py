@@ -45,6 +45,32 @@ def two_zone_grid(bottom, top, spacing_km=80.0, transition=4.5, n_sparse=7, dens
     return np.concatenate([sub, dense, sparse])
 
 
+def training_grid(config, z_native):
+    """The vertical grid of a training run from its config: (level heights in the Bifrost FITS frame [Mm], fractional
+    native indices for the interpolation of the cube, transition height [Mm, FITS frame] for the grid figure).
+
+    [dataset] grid = 'index' (default): nz_linear levels linearly spaced in native index over the first logspace_fraction
+    of the cube, then nz_log log-spaced indices up to the top (the original 30 + 20 grid).
+    [dataset] grid = 'two_zone' (rung 6, D-10): physical height above tau500 = 1, identical for Bifrost and MURaM: the
+    bottom native level, N_SUB sub-photospheric levels, dense_spacing_km from DENSE_START_MM to transition_Mm, then
+    n_sparse geometrically spaced levels up to the top native level (two_zone_grid).
+    """
+    d = config['dataset']
+    nz = len(z_native)
+    assert nz == config['data']['nz_orig'], (nz, config['data']['nz_orig'])
+    kind = d.get('grid', 'index')
+    if kind == 'index':
+        idx = np.clip(np.concatenate([np.linspace(0, nz * d['logspace_fraction'], d['nz_linear'], endpoint=False),
+                                      np.logspace(np.log10(nz * d['logspace_fraction']), np.log10(nz - 1), d['nz_log'])]), 0, nz - 1)
+        z = np.interp(idx, np.arange(nz), z_native)
+        return z, idx, z[d['nz_linear']]
+    if kind == 'two_zone':
+        h = two_zone_grid(z_native[0] - ZTAU51_BIFROST, z_native[-1] - ZTAU51_BIFROST, d['dense_spacing_km'], d['transition_Mm'], d['n_sparse'])
+        z = h + ZTAU51_BIFROST
+        return z, np.interp(z, z_native, np.arange(nz)), d['transition_Mm'] + ZTAU51_BIFROST
+    raise ValueError(f"unknown [dataset] grid = '{kind}'")
+
+
 def zone_of(z, transition):
     """0 = sub-photospheric, 1 = dense, 2 = sparse."""
     return np.where(z < DENSE_START_MM - 1e-9, 0, np.where(z <= transition + 1e-9, 1, 2))

@@ -30,27 +30,6 @@ plt.rcParams.update({
 
 print("1. Constructing grids and setting up vertical coordinates...")
 
-# Config parameters from training (saved in conf.dat)
-nz_b = 425
-logspace_fraction = 0.33
-nz_linear = 30
-nz_log = 20
-
-bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
-if not os.path.exists(bifrost_grid_file):
-    print(f"Error: Bifrost grid file not found at {bifrost_grid_file}")
-    sys.exit(1)
-bifrost_z_grid = np.load(bifrost_grid_file)["z"]
-
-# Grid setup for Bifrost
-z_b = np.arange(nz_b)
-new_z_b_log = np.concatenate([
-    np.linspace(0, nz_b * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz_b * logspace_fraction), np.log10(nz_b - 1), nz_log)
-])
-new_z_b = np.clip(new_z_b_log, 0, nz_b - 1)
-zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
-
 # The run to score: a muram_inference.py results directory (default: the most recent). Its grid.npz holds the heights of
 # the 50 levels above MURaM's tau500 = 1 and their fractional MURaM indices (alignment done once, in the inference)
 results_dir = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(os.path.join(_here, '..', 'results', 'muram_inference', '*', 'meta.json')))[-1][:-len('meta.json')]

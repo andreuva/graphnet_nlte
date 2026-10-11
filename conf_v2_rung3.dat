@@ -31,16 +31,14 @@ nz_log = 20
 logspace_fraction = 0.33
 # interpolate scalars and populations in log10 to the training grid (WP4.3; the old runs interpolated linearly)
 interp_log = True
-# Graph construction settings (in grid points)
+# vertical grid of the training run ('index' = 30 native indices linearly spaced over the first logspace_fraction of the cube + 20 log-spaced)
+grid = 'index'
+# Graph construction settings: edges within radius_neighbors * (xs + ys) / 3 in index units (level, pixel, pixel), star topology
 radius_neighbors = 6.01
 x_range_graph = 4
 y_range_graph = 4
 max_stride = 4
 random_stride = True
-fully_connected = False
-# rung 2 (D-4): no raw height feature on the nodes; edge features (dz, d_h, |dr|) in Mm instead of |dr|
-use_zpos = False
-edge_features = 'rel3'
 # Data split for train/test
 train_ratio = 0.7
 
@@ -68,8 +66,6 @@ warmup_epochs = 1
 grad_clip = 1.0
 ema_decay = 0.9998
 fresh_subset = True
-# rung 3 (D-6): MSE on log10 f with node weights max(clip(f_CaII / relevance_threshold, 0, 1), coronal_weight)
-loss = 'weighted_mse'
 relevance_threshold = 1e-2
 coronal_weight = 0.1
 # Scheduler milestones for learning rate reduction
@@ -94,10 +90,5 @@ head = 'log_softmax'
 head_log_offset = 1e-12
 
 [normalization]
-# feature normalization 'v2' (D-4): global mean/std of log10 T, n_e, rho, P clipped at 5 sigma; v / 1e4 m/s
-features = 'v2'
-# For population normalization: 'logf' targets = log10(f + log_offset) (D-5); factor must be 1
-type = 'log'
-targets = 'logf'
-factor = 1.0
+# targets log10(f + log_offset); inputs: global log10 standardization (normalization.py)
 log_offset = 1e-12

@@ -3,33 +3,41 @@
 import torch
 import numpy as np
 from torch_geometric.data import Data
-from torch_geometric.transforms import RadiusGraph
 
 class EfficientDataset(torch.utils.data.Dataset):
-    def __init__(self, list_X: list, list_Y: list, radius_neighbors: float, xdim: int, ydim: int,
-                 fully_connected: bool = False, pos_file: str = None, split: str = 'train', train_ratio: float = 0.75,
-                 logspace_fraction: float = 0.4, nz_linear: int = 30, nz_log: int = 25, epoch_size_fraction: float = 0.2,
+    def __init__(self, list_X: list, list_Y: list, xdim: int, ydim: int, z_levels, pixel_Mm: float,
+                 split: str = 'train', train_ratio: float = 0.75, epoch_size_fraction: float = 0.2,
                  max_stride: int = 1,
                  random_stride: bool = False,
                  split_stride: int = None,
-                 use_zpos: bool = True,
-                 edge_features: str = 'dist',
+                 edge_rule: str = 'index', radius_neighbors: float = 6.01, stencil_radius: float = 4.01, edge_reach_Mm: float = 0.5,
                  augment_rotation: bool = False,
                  rot_pairs=((0, 1),),
-                 seed: int = 777,
-                 device: str = 'cpu'):
+                 seed: int = 777):
+        """
+        One graph per central column: the (2 xdim + 1) x (2 ydim + 1) stencil of columns around it, hop = `stride` pixels
+        (drawn in 1..max_stride per sample when random_stride), all nz levels of every column, star topology (every edge
+        touches the central column). list_X / list_Y: lists of (nz, ny, nx, ncomp) arrays on the training grid;
+        z_levels: heights of the nz levels [Mm]; pixel_Mm: horizontal pixel size [Mm]. Node features are the
+        concatenated list_X columns; edge features (dz, d_h, |dr|) in Mm (dz = source minus target).
+
+        edge_rule 'index' (ladder rungs 0-4): a node is linked to a central node when their distance in index units
+        (level, pixel, pixel) is <= radius_neighbors * (xs + ys) / 3, so the vertical reach grows with the stride.
+        edge_rule 'physical' (rung 5a): the column lies within stencil_radius stencil units of the centre and the
+        height difference is <= edge_reach_Mm (adjacent levels of the central column are always linked), so the
+        receptive field in km is the same for every stride and grid.
+        """
         super(EfficientDataset, self).__init__()
         print(f'Dataset.py: Initializing {split} dataset...')
-        self.device = device
         self.epoch_size_fraction = epoch_size_fraction
+        self.edge_rule = edge_rule
         self.radius = radius_neighbors
+        self.stencil_radius = stencil_radius
+        self.edge_reach = edge_reach_Mm
         self.xdim = xdim
         self.ydim = ydim
-        self.fully_connected = fully_connected
         self.max_stride = max_stride
         self.random_stride = random_stride
-        self.use_zpos = use_zpos                  # rung 2 (D-4): False = no raw height feature on the nodes
-        self.edge_features = edge_features        # 'dist' = |dr| (original) | 'rel3' = (dz, d_h, |dr|) in Mm (rung 2)
         self.augment_rotation = augment_rotation  # rung 4 (D-7): one random rotation about z per sample (training only)
         self.rot_pairs = [tuple(p) for p in rot_pairs]   # (x, y) feature-column pairs rotated as vectors, e.g. (vx, vy)
 
@@ -38,28 +46,13 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.targets = torch.tensor(np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_Y], axis=1), dtype=torch.float32)
 
         self.nz, self.ny, self.nx = list_X[0].shape[:-1]
+        self.zz = np.asarray(z_levels, dtype=np.float64)
+        assert len(self.zz) == self.nz, (len(self.zz), self.nz)
+        self.pixel = float(pixel_Mm)
 
-        grid_pos = np.load(pos_file)
-        self.xx, self.yy, self.zz = grid_pos['x'], grid_pos['y'], grid_pos['z']
-        nz_original = len(self.zz)
-
-        new_z_indices = np.concatenate([
-            np.linspace(0, nz_original*logspace_fraction, nz_linear, endpoint=False),
-            np.logspace(np.log10(nz_original*logspace_fraction), np.log10(nz_original-1), nz_log)
-        ])
-        new_z_indices = np.clip(new_z_indices, 0, nz_original - 1)
-        self.zz = np.interp(new_z_indices, np.arange(nz_original), self.zz)
-
-        # Create the physical coordinates grid (x, y, z)
-        xgrid, ygrid, zgrid = np.meshgrid(self.xx, self.yy, self.zz, indexing='xy')
-        # We need to transpose to match the (z, y, x) structure of the data cubes
-        xgrid, ygrid, zgrid = xgrid.T, ygrid.T, zgrid.T
+        # Physical coordinates (x, y, z) [Mm] of every node, in the (z, y, x) flattening of the cubes
+        zgrid, ygrid, xgrid = np.meshgrid(self.zz, np.arange(self.ny) * self.pixel, np.arange(self.nx) * self.pixel, indexing='ij')
         self.grid_pos = torch.tensor(np.stack([xgrid.ravel(), ygrid.ravel(), zgrid.ravel()], axis=1), dtype=torch.float32)
-
-        # If fully connected, create the transform here
-        if self.fully_connected:
-            print("Warning: Fully connected graphs can be very large and may lead to memory issues.")
-            self.radius_transform = RadiusGraph(r=self.radius, loop=False, num_workers=4)
 
         valid_ix = np.arange(xdim * self.max_stride, self.nx - xdim * self.max_stride)
         valid_iy = np.arange(ydim * self.max_stride, self.ny - ydim * self.max_stride)
@@ -101,8 +94,10 @@ class EfficientDataset(torch.utils.data.Dataset):
         print(f'Dataset.py:  Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
         print(f'Dataset.py:  Region: x ∈ [{self.x0}, {self.x1}), y ∈ [{self.y0}, {self.y1})')
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
-        print(f'Dataset.py:  Using max stride: {self.max_stride}, Random stride: {self.random_stride}, Split stride: {self.split_stride}')
-        print(f'Dataset.py:  z_pos feature: {self.use_zpos}, edge features: {self.edge_features}, rotation augmentation: {self.augment_rotation}')
+        print(f'Dataset.py:  Using max stride: {self.max_stride}, Random stride: {self.random_stride}, Split stride: {self.split_stride}, '
+              f'rotation augmentation: {self.augment_rotation}')
+        print(f'Dataset.py:  Edge rule: {self.edge_rule} ' + (f'(radius {self.radius} index units)' if self.edge_rule == 'index' else
+              f'(stencil radius {self.stencil_radius}, vertical reach {self.edge_reach} Mm)') + f', edges per graph: {self.templates[(self.max_stride, self.max_stride)]["edge_index"].shape[1]}')
 
     def _precompute_graph_templates(self):
         """
@@ -111,35 +106,49 @@ class EfficientDataset(torch.utils.data.Dataset):
         """
         self.templates = {}
         k_range = np.arange(self.nz)
-        
+
         for xs in range(1, self.max_stride + 1):
             for ys in range(1, self.max_stride + 1):
                 x_offs = np.arange(-self.xdim, self.xdim + 1) * xs
                 y_offs = np.arange(-self.ydim, self.ydim + 1) * ys
-                
+
                 kv, yv, xv = np.meshgrid(k_range, y_offs, x_offs, indexing='ij')
-                
+
                 # Precompute the relative flatten offset for 1D slicing
                 relative_flat = kv.ravel() * self.ny * self.nx + yv.ravel() * self.nx + xv.ravel()
-                
+
                 # Mock indices to calculate fixed graph topology
                 node_pos_mock = torch.tensor(np.stack([kv.ravel(), yv.ravel(), xv.ravel()], axis=1), dtype=torch.float32)
-                
+
                 central_mask = (yv.ravel() == 0) & (xv.ravel() == 0)
-                
-                if not self.fully_connected:
+
+                if self.edge_rule == 'index':
+                    # edges within radius_neighbors * (xs + ys) / 3 in index units (level, pixel, pixel), star topology
                     r_eff = self.radius * (xs + ys) / 3
                     dist_matrix = torch.cdist(node_pos_mock, node_pos_mock)
                     edge_indices_tuple = torch.where((dist_matrix > 0) & (dist_matrix <= r_eff))
                     edge_index = torch.stack(edge_indices_tuple, dim=0)
-                    
+
                     central_nodes = torch.where(torch.tensor(central_mask))[0]
-                    if len(central_nodes) > 0:
-                        edge_mask = torch.isin(edge_index[0], central_nodes) | torch.isin(edge_index[1], central_nodes)
-                        edge_index = edge_index[:, edge_mask]
+                    edge_mask = torch.isin(edge_index[0], central_nodes) | torch.isin(edge_index[1], central_nodes)
+                    edge_index = edge_index[:, edge_mask]
+                elif self.edge_rule == 'physical':
+                    # columns within stencil_radius stencil units; levels within edge_reach Mm, or adjacent in the central column
+                    kk = kv.ravel()
+                    disc = np.sqrt((xv.ravel() / xs) ** 2 + (yv.ravel() / ys) ** 2) <= self.stencil_radius
+                    central_idx = np.where(central_mask)[0]
+                    dz = np.abs(self.zz[kk][:, None] - self.zz[kk[central_idx]][None, :])                  # (N, nz)
+                    adjacent = central_mask[:, None] & (np.abs(kk[:, None] - kk[central_idx][None, :]) == 1)
+                    ok = disc[:, None] & ((dz <= self.edge_reach) | adjacent)
+                    ok[central_idx, np.arange(len(central_idx))] = False                                   # no self loops
+                    src, dst = np.nonzero(ok)                                                             # n -> c
+                    e1 = np.stack([src, central_idx[dst]])
+                    nc = ~central_mask[src]                                                               # c -> n, n not central
+                    e2 = np.stack([central_idx[dst[nc]], src[nc]])
+                    edge_index = torch.tensor(np.concatenate([e1, e2], axis=1), dtype=torch.long)
                 else:
-                    edge_index = None # Will be handled by RadiusGraph on the fly
-                    
+                    raise ValueError(f"unknown edge_rule '{self.edge_rule}'")
+
                 self.templates[(xs, ys)] = {
                     'relative_flat': torch.tensor(relative_flat, dtype=torch.long),
                     'edge_index': edge_index,
@@ -169,7 +178,7 @@ class EfficientDataset(torch.utils.data.Dataset):
 
         # Fetch the precomputed topology template
         template = self.templates[(x_stride, y_stride)]
-        
+
         # Shift the precomputed flattened indices to the target absolute center
         center_flat = iy * self.nx + ix
         flat_indices = template['relative_flat'] + center_flat
@@ -189,32 +198,19 @@ class EfficientDataset(torch.utils.data.Dataset):
                     node_features[:, i], node_features[:, j] = vy, -vx
 
         sub_physical_pos = self.grid_pos[flat_indices]
-        if self.use_zpos:
-            z_coords = sub_physical_pos[:, 2].unsqueeze(1)
-            node_features = torch.cat([node_features, z_coords], dim=1)
 
-        if self.fully_connected:
-            node_pos_abs = template['relative_pos'] + torch.tensor([0.0, float(iy), float(ix)])
-            data = Data(x=node_features, pos=node_pos_abs, y=node_targets)
-            graph_data = self.radius_transform(data)
-        else:
-            edge_index = template['edge_index']
-            if edge_index.numel() > 0:
-                row, col = edge_index
-                edge_vectors = sub_physical_pos[row] - sub_physical_pos[col]
-                if self.edge_features == 'rel3':   # signed dz (source minus target), horizontal distance, |dr|; all in Mm
-                    edge_attr = torch.stack([edge_vectors[:, 2], edge_vectors[:, :2].norm(dim=1), edge_vectors.norm(dim=1)], dim=1)
-                else:
-                    edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
-            else:
-                edge_attr = torch.empty((0, 3 if self.edge_features == 'rel3' else 1), dtype=torch.float32)
+        edge_index = template['edge_index']
+        row, col = edge_index
+        edge_vectors = sub_physical_pos[row] - sub_physical_pos[col]
+        # signed dz (source minus target), horizontal distance, |dr|; all in Mm
+        edge_attr = torch.stack([edge_vectors[:, 2], edge_vectors[:, :2].norm(dim=1), edge_vectors.norm(dim=1)], dim=1)
 
-            graph_data = Data(
-                x=node_features, 
-                edge_index=edge_index, 
-                edge_attr=edge_attr, 
-                y=node_targets
-            )
+        graph_data = Data(
+            x=node_features,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=node_targets
+        )
 
         graph_data.central_mask = template['central_mask']
         graph_data.u = self.static_u

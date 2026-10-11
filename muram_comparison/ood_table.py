@@ -17,12 +17,13 @@ from scipy.interpolate import interpn
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path[:0] = [REPO, HERE]
-from normalization import normalize_features_with_params     # noqa: E402
+from normalization import normalize_features     # noqa: E402
+from vertical_grids import training_grid        # noqa: E402
 import muram_common as mc                                     # noqa: E402
 
-FILE_OF = {'vel': 'AR_385_veloc.dat', 'b': 'AR_385_B.dat', 'temp': 'AR_385_temp.dat', 'n_e': 'AR_385_ne.dat',
+FILE_OF = {'vel': 'AR_385_veloc.dat', 'temp': 'AR_385_temp.dat', 'n_e': 'AR_385_ne.dat',
            'rho': 'AR_385_mass.dat', 'press': 'AR_385_press.dat', 'n_h': 'AR_385_nh.dat', 'n_p': 'AR_385_np.dat'}
-NCOMP = {'vel': 3, 'b': 3}
+NCOMP = {'vel': 3}
 BANDS = [(-np.inf, 0.0, 'z<0'), (0.0, 0.5, '0-0.5'), (0.5, 1.0, '0.5-1'), (1.0, 1.5, '1-1.5'),
          (1.5, 2.2, '1.5-2.2'), (2.2, 3.5, '2.2-3.5'), (3.5, np.inf, '>3.5')]
 
@@ -35,7 +36,6 @@ meta = json.load(open(os.path.join(results_dir, 'meta.json')))
 checkpoint = torch.load(meta['checkpoint'], map_location='cpu', weights_only=False)
 config = checkpoint['config']
 labels = meta['features_labels']
-ntype = config['normalization'].get('features', config['normalization'].get('type', 'log'))   # the FEATURE normalization ('v2' from rung 2)
 fnp = checkpoint['feature_norm_params']
 grid = np.load(os.path.join(results_dir, meta['files']['grid']))
 new_z_m, z_rel = grid['muram_fractional_index'], grid['z_rel_tau1_Mm']
@@ -46,11 +46,11 @@ comp_names = [f'{l}{c}' for l in labels for c in (['x', 'y', 'z'] if NCOMP.get(l
 # ---- Bifrost percentiles per level in normalized space (subsampled columns) ----
 datadir = os.path.normpath(os.path.join(REPO, config['data']['datadir'])) if not os.path.isabs(config['data']['datadir']) else config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
-_, _, new_z_b = mc.bifrost_training_grid(config)
+_, new_z_b, _ = training_grid(config, np.load(config['data']['grid_file'])['z'])
 pts = tuple(np.meshgrid(new_z_b, np.arange(0, ny, bifrost_step), np.arange(0, nx, bifrost_step), indexing='ij', sparse=True))
 feats_b = [interpn((np.arange(nz), np.arange(ny), np.arange(nx)),
                    np.memmap(os.path.join(datadir, FILE_OF[l]), dtype='<f4', mode='r', shape=(nz, ny, nx, NCOMP.get(l, 1))), pts) for l in labels]
-norm_b = np.concatenate(normalize_features_with_params(feats_b, labels, fnp, ntype), axis=-1)      # (nz_new, ny/s, nx/s, ncomp)
+norm_b = np.concatenate(normalize_features(feats_b, labels, fnp)[0], axis=-1)      # (nz_new, ny/s, nx/s, ncomp)
 lo = np.percentile(norm_b, plo, axis=(1, 2))                                                   # (nz_new, ncomp)
 hi = np.percentile(norm_b, phi, axis=(1, 2))
 
@@ -59,7 +59,7 @@ cube = mc.load_snap()
 fields = mc.muram_si_on_levels(cube, new_z_m, labels)
 ny_m, nx_m = np.load(os.path.join(results_dir, meta['files']['rho'])).shape[1:]
 feats_m = [fields[l][:, py:py + dec * ny_m:dec, px:px + dec * nx_m:dec] for l in labels]     # the predicted native columns
-norm_m = np.concatenate(normalize_features_with_params(feats_m, labels, fnp, ntype), axis=-1)      # (nz_new, ny_m, nx_m, ncomp)
+norm_m = np.concatenate(normalize_features(feats_m, labels, fnp)[0], axis=-1)      # (nz_new, ny_m, nx_m, ncomp)
 outside = (norm_m < lo[:, None, None, :]) | (norm_m > hi[:, None, None, :])
 frac = outside.mean(axis=(1, 2))                                                                    # (nz_new, ncomp)
 flag = outside.any(axis=-1)

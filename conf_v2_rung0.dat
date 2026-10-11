@@ -1,4 +1,6 @@
 # conf.dat
+# HISTORICAL CONFIG of rung 0 (per-height normalization, 11 inputs, SmoothL1): its representation was removed from the code after commit 4b1ebbf;
+# check out that commit to re-run or re-score it.
 
 # ===================================================================
 # Rung 0 of the v2 ladder: the deployed configuration on data_train_v2 (plan WP5)
