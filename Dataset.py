@@ -11,6 +11,11 @@ class EfficientDataset(torch.utils.data.Dataset):
                  logspace_fraction: float = 0.4, nz_linear: int = 30, nz_log: int = 25, epoch_size_fraction: float = 0.2,
                  max_stride: int = 1,
                  random_stride: bool = False,
+                 split_stride: int = None,
+                 use_zpos: bool = True,
+                 edge_features: str = 'dist',
+                 augment_rotation: bool = False,
+                 rot_pairs=((0, 1),),
                  seed: int = 777,
                  device: str = 'cpu'):
         super(EfficientDataset, self).__init__()
@@ -23,6 +28,10 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.fully_connected = fully_connected
         self.max_stride = max_stride
         self.random_stride = random_stride
+        self.use_zpos = use_zpos                  # rung 2 (D-4): False = no raw height feature on the nodes
+        self.edge_features = edge_features        # 'dist' = |dr| (original) | 'rel3' = (dz, d_h, |dr|) in Mm (rung 2)
+        self.augment_rotation = augment_rotation  # rung 4 (D-7): one random rotation about z per sample (training only)
+        self.rot_pairs = [tuple(p) for p in rot_pairs]   # (x, y) feature-column pairs rotated as vectors, e.g. (vx, vy)
 
         # Convert everything directly to PyTorch tensors to avoid runtime conversions
         self.features = torch.tensor(np.concatenate([arr.reshape(-1, arr.shape[-1]) for arr in list_X], axis=1), dtype=torch.float32)
@@ -60,24 +69,29 @@ class EfficientDataset(torch.utils.data.Dataset):
         np.random.seed(seed)
         np.random.shuffle(all_indices)
 
-        # split into train and test
-        x_threshold = int((self.nx - (xdim * self.max_stride)) * train_ratio) + (xdim * self.max_stride)
-        y_threshold = int((self.ny - (ydim * self.max_stride)) * train_ratio) + (ydim * self.max_stride)
+        # split into train and test. The region boundaries depend on the stride; split_stride (default:
+        # max_stride) lets inference at another stride reuse the region of the training run.
+        self.split_stride = split_stride or self.max_stride
+        ss = self.split_stride
+        x_threshold = int((self.nx - (xdim * ss)) * train_ratio) + (xdim * ss)
+        y_threshold = int((self.ny - (ydim * ss)) * train_ratio) + (ydim * ss)
 
         if split == 'test':
             self.x0, self.y0 = x_threshold, y_threshold
-            self.x1, self.y1 = self.nx - xdim * self.max_stride, self.ny - ydim * self.max_stride
-            self.sample_centers = [(x, y) for x, y in all_indices if x >= x_threshold and y >= y_threshold]
+            self.x1, self.y1 = self.nx - xdim * ss, self.ny - ydim * ss
+            self.sample_centers = [(x, y) for x, y in all_indices
+                                   if self.x0 <= x < self.x1 and self.y0 <= y < self.y1]
         elif split == 'train':
-            self.x0, self.y0 = xdim * self.max_stride, ydim * self.max_stride
+            self.x0, self.y0 = xdim * ss, ydim * ss
             self.x1, self.y1 = x_threshold, y_threshold
             self.sample_centers = [(x, y) for x, y in all_indices if x < x_threshold or y < y_threshold]
         elif split == 'full':
-            self.x0, self.y0 = xdim * self.max_stride, ydim * self.max_stride
-            self.x1, self.y1 = self.nx - xdim * self.max_stride, self.ny - ydim * self.max_stride
-            self.sample_centers = [(x, y) for x, y in all_indices]
+            self.x0, self.y0 = xdim * ss, ydim * ss
+            self.x1, self.y1 = self.nx - xdim * ss, self.ny - ydim * ss
+            self.sample_centers = [(x, y) for x, y in all_indices
+                                   if self.x0 <= x < self.x1 and self.y0 <= y < self.y1]
         else:
-            raise ValueError("split must be 'train' or 'test'")
+            raise ValueError("split must be 'train', 'test' or 'full'")
 
         # PRE-ALLOCATIONS to save CPU cycles
         self.static_u = torch.zeros((1, 1), dtype=torch.float32)
@@ -87,7 +101,8 @@ class EfficientDataset(torch.utils.data.Dataset):
         print(f'Dataset.py:  Features shape: {self.features.shape}, Targets shape: {self.targets.shape}')
         print(f'Dataset.py:  Region: x ∈ [{self.x0}, {self.x1}), y ∈ [{self.y0}, {self.y1})')
         print(f'Dataset.py:  Split ratio: {len(self.sample_centers) / len(all_indices) * 100:.2f}% of all valid samples')
-        print(f'Dataset.py:  Using max stride: {self.max_stride}, Random stride: {self.random_stride}')
+        print(f'Dataset.py:  Using max stride: {self.max_stride}, Random stride: {self.random_stride}, Split stride: {self.split_stride}')
+        print(f'Dataset.py:  z_pos feature: {self.use_zpos}, edge features: {self.edge_features}, rotation augmentation: {self.augment_rotation}')
 
     def _precompute_graph_templates(self):
         """
@@ -146,6 +161,12 @@ class EfficientDataset(torch.utils.data.Dataset):
             x_stride = self.max_stride
             y_stride = self.max_stride
 
+        # Rotation of the whole volume about z by rot * 90 deg (rung 4, D-7): the rotated stencil of strides (xs, ys)
+        # is the (ys, xs) stencil of the original volume for 90/270 deg; (vx, vy) rotate below, nothing else changes
+        rot = np.random.randint(4) if self.augment_rotation else 0
+        if rot in (1, 3):
+            x_stride, y_stride = y_stride, x_stride
+
         # Fetch the precomputed topology template
         template = self.templates[(x_stride, y_stride)]
         
@@ -157,9 +178,20 @@ class EfficientDataset(torch.utils.data.Dataset):
         node_features = self.features[flat_indices]
         node_targets = self.targets[flat_indices]
 
+        if rot:                                # 90 deg: (vx, vy) -> (-vy, vx); 180: (-vx, -vy); 270: (vy, -vx)
+            for i, j in self.rot_pairs:
+                vx, vy = node_features[:, i].clone(), node_features[:, j].clone()
+                if rot == 1:
+                    node_features[:, i], node_features[:, j] = -vy, vx
+                elif rot == 2:
+                    node_features[:, i], node_features[:, j] = -vx, -vy
+                else:
+                    node_features[:, i], node_features[:, j] = vy, -vx
+
         sub_physical_pos = self.grid_pos[flat_indices]
-        z_coords = sub_physical_pos[:, 2].unsqueeze(1)
-        node_features = torch.cat([node_features, z_coords], dim=1)
+        if self.use_zpos:
+            z_coords = sub_physical_pos[:, 2].unsqueeze(1)
+            node_features = torch.cat([node_features, z_coords], dim=1)
 
         if self.fully_connected:
             node_pos_abs = template['relative_pos'] + torch.tensor([0.0, float(iy), float(ix)])
@@ -170,9 +202,12 @@ class EfficientDataset(torch.utils.data.Dataset):
             if edge_index.numel() > 0:
                 row, col = edge_index
                 edge_vectors = sub_physical_pos[row] - sub_physical_pos[col]
-                edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
+                if self.edge_features == 'rel3':   # signed dz (source minus target), horizontal distance, |dr|; all in Mm
+                    edge_attr = torch.stack([edge_vectors[:, 2], edge_vectors[:, :2].norm(dim=1), edge_vectors.norm(dim=1)], dim=1)
+                else:
+                    edge_attr = edge_vectors.norm(dim=1).unsqueeze(1)
             else:
-                edge_attr = torch.empty((0, 1), dtype=torch.float32)
+                edge_attr = torch.empty((0, 3 if self.edge_features == 'rel3' else 1), dtype=torch.float32)
 
             graph_data = Data(
                 x=node_features, 

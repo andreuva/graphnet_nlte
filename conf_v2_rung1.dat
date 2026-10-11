@@ -1,0 +1,88 @@
+# conf.dat
+
+# ===================================================================
+# Rung 1 of the v2 ladder: rung 0 + optimizer/schedule/EMA/sampling recipe (plan D-8)
+# This file is the single source of truth for all parameters.
+# ===================================================================
+
+[system]
+gpu = 0
+seed = 777
+# fraction of the GPU memory the training may use (shared GPU); comment out for an exclusive GPU
+gpu_memory_fraction = 0.55
+
+[data]
+datadir = '../data_train_v2'
+grid_file = '../en024048_hion/grid_bifrost.npz'
+nx = 504
+ny = 504
+# Original nz after slicing (476 - 52 + 1)
+nz_orig = 425
+nlev = 6
+# input quantities (file map in gnn_train.py); the deployed model used rho and pressure
+features = 'vel', 'b', 'temp', 'n_e', 'rho', 'press'
+
+[dataset]
+# Z-axis interpolation settings
+nz_linear = 30
+nz_log = 20
+logspace_fraction = 0.33
+# interpolate scalars and populations in log10 to the training grid (WP4.3; the old runs interpolated linearly)
+interp_log = True
+# Graph construction settings (in grid points)
+radius_neighbors = 6.01
+x_range_graph = 4
+y_range_graph = 4
+max_stride = 4
+random_stride = True
+fully_connected = False
+# Data split for train/test
+train_ratio = 0.7
+
+[training]
+lr = 1e-3
+batch_size = 8
+epoch_size_fraction = 0.2
+n_epochs = 15
+savedir = 'checkpoints/v2_rung1_recipe_seed777/'
+load_checkpoint = False
+# Smoothed loss factor
+smooth = 0.01
+# D-2 validation: held-out corner at the training stride, outside this guard band (px); fraction of it to use
+valid_guard = 32
+valid_subset = 1.0
+num_workers = 8
+# rung-1 recipe (D-8): AdamW with decoupled weight decay on the weight matrices, linear warmup (1 epoch) + cosine to zero
+# stepped per batch, gradient clipping, EMA of the weights (ramped), fresh random training subset every epoch
+optimizer = 'adamw'
+weight_decay = 0.01
+adam_betas = 0.9, 0.95
+adam_eps = 1e-6
+schedule = 'warmup_cosine'
+warmup_epochs = 1
+grad_clip = 1.0
+ema_decay = 0.9998
+fresh_subset = True
+# Scheduler milestones for learning rate reduction
+milestones = 15, 30, 60, 120
+# Scheduler reduction factor
+gamma = 0.5
+
+[model]
+# Input size is 10 physical features + 1 z-position feature
+node_input_size = 11
+edge_input_size = 1
+global_input_size = 1
+latent_size = 128
+mlp_hidden_size = 64
+mlp_n_hidden_layers = 3
+dropout=0.25
+n_message_passing_steps = 8
+# Output size is 6 CaII levels
+output_size = 6
+
+[normalization]
+# For population normalization
+type = 'log'
+factor = -4.5
+log_offset = 1e-12

@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch_geometric.nn import MetaLayer
 from torch_geometric.data import Data
 from torch_scatter import scatter_mean
+import torch.nn.init as init
 
 
 def kaiming_init(m):
@@ -78,12 +79,14 @@ class MLP(nn.Module):
 
         if (activation == 'relu'):
             self.activation = nn.ReLU()
-        if (activation == 'leakyrelu'):
+        elif (activation == 'leakyrelu'):
             self.activation = nn.LeakyReLU()
-        if (activation == 'elu'):
+        elif (activation == 'elu'):
             self.activation = nn.ELU()
-        if (activation == 'gelu'):
+        elif (activation == 'gelu'):
             self.activation = nn.GELU()
+        else:
+            raise ValueError(f"Unknown activation '{activation}'; use 'relu', 'leakyrelu', 'elu' or 'gelu'")
 
         self.layers = nn.ModuleList([])
 
@@ -226,7 +229,7 @@ class EncodeProcessDecode(nn.Module):
     def __init__(self, node_input_size, edge_input_size, global_input_size, 
                  latent_size, mlp_hidden_size, mlp_n_hidden_layers,
                  n_message_passing_steps,output_size,
-                 dropout=None):
+                 dropout=None, head='linear', head_log_offset=1e-12):
         """
         Encode-Process-Decode Network (https://arxiv.org/abs/2010.03409)
 
@@ -248,6 +251,10 @@ class EncodeProcessDecode(nn.Module):
             Number of message passing steps
         output_size : int
             Output size of the decode node representations
+        head : str, optional
+            'linear' (default) or 'log_softmax' (plan rung 3, D-5): the decoded outputs are turned into
+            log10(softmax + head_log_offset), i.e. log10 level fractions that sum exactly to one, in the
+            representation of normalization.normalize_pops_logf (same log_offset).
         """
         super(EncodeProcessDecode, self).__init__()
 
@@ -260,6 +267,10 @@ class EncodeProcessDecode(nn.Module):
         self.n_message_passing_steps = n_message_passing_steps
         self.output_size = output_size
         self.dropout = dropout
+        self.head = head
+        self.head_log_offset = head_log_offset
+        if head not in ('linear', 'log_softmax'):
+            raise ValueError(f"Unknown head '{head}'; use 'linear' or 'log_softmax'")
 
         # ---------------------
         # ENCODER
@@ -332,6 +343,8 @@ class EncodeProcessDecode(nn.Module):
 
     def decode(self, node):
         node_out = self.decoder_network(node)
+        if self.head == 'log_softmax':
+            node_out = torch.log10(torch.softmax(node_out, dim=-1) + self.head_log_offset)
 
         return node_out
 

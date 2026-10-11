@@ -91,7 +91,7 @@ def main():
     print(f"MURaM original shape: nz={nz}, nx={nx}, ny={ny}")
 
     # Build height grid: dz = 20 km = 0.02 Mm
-    dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
+    dz, dx, dy = (np.asarray(cube.Temp.dX) / 1e5) / 1e3   # Mm, from Header.499000
     z_geom = np.arange(nz) * dz
     
     print("   Loading full tau cube to locate tau=1 layer...")
@@ -135,7 +135,7 @@ def main():
     mean_V_muram_si  = mean_V_muram / 100.0
 
     # Magnetic field: Gauss -> Tesla (factor of (4*pi)/10000.0 used in repo)
-    scale_B = (4.0 * np.pi) / 10000.0
+    scale_B = np.sqrt(4.0 * np.pi) / 10000.0   # MURaM stores B/sqrt(4 pi) in G (audit M4)
     mean_Bx_muram_si = mean_Bx_muram * scale_B
     mean_By_muram_si = mean_By_muram * scale_B
     mean_Bz_muram_si = mean_Bz_muram * scale_B

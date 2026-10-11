@@ -7,6 +7,13 @@ to ensure consistency across training and inference scripts.
 
 import numpy as np
 
+# Total Ca number density per unit mass density in the training targets: the sum over the six levels of
+# data_train/AR_385_CaII_5L_pops.dat [cm^-3] divided by AR_385_mass.dat [kg m^-3] is 9.65e14 at every node
+# (relative scatter 2e-7), i.e. the targets assume one fixed Ca abundance. Absolute populations for ANY
+# atmosphere follow from predicted fractions as n_total [cm^-3] = CA_TOTAL_PER_RHO * rho [kg m^-3]
+# (plan WP2 step 2.2; replaces stretching Bifrost's totals onto another simulation).
+CA_TOTAL_PER_RHO = 9.65e14
+
 # ===================================================================
 # ORIGINAL 'POW' NORMALIZATION
 # ===================================================================
@@ -118,6 +125,39 @@ def denormalize_pops_log(normalized_pops, norm_params):
     reconstructed_pops = reconstructed_fractional_pops * \
         (total_pops_all[:, :, :, np.newaxis] + log_offset)
         # (total_pops_all[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
+
+    return reconstructed_pops
+
+# ===================================================================
+# 'LOGF' TARGETS (plan rung 3, D-5): log10 of the level fractions, no per-height means
+# ===================================================================
+def normalize_pops_logf(pops, factor=1., log_offset=1e-12):
+    """
+    normalized = log10(f + log_offset) with f = n / sum_levels(n): the representation produced by the 'log_softmax'
+    head of graphnet.py (sum of the fractions exactly 1). factor must be 1 so that dex = |factor| * |d normalized|
+    keeps holding everywhere; 'means' (per-height mean fractions) are kept for the climatology baseline.
+    """
+    assert factor == 1.0, "normalize_pops_logf: set [normalization] factor = 1.0 for 'logf' targets"
+    total_pops_all = np.sum(pops, axis=3)
+    fractional_pops = pops / (total_pops_all[:, :, :, np.newaxis] + log_offset)
+    normalized_pops = np.log10(fractional_pops + log_offset)
+
+    norm_params = {
+        'means': np.mean(fractional_pops, axis=(1, 2)),
+        'totals': total_pops_all,
+        'factor': factor,
+        'log_offset': log_offset
+    }
+
+    return normalized_pops, norm_params
+
+def denormalize_pops_logf(normalized_pops, norm_params):
+    total_pops_all = norm_params['totals']
+    log_offset = norm_params['log_offset']
+
+    reconstructed_fractional_pops = np.maximum(10**normalized_pops - log_offset, 0.0)
+    reconstructed_pops = reconstructed_fractional_pops * \
+        (total_pops_all[:, :, :, np.newaxis] + log_offset)
 
     return reconstructed_pops
 
@@ -323,6 +363,43 @@ def denormalize_features_log(normalized_features, labels, norm_params):
     return denormalized
 
 # ===================================================================
+# V2 FEATURES (plan rung 2, D-4): code-independent inputs
+# ===================================================================
+def normalize_features_v2(features, labels, norm_params=None, clip=5.0, vel_scale=1e4):
+    """
+    log10 of every scalar (temp, n_e, rho, press, n_h, n_p) standardized by ONE global mean/std of the whole array
+    (no per-height statistics) and clipped at +-clip sigma; velocities divided by vel_scale (10 km/s); B is not
+    accepted (dropped in D-4). With norm_params the statistics saved by the training run are applied (inference).
+
+    Returns:
+        normalized: List of normalized feature arrays
+        norm_params: {'version': 2, 'means', 'stds', 'clip', 'vel_scale'} (means/stds of the log10 scalars)
+    """
+    fit = norm_params is None
+    if fit:
+        norm_params = {'version': 2, 'means': [], 'stds': [], 'clip': clip, 'vel_scale': vel_scale}
+
+    normalized = []
+    for i, (feature, label) in enumerate(zip(features, labels)):
+        if feature.ndim == 3:
+            feature = feature[:, :, :, np.newaxis]
+        if label == 'b':
+            raise ValueError("normalize_features_v2: B is not an input of the v2 representation (plan D-4)")
+        if 'vel' in label:
+            mean, std = 0.0, norm_params['vel_scale']
+            normed = feature / std
+        else:
+            logf = np.log10(feature)
+            mean, std = (float(logf.mean()), float(logf.std())) if fit else (norm_params['means'][i], norm_params['stds'][i])
+            normed = np.clip((logf - mean) / std, -norm_params['clip'], norm_params['clip'])
+        if fit:
+            norm_params['means'].append(mean)
+            norm_params['stds'].append(std)
+        normalized.append(normed)
+
+    return normalized, norm_params
+
+# ===================================================================
 # UNIFIED INTERFACE
 # ===================================================================
 def normalize_features(features, labels, log_offset=1e-12, type='log'):
@@ -331,8 +408,10 @@ def normalize_features(features, labels, log_offset=1e-12, type='log'):
         return normalize_features_log(features, labels, log_offset)
     elif type == 'pow':
         return normalize_features_pow(features, labels, log_offset)
+    elif type == 'v2':
+        return normalize_features_v2(features, labels)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log' 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow' or 'v2'.")
 
 def denormalize_features(normalized_features, labels, norm_params, type='log'):
     print(f"Denomalaizing features with {type}")
@@ -435,8 +514,10 @@ def normalize_features_with_params(features, labels, norm_params, type='log'):
         return normalize_features_log_with_params(features, labels, norm_params)
     elif type == 'pow':
         return normalize_features_pow_with_params(features, labels, norm_params)
+    elif type == 'v2':
+        return normalize_features_v2(features, labels, norm_params)[0]
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow' or 'v2'.")
 
 def normalize_pops(pops, factor=4., log_offset=1e-12, type='log'):
     print(f"Nomalaizing populations with {type}")
@@ -444,8 +525,10 @@ def normalize_pops(pops, factor=4., log_offset=1e-12, type='log'):
         return normalize_pops_log(pops, factor, log_offset)
     elif type == 'pow':
         return normalize_pops_pow(pops, factor, log_offset)
+    elif type == 'logf':
+        return normalize_pops_logf(pops, factor, log_offset)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow' or 'logf'.")
 
 def denormalize_pops(normalized_pops, norm_params, type='log'):
     print(f"Denomalaizing populations with {type}")
@@ -453,5 +536,7 @@ def denormalize_pops(normalized_pops, norm_params, type='log'):
         return denormalize_pops_log(normalized_pops, norm_params)
     elif type == 'pow':
         return denormalize_pops_pow(normalized_pops, norm_params)
+    elif type == 'logf':
+        return denormalize_pops_logf(normalized_pops, norm_params)
     else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
+        raise ValueError("Normalization type not implemented. Choose 'log', 'pow' or 'logf'.")

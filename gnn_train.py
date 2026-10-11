@@ -10,18 +10,25 @@ from configobj import ConfigObj
 from Dataset import *
 from normalization import normalize_pops, denormalize_pops, normalize_features, denormalize_features
 import matplotlib.pyplot as plt
-import os, time, shutil
+import os, time, shutil, sys, csv, hashlib
 from datetime import datetime
 from scipy.interpolate import interpn
 from glob import glob
 import multiprocessing
+from provenance import git_state
 
 # Use unrepr=True to automatically convert strings to int, float, lists, etc.
-config = ConfigObj('conf.dat', unrepr=True)
+conf_path = sys.argv[1] if len(sys.argv) > 1 else 'conf.dat'          # python gnn_train.py [conf.dat]
+config = ConfigObj(conf_path, unrepr=True)
 
 gpu = config['system']['gpu']
 cuda_available = torch.cuda.is_available()
 device = torch.device(f"cuda:{gpu}" if cuda_available else "cpu")
+torch.manual_seed(config['system']['seed'])
+np.random.seed(config['system']['seed'])
+if cuda_available and config['system'].get('gpu_memory_fraction'):
+    # cap the caching allocator so that inference jobs can share the GPU (with graphs of varying size it otherwise grows to the whole card)
+    torch.cuda.set_per_process_memory_fraction(float(config['system']['gpu_memory_fraction']), device)
 print(f"CUDA available: {cuda_available}")
 print(f"Using device: {device}\n")
 
@@ -32,6 +39,20 @@ savedir = config['training']['savedir']
 load_checkpoint = config['training']['load_checkpoint']
 smooth = config['training']['smooth']
 time_format = "%Y.%m.%d-%H:%M:%S"
+valid_guard = config['training'].get('valid_guard', 32)          # D-2: held-out columns this far from the training region
+valid_subset = config['training'].get('valid_subset', 1.0)
+# ---- rung-1 recipe (plan D-8; code pattern from master's Formal.py, values to be re-tuned on this problem); defaults = rung 0 ----
+optimizer_name = config['training'].get('optimizer', 'adam')            # 'adam' | 'adamw'
+weight_decay = config['training'].get('weight_decay', 0.0)
+adam_betas = tuple(config['training'].get('adam_betas', (0.9, 0.999)))
+adam_eps = config['training'].get('adam_eps', 1e-8)
+schedule = config['training'].get('schedule', 'multistep')              # 'multistep' | 'warmup_cosine' (per batch)
+warmup_epochs = config['training'].get('warmup_epochs', 1)
+warmup_start_factor = config['training'].get('warmup_start_factor', 0.01)
+grad_clip = config['training'].get('grad_clip', 0.0)                    # 0 = off
+ema_decay = config['training'].get('ema_decay', 0.0)                    # 0 = off; 0.9998 with the (1+n)/(10+n) ramp
+fresh_subset = config['training'].get('fresh_subset', False)           # a new random subset of the training columns every epoch
+features_labels = list(config['data'].get('features', ['vel', 'b', 'temp', 'n_e', 'rho', 'press']))
 
 datadir = config['data']['datadir']
 grid_file = config['data']['grid_file']
@@ -44,8 +65,31 @@ nz_linear = config['dataset']['nz_linear']
 nz_log = config['dataset']['nz_log']
 new_nz = nz_linear + nz_log
 logspace_fraction = config['dataset']['logspace_fraction']
+interp_log = config['dataset'].get('interp_log', False)                 # WP4.3: interpolate scalars and populations in log10
 log_offset = config['normalization']['log_offset']
 normalization_type = config['normalization'].get('type', 'log')
+# ---- rungs 2-4 of the v2 ladder (plan D-4..D-7); every default reproduces rung 0 ----
+features_type = config['normalization'].get('features', normalization_type)    # rung 2: 'v2' = global log10 standardization, v/10 km/s, no B
+targets_type = config['normalization'].get('targets', normalization_type)      # rung 3: 'logf' = log10(f + log_offset), factor 1
+use_zpos = config['dataset'].get('use_zpos', True)                              # rung 2: False = no raw height feature
+edge_features = config['dataset'].get('edge_features', 'dist')                  # rung 2: 'rel3' = (dz, d_h, |dr|) in Mm
+augment_rotation = config['dataset'].get('augment_rotation', False)            # rung 4: random rotation about z per training sample
+loss_name = config['training'].get('loss', 'smoothl1')                          # rung 3: 'weighted_mse' on log10 f (D-6)
+relevance_threshold = config['training'].get('relevance_threshold', 1e-2)      # w = clip(f_CaII / threshold, 0, 1) per node ...
+coronal_weight = config['training'].get('coronal_weight', 0.1)                  # ... floored at this value (coronal nodes down-weighted, not dropped)
+
+# ---- Code snapshot and git state at start-up, before any data is loaded (WP4.2) ----
+start_stamp = time.strftime(time_format)
+git = git_state(os.path.dirname(os.path.abspath(__file__)))
+if not os.path.exists(savedir):
+    os.makedirs(savedir)
+if not load_checkpoint:
+    print(f"Saving runned code, checkpoint, and config to {savedir}")
+    shutil.copy(f'{__file__}', os.path.join(savedir, f'gnn_train_{start_stamp}.py'))
+    shutil.copy(conf_path, os.path.join(savedir, f'conf_{start_stamp}.dat'))
+    shutil.copy('Dataset.py', os.path.join(savedir, f'Dataset_{start_stamp}.py'))
+    shutil.copy('normalization.py', os.path.join(savedir, f'normalization_{start_stamp}.py'))
+    shutil.copy('graphnet.py', os.path.join(savedir, f'graphnet_{start_stamp}.py'))
 
 # ---- memory–mapped arrays ----
 pops = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
@@ -53,10 +97,15 @@ b_xyz = np.memmap(f'{datadir}/AR_385_B.dat',dtype='<f4',mode='r',shape=(nz, ny, 
 temp = np.memmap(f'{datadir}/AR_385_temp.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 1))
 vel = np.memmap(f'{datadir}/AR_385_veloc.dat',dtype='<f4',mode='r',shape=(nz, ny, nx, 3))
 n_e = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-# n_p = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
-# n_h = np.memmap(f'{datadir}/AR_385_nh.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+if 'n_h' in features_labels:
+    n_p = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
+    n_h = np.memmap(f'{datadir}/AR_385_nh.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 rho = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r',shape=(nz, ny, nx, 1))
 press = np.memmap(f'{datadir}/AR_385_press.dat',dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+for arr in [pops, b_xyz, temp, vel, n_e, rho, press] + ([n_h, n_p] if 'n_h' in features_labels else []):
+    assert os.path.getsize(arr.filename) == arr.size * 4, f'{arr.filename}: file size does not match the declared shape (WP4.2)'
+manifest_path = os.path.join(datadir, 'MANIFEST.json')
+data_manifest_sha256 = hashlib.sha256(open(manifest_path, 'rb').read()).hexdigest() if os.path.exists(manifest_path) else None
 
 print('Populations shape:\t', pops.shape)
 print('Temperature shape:\t', temp.shape)
@@ -79,23 +128,28 @@ new_z = np.clip(new_z_log, 0, nz - 1)
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
-print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
+print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx}); log interpolation: {interp_log}...")
 new_points = (new_zv, new_yv, new_xv)
-pops = interpn((z, y, x), pops, new_points)
-temp = interpn((z, y, x), temp, new_points)
-b_xyz = interpn((z, y, x), b_xyz, new_points)
-vel = interpn((z, y, x), vel, new_points)
-n_e = interpn((z, y, x), n_e, new_points)
-# n_h = interpn((z, y, x), n_h, new_points)
-# n_p = interpn((z, y, x), n_p, new_points)
-rho = interpn((z, y, x), rho, new_points)
-press = interpn((z, y, x), press, new_points)
+def to_grid(a, log=False):           # log10 for the scalars and populations when interp_log (velocities and B stay linear)
+    if log:
+        return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
+    return interpn((z, y, x), a, new_points)
+pops = to_grid(pops, interp_log)
+temp = to_grid(temp, interp_log)
+b_xyz = to_grid(b_xyz) if 'b' in features_labels else None                     # B is dropped from the inputs in rung 2 (D-4)
+vel = to_grid(vel)
+n_e = to_grid(n_e, interp_log)
+if 'n_h' in features_labels:
+    n_h = to_grid(n_h, interp_log)
+    n_p = to_grid(n_p, interp_log)
+rho = to_grid(rho, interp_log)
+press = to_grid(press, interp_log)
 
 print("Interpolation complete.")
 print('\n'+'#'*60)
 print('Populations shape INTERPOLATED:\t', pops.shape)
 print('Temperature shape INTERPOLATED:\t', temp.shape)
-print('Mag, field shape INTERPOLATED:\t', b_xyz.shape)
+print('Mag, field shape INTERPOLATED:\t', None if b_xyz is None else b_xyz.shape)
 print('Velocity shape INTERPOLATED:\t', vel.shape)
 print('N_elec shape INTERPOLATED:\t', n_e.shape)
 # print('N_nh shape INTERPOLATED:\t', n_h.shape)
@@ -106,25 +160,23 @@ print('#'*60+'\n')
 
 model_params = config['model']
 model = EncodeProcessDecode(**model_params).to(device)
+if model_params.get('head', 'linear') == 'log_softmax':   # rung 3: the head's floor is the targets' log_offset
+    assert targets_type == 'logf' and model_params.get('head_log_offset', 1e-12) == log_offset, "the 'log_softmax' head needs 'logf' targets with the same log_offset"
+assert model_params['edge_input_size'] == (3 if edge_features == 'rel3' else 1), (edge_features, model_params['edge_input_size'])
 print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
 # ---- Normalization ----
-features_labels = ['vel', 'b', 'temp', 'n_e',
-                #    'n_h', 'n_p']
-                   'rho', 'press']
-features_data = [vel, b_xyz, temp, n_e,
-                #  n_h,  n_p]
-                 rho, press]
+features_data = [{'vel': vel, 'b': b_xyz, 'temp': temp, 'n_e': n_e, 'rho': rho, 'press': press,
+                  'n_h': n_h if 'n_h' in features_labels else None, 'n_p': n_p if 'n_p' in features_labels else None}[l] for l in features_labels]
 
-normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=normalization_type)
-pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
+normalized_features, feature_norm_params = normalize_features(features_data, features_labels, log_offset, type=features_type)
+pops_normalized, pop_norm_params = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=targets_type)
 
 features_list = normalized_features
 targets_list = [pops_normalized]
-features_labels_expanded = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'n_e', 
-                            # 'n_h', 'n_p',
-                            'rho', 'press',
-                            'z_pos']
+features_labels_expanded = [f'{l}{c}' for l in features_labels for c in (['x', 'y', 'z'] if l in ('vel', 'b') else [''])] + (['z_pos'] if use_zpos else [])
+assert len(features_labels_expanded) == model_params['node_input_size'], (features_labels_expanded, model_params['node_input_size'])
+rot_pairs = [(i, i + 1) for i, l in enumerate(features_labels_expanded) if l in ('velx', 'bx')]   # (x, y) columns rotated as vectors (D-7)
 
 # ---- Create Datasets ----
 dataset_params = {
@@ -143,26 +195,44 @@ dataset_params = {
     'epoch_size_fraction': config['training'].get('epoch_size_fraction', 0.1),
     "max_stride": config["dataset"].get("max_stride", 1),
     "random_stride": config["dataset"].get("random_stride", False),
+    'use_zpos': use_zpos,
+    'edge_features': edge_features,
+    'augment_rotation': augment_rotation,
+    'rot_pairs': rot_pairs,
 }
 
 datast_train = EfficientDataset(**dataset_params, split='train')
-datast_test = EfficientDataset(**dataset_params, split='test')
+# D-2 validation: the held-out corner at the training stride (no random strides, no augmentation), outside the guard band, all its columns
+datast_test = EfficientDataset(**{**dataset_params, 'epoch_size_fraction': 1.0, 'random_stride': False, 'augment_rotation': False}, split='test')
+datast_test.sample_centers = [(ix, iy) for ix, iy in datast_test.sample_centers
+                              if ix >= datast_test.x0 + valid_guard and iy >= datast_test.y0 + valid_guard]
+if valid_subset < 1.0:
+    datast_test.sample_centers = datast_test.sample_centers[:max(1, int(len(datast_test.sample_centers) * valid_subset))]
+print(f"Validation: {len(datast_test.sample_centers)} held-out columns at stride {datast_test.max_stride}, x, y >= {datast_test.x0 + valid_guard} (guard {valid_guard} px)")
 
 # loader_train = DataLoader(datast_train, batch_size=batch_size, shuffle=True)
 # loader_test = DataLoader(datast_test, batch_size=batch_size, shuffle=False)
 
-num_workers = min(12, multiprocessing.cpu_count())
+num_workers = min(config['training'].get('num_workers', 12), multiprocessing.cpu_count())
+if fresh_subset:
+    # a fresh random subset of the training columns every epoch (the old __len__ = f*N with shuffle=True always used the same first f*N columns, T4)
+    n_per_epoch = int(len(datast_train.sample_centers) * datast_train.epoch_size_fraction)
+    datast_train.epoch_size_fraction = 1.0
+    sampler = torch.utils.data.RandomSampler(datast_train, replacement=False, num_samples=n_per_epoch)
+else:
+    sampler = None
 loader_train = DataLoader(
     datast_train, 
     batch_size=batch_size, 
-    shuffle=True, 
+    shuffle=sampler is None,
+    sampler=sampler,
     num_workers=num_workers,
     pin_memory=cuda_available, 
     persistent_workers=True
 )
 loader_test = DataLoader(
     datast_test, 
-    batch_size=batch_size, 
+    batch_size=batch_size * 6, 
     shuffle=False, 
     num_workers=num_workers,
     pin_memory=cuda_available,
@@ -174,30 +244,73 @@ print("Model device:", next(model.parameters()).device)
 print('#'*60+'\n')
 
 # ---- Initialize Optimizer, Scheduler, and Loss ----
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-scheduler = torch.optim.lr_scheduler.MultiStepLR(
-    optimizer,
-    milestones=config['training']['milestones'],
-    gamma=config['training']['gamma']
-)
+if optimizer_name == 'adamw':      # decoupled weight decay on the weight matrices only (master's Formal.py pattern)
+    decay, no_decay = [], []
+    for p_ in model.parameters():
+        if p_.requires_grad:
+            (decay if p_.ndim > 1 else no_decay).append(p_)
+    optimizer = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay}, {'params': no_decay, 'weight_decay': 0.0}],
+                                  lr=lr, betas=adam_betas, eps=adam_eps)
+else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+if schedule == 'warmup_cosine':    # stepped once per batch: linear warmup over warmup_epochs, then cosine annealing to zero
+    n_steps = n_epochs * len(loader_train)
+    warmup_steps = max(1, min(int(warmup_epochs * len(loader_train)), n_steps // 2))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, [torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=warmup_start_factor, total_iters=warmup_steps),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, n_steps - warmup_steps))], milestones=[warmup_steps])
+else:
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=config['training']['milestones'],
+        gamma=config['training']['gamma']
+    )
 loss_fn = nn.SmoothL1Loss(beta=1.0) # beta acts as the threshold between L1 and L2 behavior
+assert loss_name in ('smoothl1', 'weighted_mse'), loss_name
+if loss_name == 'weighted_mse':
+    assert targets_type == 'logf', "'weighted_mse' derives the Ca II fraction of each node from 'logf' targets"
+def relevance_weights(target):     # rung 3 (D-6): w = clip(f_CaII / threshold, 0, 1) per node, floored at coronal_weight; levels 0-4 are Ca II
+    f_caii = (10.0 ** target[:, :5]).sum(dim=1)
+    return torch.clamp(f_caii / relevance_threshold, 0.0, 1.0).clamp_min(coronal_weight)
+def compute_loss(o, t):            # o, t: (n_central_nodes, nlev) in the target representation
+    if loss_name == 'weighted_mse':
+        w = relevance_weights(t)
+        return (w[:, None] * (o - t) ** 2).sum() / (w.sum() * o.shape[1])
+    return loss_fn(o, t)
+ema, ema_updates = None, 0
+if ema_decay > 0:                  # EMA of the weights with the (1+n)/(10+n) ramp, validated next to the raw weights
+    def ema_avg_fn(averaged, current, num_averaged):
+        d = min(ema_decay, (1.0 + ema_updates) / (10.0 + ema_updates))
+        torch._foreach_lerp_(averaged, current, 1.0 - d)
+    ema = torch.optim.swa_utils.AveragedModel(model, multi_avg_fn=ema_avg_fn)
+print(f"Recipe: optimizer {optimizer_name} (wd {weight_decay}), schedule {schedule}, grad clip {grad_clip}, EMA {ema_decay}, fresh subset {fresh_subset}")
+print(f"Representation: features {features_type}, targets {targets_type}, z_pos {use_zpos}, edges {edge_features}, head {model_params.get('head', 'linear')}, "
+      f"loss {loss_name}, rotation augmentation {augment_rotation}")
 
 # ---- Initialize Training State Variables ----
 start_epoch = 1
 best_loss = float('inf')
-train_loss, valid_loss, lrs = [], [], []
+best_dex = float('inf')
+train_loss, valid_loss, valid_dex, lrs = [], [], [], []
+meta = {'conf_path': os.path.abspath(conf_path), 'features_labels': features_labels, 'features_labels_expanded': features_labels_expanded,
+        'loss': {'smoothl1': 'SmoothL1Loss(beta=1)', 'weighted_mse': f'MSE on log10 f with node weights max(clip(f_CaII / {relevance_threshold}, 0, 1), {coronal_weight})'}[loss_name],
+        'target_transform': ('log10(f + log_offset)' if targets_type == 'logf' else f"log10(f / <f>_z) / ({config['normalization']['factor']})") + '; dex = |factor| * |d normalized|',
+        'features_type': features_type, 'targets_type': targets_type, 'use_zpos': use_zpos, 'edge_features': edge_features,
+        'augment_rotation': augment_rotation, 'rot_pairs': rot_pairs, 'head': model_params.get('head', 'linear'),
+        'interp_log': interp_log, 'datadir': datadir, 'data_manifest_sha256': data_manifest_sha256, 'grid_file': grid_file,
+        'z_grid_Mm': np.interp(new_z, z, np.load(grid_file)['z']).tolist(), 'new_z_indices': new_z.tolist(),
+        'validation': {'split': 'test', 'stride': datast_test.max_stride, 'guard': valid_guard, 'n_columns': len(datast_test.sample_centers),
+                       'metric': 'RMS dex over central nodes, plain mean'},
+        'recipe': {'optimizer': optimizer_name, 'weight_decay': weight_decay, 'adam_betas': adam_betas, 'adam_eps': adam_eps, 'schedule': schedule,
+                   'warmup_epochs': warmup_epochs, 'grad_clip': grad_clip, 'ema_decay': ema_decay, 'fresh_subset': fresh_subset},
+        'git': git, 'start_time': start_stamp, 'seed': config['system']['seed']}
 
 # ---- Load Checkpoint if configured ----
-if not os.path.exists(savedir):
-    os.makedirs(savedir)
-    if load_checkpoint:
-        print(f"WARNING: Checkpoint loading enabled, but save directory '{savedir}' not found. Starting fresh.")
-
 if load_checkpoint:
     checkpoints = glob(os.path.join(savedir, "*.pth"))
     if checkpoints:
-        # Find the most recent checkpoint
-        latest_checkpoint_path = max(checkpoints, key=os.path.getctime)
+        # Find the most recent checkpoint (last.pth is written every epoch)
+        latest_checkpoint_path = max(checkpoints, key=os.path.getmtime)
         try:
             print(f"Loading checkpoint: {latest_checkpoint_path}")
             checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
@@ -211,9 +324,14 @@ if load_checkpoint:
 
             # Load training progress
             start_epoch = checkpoint['epoch'] + 1
-            best_loss = checkpoint['best_loss']
+            best_loss = checkpoint['best_loss'] if checkpoint.get('best_loss') is not None else float('inf')
+            best_dex = checkpoint.get('best_dex', float('inf'))
             train_loss = checkpoint.get('train_loss_history', []) # Use .get for backward compatibility
             valid_loss = checkpoint.get('valid_loss_history', []) # Use .get for backward compatibility
+            valid_dex = checkpoint.get('valid_dex_history', [])
+            if ema is not None and 'ema' in checkpoint:
+                ema.load_state_dict(checkpoint['ema'])
+                ema_updates = int(checkpoint.get('ema_updates', 0))
             
             # Restore other saved parameters
             config = checkpoint['config']
@@ -228,17 +346,28 @@ if load_checkpoint:
     else:
         print(f"INFO: No checkpoint found in '{savedir}'. Starting training from scratch.")
 else:
-    print("Checkpoint loading not enabled. Starting training from scratch.")
-    print(f"Saving runned code, checkpoint, and config to {savedir}")
-    # save a copy of the current code and config for reference
-    shutil.copy(f'{__file__}', os.path.join(savedir, f'gnn_train_{time.strftime(time_format)}.py'))
-    shutil.copy('conf.dat', os.path.join(savedir, f'conf_{time.strftime(time_format)}.dat'))
-    shutil.copy('Dataset.py', os.path.join(savedir, f'Dataset_{time.strftime(time_format)}.py'))
-    shutil.copy('normalization.py', os.path.join(savedir, f'normalization_{time.strftime(time_format)}.py'))
-    shutil.copy('graphnet.py', os.path.join(savedir, f'graphnet_{time.strftime(time_format)}.py'))
+    print("Checkpoint loading not enabled. Starting training from scratch (code snapshot saved at start-up).")
+
+csv_path = os.path.join(savedir, 'training_log.csv')          # one row per epoch
+if not os.path.exists(csv_path) or not load_checkpoint:
+    with open(csv_path, 'w', newline='') as f:
+        csv.writer(f).writerow(['epoch', 'time', 'lr', 'train_loss_ema', 'valid_loss', 'valid_dex', 'best_dex', 'epoch_seconds'])
+
+# grids.png: the vertical grid in use against the native grid and the Ca II formation heights (plan WP2 step 2.9)
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'muram_comparison'))
+    import muram_common as mc
+    z_native_grid = np.load(grid_file)['z']
+    zz_training = np.interp(new_z, z, z_native_grid)
+    mc.plot_grids([('native Bifrost', z_native_grid, 'royalblue'), ('training grid', zz_training, 'forestgreen')],
+                  bands=[(l, lo, hi) for l, lo, hi in mc.FORMATION_BANDS_BIFROST_FRAME], transition=zz_training[nz_linear],
+                  path=os.path.join(savedir, 'grids.png'), title='Vertical grids (Bifrost FITS frame)', xlim=(-0.8, 13.0))
+except Exception as exc:                 # noqa: BLE001  (a check figure is never a reason to stop training)
+    print(f'grids.png not written: {exc}')
 
 # ---- Main Training Loop ----
 for epoch in range(start_epoch, n_epochs + 1):
+    t_epoch = time.time()
     filename = time.strftime(time_format)
     model.train()
     print("\n" + "#" * 80)
@@ -252,55 +381,85 @@ for epoch in range(start_epoch, n_epochs + 1):
 
         optimizer.zero_grad()
         out = model(node, edge_attr, edge_index, u, batch)
-        loss = loss_fn(out.squeeze()[central_mask], target.squeeze()[central_mask])
+        loss = compute_loss(out.squeeze()[central_mask], target.squeeze()[central_mask])
         loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        if schedule == 'warmup_cosine':
+            scheduler.step()
+        if ema is not None:
+            ema.update_parameters(model)
+            ema_updates += 1
 
         loss_avg = smooth * loss.item() + (1.0 - smooth) * loss_avg if loss_avg != 0.0 else loss.item()
 
     train_loss.append(loss_avg)
 
-    # ------------------- VALIDATION -------------------
-    model.eval()
-    val_loss_avg = 0.0
-    with torch.no_grad():
-        for data in tqdm(loader_test, desc="Validating"):
-            node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
-            u, batch, target = data.u.to(device), data.batch.to(device), data.y.to(device)
-            central_mask = data.central_mask.to(device)
-            out = model(node, edge_attr, edge_index, u, batch)
-            loss = loss_fn(out.squeeze()[central_mask], target.squeeze()[central_mask])
-            val_loss_avg = smooth * loss.item() + (1.0 - smooth) * val_loss_avg if val_loss_avg != 0.0 else loss.item()
+    # ------------------- VALIDATION (D-2): plain mean over all held-out graphs, in loss and in dex -------------------
+    def validate(net):
+        net.eval()
+        loss_sum, sq_sum, n_batches, n_nodes = 0.0, 0.0, 0, 0
+        with torch.no_grad():
+            for data in tqdm(loader_test, desc="Validating"):
+                node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
+                u, batch, target = data.u.to(device), data.batch.to(device), data.y.to(device)
+                central_mask = data.central_mask.to(device)
+                out = net(node, edge_attr, edge_index, u, batch)
+                o, t = out.squeeze()[central_mask], target.squeeze()[central_mask]
+                loss_sum += compute_loss(o, t).item(); n_batches += 1
+                sq_sum += ((o - t) ** 2).sum().item(); n_nodes += o.numel()
+        return loss_sum / max(n_batches, 1), abs(config['normalization']['factor']) * np.sqrt(sq_sum / max(n_nodes, 1))
 
+    val_loss_avg, val_dex = validate(model)
+    val_dex_ema = validate(ema.module)[1] if ema is not None else None
     valid_loss.append(val_loss_avg)
-    print(f"Epoch {epoch} finished with validation loss: {val_loss_avg:.6f}")
+    valid_dex.append(val_dex)
+    epoch_seconds = time.time() - t_epoch
+    print(f"Epoch {epoch} finished with validation loss: {val_loss_avg:.6f} | held-out RMS {val_dex:.5f} dex"
+          + (f" | EMA weights {val_dex_ema:.5f} dex" if val_dex_ema is not None else "") + f" | {epoch_seconds / 60:.1f} min")
 
-    if valid_loss[-1] < best_loss:
-        best_loss = valid_loss[-1]
-
-        checkpoint = {
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'best_loss': best_loss,
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'config': config,
-            'feature_norm_params': feature_norm_params,
-            'normalization_params': pop_norm_params,
-            'train_loss_history': train_loss,
-            'valid_loss_history': valid_loss,
-        }
-
-        print(f"New best validation loss: {best_loss:.6f}. Saving model...")
+    use_ema = val_dex_ema is not None and val_dex_ema < val_dex
+    candidate = val_dex_ema if use_ema else val_dex
+    best_loss = min(best_loss, valid_loss[-1])
+    checkpoint = {
+        'epoch': epoch,
+        'state_dict': (ema.module if use_ema else model).state_dict(),
+        'weights': 'ema' if use_ema else 'raw',
+        'best_loss': best_loss,
+        'best_dex': min(best_dex, candidate),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'config': config,
+        'feature_norm_params': feature_norm_params,
+        'normalization_params': pop_norm_params,
+        'train_loss_history': train_loss,
+        'valid_loss_history': valid_loss,
+        'valid_dex_history': valid_dex,
+        'meta': meta,
+    }
+    if candidate < best_dex:
+        best_dex = candidate
+        print(f"New best held-out dex: {best_dex:.5f} ({checkpoint['weights']} weights). Saving model...")
         torch.save(checkpoint, os.path.join(savedir, f'{filename}_best.pth'))
+    # last.pth is the resume point: raw weights plus optimizer, scheduler and EMA state
+    checkpoint['state_dict'], checkpoint['weights'] = model.state_dict(), 'raw'
+    if ema is not None:
+        checkpoint['ema'] = ema.state_dict()
+        checkpoint['ema_updates'] = ema_updates
+    torch.save(checkpoint, os.path.join(savedir, 'last.pth'))
+    with open(csv_path, 'a', newline='') as f:
+        csv.writer(f).writerow([epoch, filename, scheduler.get_last_lr()[0], loss_avg, valid_loss[-1], valid_dex[-1], best_dex, round(epoch_seconds, 1)])
     
     lrs.append(scheduler.get_last_lr())
-    scheduler.step()
+    if schedule != 'warmup_cosine':
+        scheduler.step()
 
     # ---- Plotting ----
     plt.figure(figsize=(10, 7))
     plt.plot(train_loss, label='Training Loss')
     plt.plot(valid_loss, label='Validation Loss')
+    plt.plot(valid_dex, label='Held-out RMS [dex]')
     plt.yscale('log')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')

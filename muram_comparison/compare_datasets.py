@@ -10,7 +10,7 @@ import muram as mio
 from normalization import normalize_features_with_params
 
 # Use GPU 2 if available
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")   # only the checkpoint is read here; no GPU needed
 print(f"Using device: {device}")
 
 # ---- Load Checkpoint ----
@@ -54,7 +54,7 @@ snap_number = 499000
 cube = mio.MuramSnap(pathsource, snap_number)
 
 # Grid parameters
-dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
+dz, dx, dy = (np.asarray(cube.Temp.dX) / 1e5) / 1e3   # Mm, from Header.499000 (dx = dy = 23.4375 km, dz = 20 km)
 nz, nx, ny = cube.Temp.shape
 z, x, y = (np.arange(d) for d in (nz, nx, ny))
 z_geom, x_geom, y_geom = z*dz, x*dx, y*dy
@@ -110,7 +110,7 @@ vel_muram = np.stack([v_x_m, v_y_m, v_z_m], axis=-1)
 
 # Convert MURaM features to SI units to match Bifrost units before normalization
 vel_muram_si = vel_muram / 100.0
-b_xyz_muram_si = b_xyz_muram * (4.0 * np.pi) / 10000.0
+b_xyz_muram_si = b_xyz_muram * np.sqrt(4.0 * np.pi) / 10000.0   # MURaM stores B/sqrt(4 pi) in G (audit M4)
 temp_muram_si = temp_muram
 ne_muram_si = ne_muram * 1e6
 rho_muram_si = rho_muram * 1000.0

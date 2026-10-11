@@ -2,14 +2,21 @@
 """
 muram_synthesis.py
 
-Synthesizes the Ca II 8542 Å spectral line from both SNAPI (1.5D NLTE) and GNN-predicted
-Ca II populations in the MURaM dataset.
+Synthesizes the Ca II K line (the line of the reference spectra, HDU0) on a regular sample of MURaM columns with
+the SNAPI (1.5D NLTE, HDU2), GNN-predicted, LTE and Bifrost-climatology Ca II populations imposed on the
+native 401-level atmosphere (MURaM n_e and n_H, v_turb = 0, mu = 1, CRD), and compares the Lightweaver synthesis of the
+SNAPI populations with SNAPI's own spectra (HDU0): a cross-code check, not a reproduction. The reference wavelength axis (HDU1) is in air and is converted to vacuum.
 
 Author: Antigravity AI (Google DeepMind)
 """
 
 import numpy as np
 import scipy.interpolate as interp
+import json
+import torch
+import lightweaver.constants as const
+from lightweaver.atomic_set import lte_pops
+from lightweaver.atomic_table import DefaultAtomicAbundance
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import matplotlib.ticker as ticker
@@ -17,6 +24,7 @@ from astropy.io import fits
 import os
 import sys
 import time
+import glob
 import multiprocessing
 from joblib import Parallel, delayed
 
@@ -31,6 +39,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 sys.path.append(os.path.join(current_dir, '..'))
 import muram as mio
+import muram_common as mc
+from normalization import CA_TOTAL_PER_RHO
 
 # Configure matplotlib for premium, publication-quality plots
 plt.rcParams.update({
@@ -49,13 +59,14 @@ plt.rcParams.update({
 # ==============================================================================
 # CONFIGURABLE SETTINGS
 # ==============================================================================
-# We define a 32x32 patch from the center of the 992x992 grid.
-patch_size = 900
-py_start, py_end = 0, 0 + patch_size
-px_start, px_end = 0, 0 + patch_size
+# The muram_inference.py run to synthesize (default: the most recent) and the sample: n_side x n_side columns on a
+# regular grid over the predicted crop.   python muram_synthesis.py [results/muram_inference/<stamp>] [n_side]
+results_dir = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(os.path.join(current_dir, '..', 'results', 'muram_inference', '*', 'meta.json')))[-1][:-len('meta.json')]
+n_side = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+meta = json.load(open(os.path.join(results_dir, 'meta.json')))
 
-# Number of CPU cores to use (safely utilizing a portion of the 192 cores)
-n_jobs = 128
+# Number of CPU cores to use
+n_jobs = 32
 
 # Config parameters from training (saved in conf.dat)
 nz_b = 425
@@ -67,7 +78,7 @@ bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
 pathsource = '/dat/milic/MURaM_enhanced_network/'
 snap_number = 499000
 fits_path = "/dat/milic/MURaM_enhanced_network/che_full_499000_lwsynth_200.0.fits"
-pred_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy'
+pred_path = os.path.join(results_dir, meta['files']['predictions'])
 
 # ==============================================================================
 # 1. SETUP GRIDS AND VERTICAL COORDINATES
@@ -88,240 +99,182 @@ new_z_b_log = np.concatenate([
 new_z_b = np.clip(new_z_b_log, 0, nz_b - 1)
 zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
 
-# Load MURaM snap to compute vertical coordinate muram_z_grid
+# Load MURaM snap; the vertical coordinate and the alignment come from the inference run (grid.npz, meta.json)
 cube = mio.MuramSnap(pathsource, snap_number)
 
-dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
 nz, nx, ny = cube.Temp.shape
-z = np.arange(nz)
-z_geom = z * dz
+dz, dx, dy = (np.asarray(cube.Temp.dX) / 1e5) / 1e3
+grid = np.load(os.path.join(results_dir, meta['files']['grid']))
+zz_grid_muram = grid['z_rel_tau1_Mm']                                   # heights of the 50 GNN levels above tau500 = 1
+tau_zero_index = meta['tau1_index_median']
+muram_z_grid = (np.arange(nz) - tau_zero_index) * dz
+print(f"   tau=1 layer index: {tau_zero_index:.2f}")
 
-# Compute tau=1 layer
-tau_mean = np.mean(cube.tau, axis=(1, 2))
-tau_zero_index = np.argmin(np.abs(tau_mean - 1))
-print(f"   tau=1 layer index: {tau_zero_index} (z={z_geom[tau_zero_index]:.4f} Mm)")
-
-muram_z_grid = z_geom - z_geom[tau_zero_index]
-
-# Align height interpolation exactly with Bifrost
-new_z = np.interp(zz_grid_bifrost, muram_z_grid, z)
-new_z = np.clip(new_z, 0, nz - 1)
-zz_grid_muram = np.interp(new_z, z, muram_z_grid)
-
-# 1.5D NLTE z grid is cropped from 15 to 416 (not including 416)
-fits_heights = muram_z_grid[15:416]
-
-# Clip the range of the GNN grid to remove parts where NLTE doesn't reach
-valid_mask = (zz_grid_muram >= fits_heights.min()) & (zz_grid_muram <= fits_heights.max())
-zz_gnn_clipped = zz_grid_muram[valid_mask]
-new_z_clipped = new_z[valid_mask]
-
-print(f"   Clipped GNN vertical heights (Mm): min={zz_gnn_clipped.min():.4f}, max={zz_gnn_clipped.max():.4f}")
-print(f"   Using {len(zz_gnn_clipped)} vertical layers for synthesis.")
+# 1.5D NLTE z grid is cropped from 15 to 416 (not including 416); the synthesis uses these native levels directly
+nat = np.arange(mc.FITS_Z_SLICE.start, mc.FITS_Z_SLICE.stop)
+fits_heights = muram_z_grid[nat]
+print(f"   Using the {len(nat)} native levels of the reference ({fits_heights.min():.3f} to {fits_heights.max():.3f} Mm) for synthesis.")
 
 # ==============================================================================
 # 2. INTERPOLATE ATMOSPHERIC VARIABLES
 # ==============================================================================
-print(f"2. Interpolating physical variables for the selected patch [{py_start}:{py_end}, {px_start}:{px_end}]...")
+pred = np.load(pred_path)                                                  # (50, ny_p, nx_p, 6) cm^-3, NaN = not predicted
+done = np.isfinite(pred[0, :, :, 0])
+oy, ox = meta['origin']                                                     # native column of pred[:, 0, 0]
+ny_p, nx_p = pred.shape[1:3]
+sample = [(j, i) for j in np.linspace(4, ny_p - 5, n_side).astype(int) for i in np.linspace(4, nx_p - 5, n_side).astype(int) if done[j, i]]
+print(f"2. Reading the physical variables of {len(sample)} sample columns at native resolution...")
 
-# GNN and FITS horizontal domain corresponds to original coordinates shifted by 16:
-new_y_patch = np.linspace(py_start + 16, py_end - 1 + 16, patch_size)
-new_x_patch = np.linspace(px_start + 16, px_end - 1 + 16, patch_size)
+def native_column(j, i):
+    xi, yj = ox + i, oy + j                                                 # cube is (z, x, y); prediction axes are (y, x)
+    c = lambda a, f: np.ascontiguousarray(np.asarray(a[nat, xi, yj], dtype=np.float64)[::-1] * f)   # top first
+    return c(cube.Temp, 1.0), c(cube.vx, 1e-2), c(cube.ne, 1e6), c(cube.rho, 1e3)    # K, m/s (positive up), m^-3, kg m^-3
 
-new_zv, new_yv, new_xv = np.meshgrid(new_z_clipped, new_y_patch, new_x_patch, indexing='ij', sparse=True)
-new_points = (new_zv, new_xv, new_yv) # original MURaM cube shape is (nz, nx, ny)
-
-temp_patch = interp.interpn((z, np.arange(nx), np.arange(ny)), cube.Temp, new_points) # (z, y, x)
-v_z_patch = interp.interpn((z, np.arange(nx), np.arange(ny)), cube.vx, new_points)     # (z, y, x)
-press_patch = interp.interpn((z, np.arange(nx), np.arange(ny)), cube.Pres, new_points) # (z, y, x)
-
-# Convert units to SI
-# Temperature is already in K
-# Velocity: cm/s -> m/s
-vlos_m_s = v_z_patch / 100.0
-# Gas pressure: dyn/cm^2 -> Pa
-press_pa = press_patch / 10.0
-
-# Reverse physical variable vertical axis to go from top to bottom (decreasing height)
-temp_patch = temp_patch[::-1, :, :]
-vlos_m_s = vlos_m_s[::-1, :, :]
-press_pa = press_pa[::-1, :, :]
+columns = [native_column(j, i) for j, i in sample]
 
 # Lightweaver expects depthScale in meters, strictly decreasing
-depthScale_m = zz_gnn_clipped[::-1] * 1e6
+depthScale_m = np.ascontiguousarray(fits_heights[::-1] * 1e6)
 
 # ==============================================================================
 # 3. LOAD LEVEL POPULATIONS FOR THE PATCH
 # ==============================================================================
 print("3. Loading populations for the patch...")
 
-# GNN populations (cm^-3 initially, we scale to m^-3 by multiplying by 1e6)
-if not os.path.exists(pred_path):
-    print(f"Error: GNN predictions not found at {pred_path}")
-    sys.exit(1)
-print(f"   Loading GNN predictions from {pred_path}...")
-pred = np.load(pred_path)
-pred_patch_cgs = pred[valid_mask, py_start:py_end, px_start:px_end, :] # (z, y, x, 6)
-gnn_pops_si = pred_patch_cgs * 1e6 # convert CGS to SI (m^-3)
+# GNN populations: log fractions interpolated from the 50 levels to the native levels, times the total Ca density
+# of each native column (CA_TOTAL_PER_RHO * rho); LTE (Saha-Boltzmann) and Bifrost climatology on the same levels
+checkpoint = torch.load(meta['checkpoint'], map_location='cpu', weights_only=False)
+means = np.asarray(checkpoint['normalization_params']['means'])          # (50, 6) Bifrost mean fraction per level
 
-# Reverse GNN populations along vertical coordinate to match decreasing heights
-gnn_pops_si = gnn_pops_si[::-1, :, :, :]
+def pops_on_native(j, i, T_top, ne_top, rho_top):
+    tot_cm3 = CA_TOTAL_PER_RHO * rho_top[::-1]                                        # bottom first, cm^-3
+    f_gnn = pred[:, j, i, :] / pred[:, j, i, :].sum(-1, keepdims=True)
+    lf = np.stack([np.interp(fits_heights, zz_grid_muram, np.log10(f_gnn[:, l])) for l in range(6)], axis=-1)
+    gnn = np.ascontiguousarray((10 ** lf * tot_cm3[:, None])[::-1].T * 1e6)         # (6, nz) top first, m^-3
+    lfc = np.stack([np.interp(fits_heights, zz_grid_muram, np.log10(means[:, l])) for l in range(6)], axis=-1)
+    clim = np.ascontiguousarray((10 ** lfc * tot_cm3[:, None])[::-1].T * 1e6)
+    lte = np.ascontiguousarray(lte_pops(CaII_atom(), T_top, ne_top, tot_cm3[::-1] * 1e6))
+    return gnn, lte, clim
 
-# SNAPI (1.5D NLTE FITS) populations
+# SNAPI (1.5D NLTE FITS) populations and spectra of the sample columns; FITS[a, b] = MURaM (x=a, y=b)
 print(f"   Memory-mapping FITS file at {fits_path}...")
-if not os.path.exists(fits_path):
-    print(f"Error: FITS file not found at {fits_path}")
-    sys.exit(1)
-
 with fits.open(fits_path, memmap=True) as hdul:
-    fits_patch = hdul[2].data[px_start + 16 : px_end + 16, py_start + 16 : py_end + 16, :, :] # (patch_size, patch_size, 6, 401)
-
-# Reverse FITS vertical axis to match increasing heights
-fits_patch = fits_patch[..., ::-1]
-
-# Reinterpolate fits_patch onto zz_gnn_clipped
-fits_interp_func = interp.interp1d(fits_heights, fits_patch, axis=-1, bounds_error=False, fill_value="extrapolate")
-fits_patch_on_gnn = fits_interp_func(zz_gnn_clipped) # Shape: (patch_size, patch_size, 6, len(zz_gnn_clipped))
-
-# Transpose to (z, y, x, level) to match GNN patch shape
-snapi_pops_si = fits_patch_on_gnn.transpose(3, 1, 0, 2) # (z, y, x, 6)
-
-# Reverse SNAPI populations along vertical coordinate to match decreasing heights
-snapi_pops_si = snapi_pops_si[::-1, :, :, :]
+    wave_air = np.asarray(hdul[1].data, dtype=np.float64)
+    snapi_pops_si = np.array([hdul[2].data[ox + i, oy + j, :, :] for j, i in sample], dtype=np.float64)   # (ncol, 6, 401) top first, m^-3
+    I_hdu0 = np.array([hdul[0].data[ox + i, oy + j, 0, :] for j, i in sample], dtype=np.float64)          # (ncol, nwave)
+pop_sets = [[snapi_pops_si[c], *pops_on_native(j, i, columns[c][0], columns[c][2], columns[c][3])] for c, (j, i) in enumerate(sample)]
+set_names = ['snapi', 'gnn', 'lte', 'climatology']
 
 # ==============================================================================
 # 4. PARALLEL SYNTHESIS
 # ==============================================================================
-# Setup wavelengths (wavelengths in nm, around 854.2 nm)
-nwave = 1001
-wave = np.linspace(853.9444, 854.9444, nwave)
+# Setup wavelengths: those of the reference spectra (HDU1, in AIR -> vacuum for Lightweaver), Ca II K window + continuum points
+wave = lw.air_to_vac(wave_air)
+nwave = len(wave)
+lambda_K = 393.4777                                       # Ca II K rest wavelength of CaII_atom (nm, vacuum)
 
-def process_single_row(row_idx, patch_size, 
-                       temp_patch,
-                       vlos_m_s, 
-                       press_pa,
-                       gnn_pops_si, 
-                       snapi_pops_si,
-                       depthScale_m, wave):
+def process_single_column(col_idx, temp_atm, vel_atm, ne_atm, rho_atm, pops_list, depthScale_m, wave):
     
-    row_gnn = np.zeros((patch_size, len(wave)))
-    row_snapi = np.zeros((patch_size, len(wave)))
-    
-    for col_pix in range(patch_size):
-        # Extract 1D profiles for this column
-        temp_atm = np.ascontiguousarray(temp_patch[:, col_pix, row_idx])
-        vel_atm = np.ascontiguousarray(vlos_m_s[:, col_pix, row_idx])
-        press_atm = np.ascontiguousarray(press_pa[:, col_pix, row_idx])
-        
-        gnn_atm = np.ascontiguousarray(gnn_pops_si[:, col_pix, row_idx, :])
-        snapi_atm = np.ascontiguousarray(snapi_pops_si[:, col_pix, row_idx, :])
+    out = np.full((len(pops_list), len(wave)), np.nan)      # NaN = failed
+    try:
+        atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
+                                      depthScale=np.ascontiguousarray(depthScale_m),
+                                      convertScales=False,
+                                      temperature=temp_atm, 
+                                      ne=ne_atm,
+                                      nHTot=rho_atm / (const.Amu * DefaultAtomicAbundance.massPerH),
+                                      vturb=np.zeros_like(temp_atm),
+                                      vlos=vel_atm)
+        atmos.quadrature(5)
+        aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
+                                Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
+        aSet.set_active('Ca')
+        spect = aSet.compute_wavelength_grid()
+        eqPops = aSet.compute_eq_pops(atmos)
 
-        # 1. GNN Synthesis
-        try:
-            atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
-                                          depthScale=np.ascontiguousarray(depthScale_m),
-                                          convertScales=False,
-                                          temperature=temp_atm, 
-                                          Pgas=press_atm,
-                                          vturb=1e3 * np.ones_like(temp_atm),
-                                          vlos=vel_atm)
-            atmos.quadrature(5)
-            aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
-                                    Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
-            aSet.set_active('H', 'Ca')
-            spect = aSet.compute_wavelength_grid()
-            eqPops = aSet.compute_eq_pops(atmos)
-
-            eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(gnn_atm, 1, 0))
+        for k, pops_atm in enumerate(pops_list):             # reference, GNN, LTE, climatology populations imposed (6, nz) m^-3
+            eqPops.atomicPops['Ca'].n = np.ascontiguousarray(pops_atm)
             ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
-            row_gnn[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
-        except Exception as e:
-            print(f"Error in pixel (GNN) ({row_idx}, {col_pix}): {e}")
-            row_gnn[col_pix, :] = 0.0
+            out[k] = ctx.compute_rays(wave, [1.0], stokes=False)
+    except Exception as e:
+        print(f"Error in column {col_idx}: {e}")
 
-        # 2. SNAPI Synthesis
-        try:
-            atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
-                                          depthScale=np.ascontiguousarray(depthScale_m),
-                                          convertScales=False,
-                                          temperature=temp_atm, 
-                                          Pgas=press_atm,
-                                          vturb=1e3 * np.ones_like(temp_atm),
-                                          vlos=vel_atm)
-            atmos.quadrature(5)
-            aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
-                                    Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
-            aSet.set_active('H', 'Ca')
-            spect = aSet.compute_wavelength_grid()
-            eqPops = aSet.compute_eq_pops(atmos)
+    return col_idx, out
 
-            eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(snapi_atm, 1, 0))
-            ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
-            row_snapi[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
-        except Exception as e:
-            print(f"Error in pixel (SNAPI) ({row_idx}, {col_pix}): {e}")
-            row_snapi[col_pix, :] = 0.0
-
-    return row_idx, row_gnn, row_snapi
-
-print(f"4. Starting parallel synthesis of patch ({patch_size}x{patch_size}) using {n_jobs} cores...")
+print(f"4. Starting parallel synthesis of {len(sample)} columns using {n_jobs} cores...")
 start_time = time.time()
 
 results = Parallel(n_jobs=n_jobs, verbose=5)(
-    delayed(process_single_row)(
-        row, patch_size,
-        temp_patch, vlos_m_s, press_pa,
-        gnn_pops_si, snapi_pops_si,
-        depthScale_m, wave
-    ) for row in range(patch_size)
+    delayed(process_single_column)(c, *columns[c], pop_sets[c], depthScale_m, wave) for c in range(len(sample))
 )
 
 print(f"   Calculation finished in {(time.time() - start_time):.2f} seconds.")
 
-# Reassemble outputs
-Iwave_gnn = np.zeros((patch_size, patch_size, nwave))
-Iwave_snapi = np.zeros((patch_size, patch_size, nwave))
-
-for res in results:
-    r_idx, r_gnn, r_snapi = res
-    Iwave_gnn[r_idx, :, :] = r_gnn
-    Iwave_snapi[r_idx, :, :] = r_snapi
+# Reassemble outputs: (ncol, nwave) per population set
+Iwave = {name: np.full((len(sample), nwave), np.nan) for name in set_names}
+for c_idx, out in results:
+    for k, name in enumerate(set_names):
+        Iwave[name][c_idx] = out[k]
+Iwave_gnn = Iwave['gnn']
+Iwave_snapi = Iwave['snapi']
 
 # ==============================================================================
 # 5. SAVE OUTPUT DATA
 # ==============================================================================
 print("5. Saving outputs...")
-np.save(os.path.join(current_dir, 'muram_Iwave_gnn.npy'), Iwave_gnn)
-np.save(os.path.join(current_dir, 'muram_Iwave_snapi.npy'), Iwave_snapi)
-print(f"   Saved synthesized GNN spectra to: {os.path.join(current_dir, 'muram_Iwave_gnn.npy')}")
-print(f"   Saved synthesized SNAPI spectra to: {os.path.join(current_dir, 'muram_Iwave_snapi.npy')}")
+np.savez_compressed(os.path.join(results_dir, 'muram_synthesis_K.npz'), wave_vac=wave, wave_air=wave_air, columns=np.array(sample), I_hdu0=I_hdu0, **Iwave)
+print(f"   Saved synthesized spectra to: {os.path.join(results_dir, 'muram_synthesis_K.npz')}")
+
+# Metrics: (a) reference populations vs HDU0 (how far a 1D CRD synthesis is from the reference's own spectra);
+# (b) GNN, LTE and climatology populations vs the reference populations on the same atmosphere (population error only)
+core = np.abs(wave - lambda_K) <= 0.05
+kwin = (wave > 392.9) & (wave < 394.9)
+wing = kwin & (np.abs(wave - lambda_K) >= 0.5)
+i0 = int(np.argmin(np.abs(wave - lambda_K)))
+def spec_stats(I, Iref):
+    good = np.isfinite(I[:, 0]) & np.isfinite(Iref[:, 0])
+    rel = (I[good] - Iref[good]) / Iref[good]
+    return {'n': int(good.sum()), 'continuum_median_abs_pct': float(np.median(np.abs(rel[:, ~kwin])) * 100), 'wing_median_abs_pct': float(np.median(np.abs(rel[:, wing])) * 100),
+            'core_mape_pct': float(np.mean(np.abs(rel[:, core])) * 100), 'centre_median_abs_pct': float(np.median(np.abs(rel[:, i0])) * 100), 'centre_bias_pct': float(np.median(rel[:, i0]) * 100)}
+synth_metrics = {'results': os.path.abspath(results_dir), 'n_columns': len(sample), 'setup': 'native 401 levels, Bifrost n_e and n_H, vturb 0, mu 1, CRD, Ca active; HDU1 air -> vacuum',
+                 'reference': 'SNAPI 1.5D NLTE populations (HDU2) and spectra (HDU0)',
+                 'reference_pops_vs_HDU0': spec_stats(Iwave_snapi, I_hdu0),
+                 **{f'{name}_vs_reference_pops': spec_stats(Iwave[name], Iwave_snapi) for name in ('gnn', 'lte', 'climatology')}}
+with open(os.path.join(results_dir, 'muram_synthesis_K.json'), 'w') as f:
+    json.dump(synth_metrics, f, indent=1)
+print(json.dumps(synth_metrics, indent=1))
 
 # ==============================================================================
 # 6. PLOT COMPARATIVE RESULTS
 # ==============================================================================
 print("6. Analyzing and generating premium visualization plots...")
 
-# Spatially averaged profiles
-mean_I_gnn = np.mean(Iwave_gnn, axis=(0, 1))
-mean_I_snapi = np.mean(Iwave_snapi, axis=(0, 1))
+# Spatially averaged profiles (over the sample columns), K window only
+mean_I_gnn = np.nanmean(Iwave_gnn, axis=0)
+mean_I_snapi = np.nanmean(Iwave_snapi, axis=0)
+mean_I_hdu0 = np.nanmean(I_hdu0, axis=0)
+mean_I_lte = np.nanmean(Iwave['lte'], axis=0)
+mean_I_clim = np.nanmean(Iwave['climatology'], axis=0)
 
-continuum_idx = 0
-line_core_idx = np.argmin(mean_I_snapi)
+continuum_idx = int(np.argmin(np.abs(wave - 394.8)))      # last point of the K window
+line_core_idx = i0
 
 print(f"   Continuum wavelength: {wave[continuum_idx]:.4f} nm (Index {continuum_idx})")
 print(f"   Line core wavelength: {wave[line_core_idx]:.4f} nm (Index {line_core_idx})")
 
 # Figure 1: Spatially Averaged Spectra comparison
 plt.figure(figsize=(10, 6), dpi=300)
-plt.plot(wave, mean_I_snapi, 'k-', linewidth=2, label='SNAPI (1.5D NLTE)')
-plt.plot(wave, mean_I_gnn, 'r--', linewidth=1.8, label='GNN Predicted')
-plt.xlabel('Wavelength [nm]', fontsize=13)
+plt.plot(wave[kwin], mean_I_hdu0[kwin], color='gray', linewidth=2.5, alpha=0.6, label='SNAPI spectra (HDU0)')
+plt.plot(wave[kwin], mean_I_snapi[kwin], 'k-', linewidth=2, label='SNAPI populations (1.5D NLTE), Lightweaver CRD synthesis')
+plt.plot(wave[kwin], mean_I_gnn[kwin], 'r--', linewidth=1.8, label='GNN populations')
+plt.plot(wave[kwin], mean_I_lte[kwin], ':', color='gray', linewidth=1.5, label='LTE populations')
+plt.plot(wave[kwin], mean_I_clim[kwin], '-.', color='royalblue', linewidth=1.5, label='Bifrost climatology populations')
+plt.xlabel('Wavelength [nm] (vacuum)', fontsize=13)
 plt.ylabel('Intensity [W / (m$^2$ Hz sr)]', fontsize=13)
-plt.title('Spatially Averaged Ca II 8542 Å Line Profile', fontsize=14, pad=15)
+plt.title('Mean Ca II K profile over the sample columns', fontsize=14, pad=15)
 plt.grid(True, alpha=0.3)
 plt.legend(loc='best')
 plt.tight_layout()
-spectra_plot_path = os.path.join(current_dir, 'muram_synthesis_spectra.png')
+spectra_plot_path = os.path.join(results_dir, 'muram_synthesis_K_spectra.png')
 plt.savefig(spectra_plot_path, bbox_inches='tight')
 plt.close()
 print(f"   Saved average spectra plot to: {spectra_plot_path}")
@@ -330,59 +283,61 @@ print(f"   Saved average spectra plot to: {spectra_plot_path}")
 fig, axes = plt.subplots(2, 3, figsize=(18, 12), dpi=300)
 
 epsilon = 1e-32
-cont_snapi = Iwave_snapi[:, :, continuum_idx]
-cont_gnn = Iwave_gnn[:, :, continuum_idx]
+n_s = int(np.sqrt(len(sample)))                           # the sample is a regular n_side x n_side grid
+as_map = lambda v: np.full(n_side * n_side, np.nan) if len(v) != n_side * n_side else v.reshape(n_side, n_side)
+cont_snapi = as_map(Iwave_snapi[:, continuum_idx])
+cont_gnn = as_map(Iwave_gnn[:, continuum_idx])
 cont_diff = (cont_gnn - cont_snapi) / (cont_snapi + epsilon) * 100 # Relative diff (%)
 
-core_snapi = Iwave_snapi[:, :, line_core_idx]
-core_gnn = Iwave_gnn[:, :, line_core_idx]
+core_snapi = as_map(Iwave_snapi[:, line_core_idx])
+core_gnn = as_map(Iwave_gnn[:, line_core_idx])
 core_diff = (core_gnn - core_snapi) / (core_snapi + epsilon) * 100 # Relative diff (%)
 
 # Continuum Row (Row 0)
-cont_vmin = min(cont_snapi.min(), cont_gnn.min())
-cont_vmax = max(cont_snapi.max(), cont_gnn.max())
+cont_vmin = np.nanmin([cont_snapi, cont_gnn])
+cont_vmax = np.nanmax([cont_snapi, cont_gnn])
 
 im0 = axes[0, 0].imshow(cont_snapi.T, origin='lower', cmap='magma', vmin=cont_vmin, vmax=cont_vmax)
-axes[0, 0].set_title('SNAPI - Continuum (853.94 nm)', fontsize=12)
+axes[0, 0].set_title(f'SNAPI pops - wing ({wave[continuum_idx]:.2f} nm)', fontsize=12)
 axes[0, 0].set_ylabel('y-pixel', fontsize=11)
 axes[0, 0].set_xlabel('x-pixel', fontsize=11)
 fig.colorbar(im0, ax=axes[0, 0], shrink=0.8, label='Intensity [W/(m$^2$ Hz sr)]')
 
 im1 = axes[0, 1].imshow(cont_gnn.T, origin='lower', cmap='magma', vmin=cont_vmin, vmax=cont_vmax)
-axes[0, 1].set_title('GNN - Continuum (853.94 nm)', fontsize=12)
+axes[0, 1].set_title(f'GNN pops - wing ({wave[continuum_idx]:.2f} nm)', fontsize=12)
 axes[0, 1].set_xlabel('x-pixel', fontsize=11)
 fig.colorbar(im1, ax=axes[0, 1], shrink=0.8, label='Intensity [W/(m$^2$ Hz sr)]')
 
-cont_lim = max(1.0, np.percentile(np.abs(cont_diff), 99))
+cont_lim = max(1.0, np.nanpercentile(np.abs(cont_diff), 99))
 im2 = axes[0, 2].imshow(cont_diff.T, origin='lower', cmap='RdBu_r', vmin=-cont_lim, vmax=cont_lim)
 axes[0, 2].set_title('Relative Difference (%)', fontsize=12)
 axes[0, 2].set_xlabel('x-pixel', fontsize=11)
 fig.colorbar(im2, ax=axes[0, 2], shrink=0.8, label='(GNN - SNAPI) / SNAPI [%]')
 
 # Line Core Row (Row 1)
-core_vmin = min(core_snapi.min(), core_gnn.min())
-core_vmax = max(core_snapi.max(), core_gnn.max())
+core_vmin = np.nanmin([core_snapi, core_gnn])
+core_vmax = np.nanmax([core_snapi, core_gnn])
 
 im3 = axes[1, 0].imshow(core_snapi.T, origin='lower', cmap='magma', vmin=core_vmin, vmax=core_vmax)
-axes[1, 0].set_title(f'SNAPI - Line Core ({wave[line_core_idx]:.2f} nm)', fontsize=12)
+axes[1, 0].set_title(f'SNAPI pops - K core ({wave[line_core_idx]:.2f} nm)', fontsize=12)
 axes[1, 0].set_ylabel('y-pixel', fontsize=11)
 axes[1, 0].set_xlabel('x-pixel', fontsize=11)
 fig.colorbar(im3, ax=axes[1, 0], shrink=0.8, label='Intensity [W/(m$^2$ Hz sr)]')
 
 im4 = axes[1, 1].imshow(core_gnn.T, origin='lower', cmap='magma', vmin=core_vmin, vmax=core_vmax)
-axes[1, 1].set_title(f'GNN - Line Core ({wave[line_core_idx]:.2f} nm)', fontsize=12)
+axes[1, 1].set_title(f'GNN pops - K core ({wave[line_core_idx]:.2f} nm)', fontsize=12)
 axes[1, 1].set_xlabel('x-pixel', fontsize=11)
 fig.colorbar(im4, ax=axes[1, 1], shrink=0.8, label='Intensity [W/(m$^2$ Hz sr)]')
 
-core_lim = max(1.0, np.percentile(np.abs(core_diff), 99))
+core_lim = max(1.0, np.nanpercentile(np.abs(core_diff), 99))
 im5 = axes[1, 2].imshow(core_diff.T, origin='lower', cmap='RdBu_r', vmin=-core_lim, vmax=core_lim)
 axes[1, 2].set_title('Relative Difference (%)', fontsize=12)
 axes[1, 2].set_xlabel('x-pixel', fontsize=11)
 fig.colorbar(im5, ax=axes[1, 2], shrink=0.8, label='(GNN - SNAPI) / SNAPI [%]')
 
-fig.suptitle('MURaM Synthesized Intensity Maps Comparison', fontsize=16, y=0.96)
+fig.suptitle(f'Ca II K on the {n_side}x{n_side} sample columns: SNAPI vs GNN populations', fontsize=16, y=0.96)
 plt.tight_layout(rect=[0, 0, 1, 0.94])
-maps_plot_path = os.path.join(current_dir, 'muram_synthesis_maps.png')
+maps_plot_path = os.path.join(results_dir, 'muram_synthesis_K_maps.png')
 plt.savefig(maps_plot_path, bbox_inches='tight')
 plt.close()
 print(f"   Saved comparative maps plot to: {maps_plot_path}")

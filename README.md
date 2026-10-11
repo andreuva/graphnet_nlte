@@ -1,8 +1,8 @@
-# GraphNet-3D-NLTE: Fast 3D Non-LTE Departure Coefficients with Graph Neural Networks
+# GraphNet-3D-NLTE: Fast 3D Non-LTE Atomic Populations with Graph Neural Networks
 
 **GraphNet-3D-NLTE** is a deep learning framework designed to accelerate the computation of non-LTE (Local Thermodynamic Equilibrium) atomic populations in 3D solar and stellar atmospheres.
 
-Building upon the 1D architecture proposed by [Vicente Arévalo et al. (2022)](https://doi.org/10.3847/1538-4357/ac53b3), this project extends the concept to fully **3D geometries**. It utilizes Graph Neural Networks (GNNs) to predict departure coefficients ($\beta$) orders of magnitude faster than traditional 3D radiative transfer solvers.
+Building upon the 1D architecture proposed by [Vicente Arévalo et al. (2022)](https://doi.org/10.3847/1538-4357/ac53b3), this project extends the concept to fully **3D geometries**. It utilizes Graph Neural Networks (GNNs) to predict the atomic level **populations** (not departure coefficients) orders of magnitude faster than traditional 3D radiative transfer solvers.
 
 ## 📖 Table of Contents
 
@@ -57,7 +57,7 @@ The core architecture follows the "Encode-Process-Decode" paradigm described in 
 
 * **Differentiable:** The network is fully differentiable, allowing seamless integration into inversion codes for calculation of Response Functions via backpropagation.
 
-* **Speed:** Predicts departure coefficients in milliseconds, offering a speedup factor of  over traditional solvers.
+* **Speed:** Predicts level populations in milliseconds, offering a large speedup over traditional solvers.
 
 ## ⚙️ Installation
 
@@ -89,6 +89,12 @@ The code expects data in BIFROST format, but easy adaptation to other formats is
  
 * **Edges ():** Connectivity indices and edge features (e.g., geometric distance).
 
+### Training data used on this branch (`new_topologies`)
+
+* **Atmosphere:** Bifrost `en024048_hion`, snapshot 385, 504 x 504 columns, vertical indices 52-476 of the native grid (425 levels, -0.51 to 12.59 Mm), stored in SI units as `data_train/AR_385_{temp,veloc,B,ne,mass,press}.dat` (produced by `bifrost_raw_read_test.ipynb` from `en024048_hion/atmos/BIFROST_en024048_hion_*_385.fits`). Known defect: the committed `AR_385_B.dat` has Bz == By (the notebook read `by` twice); corrected in `data_train_v2/`.
+* **Targets:** `data_train/AR_385_CaII_5L_pops.dat`, the populations of the 5 Ca II levels plus Ca III, in **cm^-3** (the rest of the data is SI). The network is trained on log10 of the level *fractions*; the total Ca density equals 9.65e14 * rho[kg m^-3] cm^-3 at every point.
+* **Provenance of the targets, as far as it is known:** a 3D non-LTE solution, attributed to Multi3D in `stride_tests.ipynb`; `porta_scripts/caiigen.c` reads this file as *input*, so it is not PORTA output. The code version, model atom, CRD/PRD treatment, microturbulence and the n_e treatment used to compute them are **not documented**.
+
 
 ## 🚀 Usage
 
@@ -105,7 +111,7 @@ The training process optimizes the Mean Squared Error (MSE) between the predicte
 
 ### 2. Inference (Prediction)
 
-Generate departure coefficients for a new 3D snapshot:
+Generate level populations for a new 3D snapshot:
 
 ```
 gnn_inference.ipynb
@@ -152,11 +158,11 @@ model = GNModel.load('weights/ca_ii_best.pt')
 
 # Inversion loop
 for iteration in range(max_iter):
-    # Predict Departure Coefficients (b) instantly
-    b_coeffs = model(current_atmosphere)
+    # Predict level populations instantly
+    pops = model(current_atmosphere)
     
-    # Synthesize spectra using b (e.g., with Lightweaver or SIR)
-    spectra = synthesize(current_atmosphere, b_coeffs)
+    # Synthesize spectra using the populations (e.g., with Lightweaver or SIR)
+    spectra = synthesize(current_atmosphere, pops)
     
     # ... compute loss and update atmosphere ...
 

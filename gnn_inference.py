@@ -1,6 +1,6 @@
 # %%
 import numpy as np
-import torch, os
+import torch, os, sys, json
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -11,7 +11,8 @@ import multiprocessing
 
 from graphnet import EncodeProcessDecode
 from Dataset import EfficientDataset
-from normalization import denormalize_pops, normalize_features, normalize_pops
+from normalization import denormalize_pops, normalize_features, normalize_features_with_params, normalize_pops
+from provenance import make_run_dir, write_meta
 
 # %%
 import matplotlib.colors as colors
@@ -29,14 +30,22 @@ plt.rcParams.update({
 # %%
 # Check if CUDA is available and set the device
 # Set device
-gpu = 0
-cuda_available = torch.cuda.is_available()
-device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+# CPU unless a device is given as 4th argument (e.g. 'cuda:0' with CUDA_VISIBLE_DEVICES=<a GPU nobody else uses>)
+device_name = sys.argv[4] if len(sys.argv) > 4 else 'cpu'
+cuda_available = device_name.startswith('cuda')
+device = torch.device(device_name)
 print(f"Using device: {device}\n")
 
 # %%
-# The ONLY parameter you need to set manually is the path to the checkpoint.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+# The parameters to set manually: checkpoint, inference stride (None = the training max_stride), split and the input
+# quantities ('press' or 'nh'); all can be given positionally:  python gnn_inference.py <checkpoint> <stride> <split> <device> <press|nh> [zero_features]
+checkpoint_path = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+stride = int(sys.argv[2]) if len(sys.argv) > 2 else None
+split = sys.argv[3] if len(sys.argv) > 3 else 'test'          # held-out columns only (audit E4); 'full' and 'train' still possible
+features = sys.argv[5] if len(sys.argv) > 5 else 'press'
+# ablation: expanded input labels set to zero after normalization, e.g. 'velx,vely' (what an inversion cannot provide); '' = none
+zero_features = [s for s in (sys.argv[6] if len(sys.argv) > 6 else '').split(',') if s]
+guard = 32                                                     # px next to the training region excluded from the metrics (E4)
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -53,6 +62,18 @@ new_nz = nz_linear + nz_log
 logspace_fraction = config['dataset']['logspace_fraction']
 log_offset = config['normalization']['log_offset']
 normalization_type = config['normalization'].get('type', 'log')
+factor = config['normalization']['factor']
+train_stride = config['dataset'].get('max_stride', 1)
+stride = stride or train_stride
+# representation of the training run (rungs 2-4 are config-gated; old checkpoints have none of these keys)
+features_type = config['normalization'].get('features', normalization_type)
+targets_type = config['normalization'].get('targets', normalization_type)
+use_zpos = config['dataset'].get('use_zpos', True)
+edge_features = config['dataset'].get('edge_features', 'dist')
+interp_log = config['dataset'].get('interp_log', False)
+if 'meta' in checkpoint:          # the input quantities are recorded in the checkpoint since rung 0 (the positional argument is for old runs)
+    features = 'nh' if 'n_h' in checkpoint['meta']['features_labels'] else 'press'
+print(f"Representation: features {features_type} ({features}), targets {targets_type}, z_pos {use_zpos}, edges {edge_features}, log interpolation {interp_log}")
 
 print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
@@ -63,10 +84,13 @@ b_xyz_orig = np.memmap(f'{datadir}/AR_385_B.dat', dtype='<f4', mode='r', shape=(
 temp_orig = np.memmap(f'{datadir}/AR_385_temp.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 vel_orig = np.memmap(f'{datadir}/AR_385_veloc.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 n_e_orig = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-# n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-# n_p_orig = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+if features == 'nh':
+    n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+    n_p_orig = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 rho_orig = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 press_orig = np.memmap(f'{datadir}/AR_385_press.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+for arr in (pops_orig, b_xyz_orig, temp_orig, vel_orig, n_e_orig, rho_orig, press_orig):
+    assert os.path.getsize(arr.filename) == arr.size * 4, f'{arr.filename}: file size does not match the declared shape'
 
 # %%
 print(f"Original data shape: {pops_orig.shape}")
@@ -100,15 +124,20 @@ plt.close()
 # %%
 print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
 new_points = (new_zv, new_yv, new_xv)
-pops = interpn((z, y, x), pops_orig, new_points)
-temp = interpn((z, y, x), temp_orig, new_points)
-b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
-vel = interpn((z, y, x), vel_orig, new_points)
-n_e = interpn((z, y, x), n_e_orig, new_points)
-# n_h = interpn((z, y, x), n_h_orig, new_points)
-# n_p = interpn((z, y, x), n_p_orig, new_points)
-rho = interpn((z, y, x), rho_orig, new_points)
-press = interpn((z, y, x), press_orig, new_points)
+def to_grid(a, log=False):           # as in gnn_train.py: log10 for the scalars and populations when the run used interp_log
+    if log:
+        return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
+    return interpn((z, y, x), a, new_points)
+pops = to_grid(pops_orig, interp_log)
+temp = to_grid(temp_orig, interp_log)
+b_xyz = to_grid(b_xyz_orig)
+vel = to_grid(vel_orig)
+n_e = to_grid(n_e_orig, interp_log)
+if features == 'nh':
+    n_h = to_grid(n_h_orig, interp_log)
+    n_p = to_grid(n_p_orig, interp_log)
+rho = to_grid(rho_orig, interp_log)
+press = to_grid(press_orig, interp_log)
 print("Interpolation complete.")
 print(f"New shape: {pops.shape}")
 
@@ -118,21 +147,24 @@ print(f"New shape: {pops.shape}")
 feature_norm_params = checkpoint['feature_norm_params']
 pop_norm_params = checkpoint['normalization_params']
 
-features_labels = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'ne',
-                #    'n_h', 'n_p']
-                   'rho', 'press']
-features_labels_simple = ['vel', 'b', 'temp', 'n_e',
-                        #   'n_h', 'n_p']
-                          'rho', 'press']
-features_data = [vel, b_xyz, temp, n_e,
-                #  n_h, n_p]
-                 rho, press]
+if 'meta' in checkpoint:                # the exact input list of the run (rung 2 drops B)
+    features_labels_simple = list(checkpoint['meta']['features_labels'])
+elif features == 'nh':
+    features_labels_simple = ['vel', 'b', 'temp', 'n_e', 'n_h', 'n_p']
+else:
+    features_labels_simple = ['vel', 'b', 'temp', 'n_e', 'rho', 'press']
+features_data = [{'vel': vel, 'b': b_xyz, 'temp': temp, 'n_e': n_e, 'rho': rho, 'press': press,
+                  'n_h': n_h if features == 'nh' else None, 'n_p': n_p if features == 'nh' else None}[l] for l in features_labels_simple]
+features_labels = [f'{l}{c}' for l in features_labels_simple for c in (['x', 'y', 'z'] if l in ('vel', 'b') else [''])]
 
-# We need to re-run the normalization to get the features for the dataset
-# Note: For a true inference-only script, you would apply the saved means/stds,
-# but since we're using the full dataset here, re-calculating is equivalent.
-normalized_features, _ = normalize_features(features_data, features_labels_simple, log_offset, normalization_type)
-pops_normalized, _ = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
+# The saved statistics of the training run (for the per-height 'log' type this equals re-computing them on the full cube)
+# normalized_features, _ = normalize_features(features_data, features_labels_simple, log_offset, normalization_type)
+normalized_features = normalize_features_with_params(features_data, features_labels_simple, feature_norm_params, features_type)
+for zf in zero_features:               # zero is zero in both normalizations for velocities and B (no centring)
+    l = next(l for l in features_labels_simple if zf.startswith(l))
+    normalized_features[features_labels_simple.index(l)][..., {'x': 0, 'y': 1, 'z': 2}.get(zf[len(l):], 0)] = 0.0
+    print(f"Ablation: input '{zf}' set to zero")
+pops_normalized, _ = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=targets_type)
 
 # ---- Create Test Dataset ----
 # All parameters are now from the loaded config object
@@ -150,12 +182,17 @@ dataset_params = {
     'nz_log': config['dataset']['nz_log'],
     'logspace_fraction': config['dataset']['logspace_fraction'],
     'epoch_size_fraction': 1.0,  # Use full dataset for testing
-    'max_stride': 5, # config["dataset"].get("max_stride", 2),
-    'random_stride': False, #config["dataset"].get("random_stride", False),
-    'split': 'full'
+    'max_stride': stride,
+    'random_stride': False,
+    'split_stride': train_stride,     # the test region is the one of the training run, whatever the inference stride (E4/E5)
+    'use_zpos': use_zpos,
+    'edge_features': edge_features,
+    'split': split
 }
 
 datast_test = EfficientDataset(**dataset_params)
+assert np.allclose(datast_test.zz, zz_grid, atol=1e-6), 'dataset z grid != interpolation grid'
+run_dir = make_run_dir(__file__)                                # results/gnn_inference/<stamp>/ (never overwrites)
 # loader_test = DataLoader(datast_test, batch_size=config['training']['batch_size']*6, shuffle=False)
 
 num_workers = min(12, multiprocessing.cpu_count())
@@ -286,13 +323,13 @@ k_indices_flat = np.concatenate(k_indices_central_flat, axis=0)
 
 # %%
 predictions_spatial.shape
-pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.x0:datast_test.x1, datast_test.y0:datast_test.y1]
+pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1]
 
 # %%
 # --- Denormalized Analysis ---
 print("Denormalizing populations...")
-predictions_denorm = denormalize_pops(predictions_spatial, pop_norm_params)
-targets_denorm = denormalize_pops(targets_spatial, pop_norm_params)
+predictions_denorm = denormalize_pops(predictions_spatial, pop_norm_params, targets_type)
+targets_denorm = denormalize_pops(targets_spatial, pop_norm_params, targets_type)
 
 # %%
 test_mask = np.zeros((ny_size, nx_size), dtype=bool)
@@ -300,32 +337,74 @@ for i in range(num_test_samples):
     ix, iy = datast_test.sample_centers[i]
     test_mask[iy - datast_test.y0, ix - datast_test.x0] = True
 
-predictions_denorm_flat = predictions_denorm[:, test_mask, :].reshape(-1, nlev)
-targets_denorm_flat = targets_denorm[:, test_mask, :].reshape(-1, nlev)
+# metric columns: the held-out columns at least `guard` px away from the training region (E4)
+metric_mask = test_mask.copy()
+if split == 'test':
+    metric_mask[:guard, :] = False
+    metric_mask[:, :guard] = False
+predictions_denorm_flat = predictions_denorm[:, metric_mask, :].reshape(-1, nlev)
+targets_denorm_flat = targets_denorm[:, metric_mask, :].reshape(-1, nlev)
 
 residuals_denorm = (predictions_denorm_flat - targets_denorm_flat) / (targets_denorm_flat + 1e-12)
 mae_denorm = np.mean(np.abs(residuals_denorm), axis=0)
 rmse_denorm = np.sqrt(np.mean(residuals_denorm**2, axis=0))
 
-# --- Normalized Analysis ---
-print("\nCalculating metrics on normalized values...")
-residuals_normalized = (predictions_norm_flat - targets_norm_flat) / (targets_norm_flat + 1e-12)
-mae_normalized = np.mean(np.abs(residuals_normalized), axis=0)
-rmse_normalized = np.sqrt(np.mean(residuals_normalized**2, axis=0))
-
+# --- Error in dex: e = log10(n_pred / n_target), per level and height band (plan D-2); the normalized relative
+# residual of the old version is meaningless (targets near 0) and is dropped ---
+print("\nCalculating metrics in dex...")
+with np.errstate(divide='ignore', invalid='ignore'):
+    e_dex = np.log10(predictions_denorm_flat) - np.log10(targets_denorm_flat)
+e_dex[~np.isfinite(e_dex)] = np.nan
+num_pixels_in_test = metric_mask.sum()
+z_grid_flat = np.repeat(zz_grid, num_pixels_in_test)                  # arrays are level-major: (nz * n_columns, nlev)
+bands = [(-np.inf, 0.0, 'z<0'), (0.0, 0.5, '0-0.5'), (0.5, 1.0, '0.5-1'), (1.0, 1.5, '1-1.5'), (1.5, 2.2, '1.5-2.2'), (2.2, 3.5, '2.2-3.5'), (3.5, np.inf, '>3.5')]
+level_names = ['4s', '3d3/2', '3d5/2', '4p1/2', '4p3/2', 'CaIII']
+rms = lambda v: float(np.sqrt(np.nanmean(v**2)))
+f_caII = 1.0 - targets_denorm_flat[:, -1] / targets_denorm_flat.sum(1)
+w_rel = np.clip(f_caII / 1e-2, 0.0, 1.0)[:, None]                     # Ca II relevance weight (plan D-6)
+metrics = {'region': {'x0': int(datast_test.x0), 'x1': int(datast_test.x1), 'y0': int(datast_test.y0), 'y1': int(datast_test.y1),
+                      'guard': guard, 'n_columns_test': int(test_mask.sum()), 'n_columns_metric': int(metric_mask.sum())},
+           'all': {'rms': rms(e_dex), 'median_abs': float(np.nanmedian(np.abs(e_dex))), 'p95_abs': float(np.nanpercentile(np.abs(e_dex), 95))},
+           'relevance_weighted_rms': float(np.sqrt(np.nansum(w_rel * e_dex**2) / np.nansum(w_rel * np.isfinite(e_dex)))),
+           'per_level': {level_names[l]: {'rms': rms(e_dex[:, l]), 'bias': float(np.nanmean(e_dex[:, l]))} for l in range(nlev)},
+           'per_band': {name: {'rms': rms(e_dex[(z_grid_flat >= lo) & (z_grid_flat < hi)])} for lo, hi, name in bands}}
+# the audit's number (T1/E5): all levels on the absolute columns [358, 484)^2, no guard
+a0, a1, b0, b1 = 358 - datast_test.x0, 484 - datast_test.x0, 358 - datast_test.y0, 484 - datast_test.y0
+if a0 >= 0 and b0 >= 0 and a1 <= nx_size and b1 <= ny_size:
+    with np.errstate(divide='ignore', invalid='ignore'):
+        e_audit = np.log10(predictions_denorm[:, b0:b1, a0:a1, :]) - np.log10(targets_denorm[:, b0:b1, a0:a1, :])
+    metrics['audit_region_358_484_rms_all'] = rms(e_audit[np.isfinite(e_audit)])
+print(f"\nHeld-out region x,y in [{datast_test.x0},{datast_test.x1}) minus {guard} px guard: {metric_mask.sum()} columns")
+print(f"RMS log10(n_pred/n_target) all levels: {metrics['all']['rms']:.4f} dex | Ca II-relevance-weighted {metrics['relevance_weighted_rms']:.4f} dex")
+print('per level: ' + '  '.join(f"{k} {v['rms']:.4f}" for k, v in metrics['per_level'].items()))
+print('per band : ' + '  '.join(f"{k} {v['rms']:.4f}" for k, v in metrics['per_band'].items()))
+if 'audit_region_358_484_rms_all' in metrics:
+    print(f"audit-compatible RMS on [358,484)^2, no guard: {metrics['audit_region_358_484_rms_all']:.4f} dex")
 print(f"\nMAE on original populations: {mae_denorm}")
 print(f"RMSE on original populations: {rmse_denorm}")
-
-print(f"\nMAE on normalized values: {mae_normalized}")
-print(f"RMSE on normalized values: {rmse_normalized}")
 
 # %%
 print(f"predictions_denorm.shape: {predictions_denorm.shape}, targets_denorm.shape: {targets_denorm.shape}")
 
 # %%
 # Save both populations for further synthesis
-np.save(f'{config['training']['savedir']}predictions_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy', predictions_denorm)
-np.save(f'{config['training']['savedir']}targets_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy', targets_denorm)
+tag = f'stride_{dataset_params["max_stride"]}_{dataset_params["split"]}'
+np.save(os.path.join(run_dir, f'predictions_patch_{tag}.npy'), predictions_denorm)
+np.save(os.path.join(run_dir, f'targets_patch_{tag}.npy'), targets_denorm)
+np.save(os.path.join(run_dir, 'metric_mask.npy'), metric_mask)
+np.save(os.path.join(run_dir, 'test_mask.npy'), test_mask)
+np.save(os.path.join(run_dir, 'zz_grid.npy'), zz_grid)
+with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
+    json.dump(metrics, f, indent=1)
+write_meta(run_dir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride,
+           train_stride=train_stride, split=split, split_stride=train_stride, guard=guard, x0=int(datast_test.x0), x1=int(datast_test.x1),
+           y0=int(datast_test.y0), y1=int(datast_test.y1), nx_size=int(nx_size), ny_size=int(ny_size), normalization_type=normalization_type,
+           factor=factor, totals_source='checkpoint normalization_params[totals] (Bifrost sum of levels), sliced [:, y0:y1, x0:x1]',
+           feature_set=features, features_labels=features_labels_simple, features_labels_expanded=features_labels + (['z_pos'] if use_zpos else []), datadir=datadir,
+           features_type=features_type, targets_type=targets_type, edge_features=edge_features, interp_log=interp_log, zero_features=zero_features,
+           z_grid_Mm=zz_grid, new_z_indices=new_z, device=device_name,
+           files={'predictions': f'predictions_patch_{tag}.npy', 'targets': f'targets_patch_{tag}.npy'})
+print(f"Saved arrays, metrics.json and meta.json to {run_dir}")
 
 # %%
 # 1. Configuration
@@ -404,7 +483,7 @@ for r in range(rows):
         ax.set_xticks([])
         ax.set_yticks([])
 
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_maps_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_maps_{tag}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -448,7 +527,7 @@ for i in range(nlev):
 
 # fig1.suptitle('Predicted vs. Actual Departure Coefficients (Original Scale)', fontsize=16)
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_scatter_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_scatter_{tag}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -477,7 +556,7 @@ for i in range(predictions_norm_flat.shape[1]):
 
 fig2.suptitle('Predicted vs. Actual Values for Each Target Feature (Normalized)', fontsize=16)
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_scatter_normalized_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_scatter_normalized_{tag}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -503,19 +582,19 @@ for i in range(nlev):
              transform=ax1.transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round,pad=0.3', fc='lightblue', alpha=0.7))
 
-    # --- Row 2: Residuals on Normalized Scale ---
+    # --- Row 2: Error in dex ---
     ax2 = axes3[i, 1]
-    data = residuals_normalized[:, i] * 100
-    lower, upper = -50, 50 # np.percentile(data, [3, 97])
+    data = e_dex[:, i]
+    lower, upper = -0.5, 0.5
     ax2.set_xlim(lower, upper)
-    ax2.hist(data, bins=100, range=(lower, upper), density=True, alpha=0.75, color='orange')
+    ax2.hist(data[np.isfinite(data)], bins=100, range=(lower, upper), density=True, alpha=0.75, color='orange')
     ax2.axvline(0, color='r', linestyle='--')
-    ax2.set_title(f'Level {i+1} Residuals (Normalized)')
-    ax2.set_xlabel('Relative Error (%)')
+    ax2.set_title(f'Level {i+1} error (dex)')
+    ax2.set_xlabel('log10(pred / target)')
     # ax2.set_yscale('log')
     if i == 0: ax2.set_ylabel('Density')
     ax2.grid(True, linestyle='--', alpha=0.5)
-    ax2.text(0.05, 0.95, f'MAE: {mae_normalized[i]:.3f}\nRMSE: {rmse_normalized[i]:.3f}', 
+    ax2.text(0.05, 0.95, f'RMS: {rms(data):.4f} dex\nmedian |e|: {np.nanmedian(np.abs(data)):.4f}', 
              transform=ax2.transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.7))
 
@@ -539,7 +618,7 @@ for i in range(nlev):
     ax3.legend()
 
 plt.tight_layout(rect=[0, 0, 1, 0.96])
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_errors_histograms_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_errors_histograms_{tag}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -547,10 +626,8 @@ plt.close()
 # %%
 print("Generating height-color-coded scatter plots...")
 
-# To perform the height-based analysis, we need the z-index for each flattened point
-num_pixels_in_test = test_mask.sum()
+# To perform the height-based analysis, we need the z-index for each flattened point (level-major flattening)
 z_indices_flat = np.repeat(np.arange(new_nz), num_pixels_in_test)
-z_grid_flat = np.repeat(zz_grid, num_pixels_in_test)
 
 fig_scatter, axes_scatter = plt.subplots(3, 2, figsize=(12, 15), dpi=100, gridspec_kw={'hspace': 0.1, 'wspace': 0.15})
 axes_scatter = axes_scatter.flatten()
@@ -569,9 +646,9 @@ for i in range(nlev):
         scatter = ax.scatter(x, y, c=z_colors, cmap='viridis', s=0.75, alpha=0.1, rasterized=True)
         last_scatter = scatter
 
-        # np.corrcoef returns a matrix; we want the off-diagonal element [0, 1]
-        pearson_r = np.corrcoef(x, y)[0, 1]
-        r_squared = pearson_r ** 2
+        # R^2 in log space (a linear R^2 is dominated by the deepest, densest nodes)
+        lt, lp = np.log10(x), np.log10(y)
+        r_squared = 1.0 - np.sum((lp - lt)**2) / np.sum((lt - lt.mean())**2)
         
         # Add R^2 text to the plot (bottom right corner to avoid overlap)
         # transform=ax.transAxes ensures the coordinates (0.95, 0.05) are relative to the box, not data
@@ -605,7 +682,7 @@ if last_scatter is not None:
     cbar.set_label('Height [Mm]', fontsize=14)
     cbar.solids.set(alpha=1)
 
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_scatter_height_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_scatter_height_{tag}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -618,10 +695,10 @@ fig_comp, axes_comp = plt.subplots(nlev, 3, figsize=(12, 15), dpi=100, sharex='c
                                    gridspec_kw={'hspace': 0.15, 'wspace': 0.1}) 
 
 # Define height groups for color-coding
-height_groups = {
-    f'Bottom (z < 2) Mm': (z_indices_flat < 25),
-    f'Middle (2 < z < 4) Mm': (z_indices_flat >= 25) & (z_indices_flat < 37),
-    f'Top (z >= 4) Mm': (z_indices_flat >= 37)
+height_groups = {                      # boundaries taken from the grid heights (E6: indices 25/37 are 1.78/3.66 Mm)
+    f'Bottom (z < 2) Mm': (z_grid_flat < 2.0),
+    f'Middle (2 < z < 4) Mm': (z_grid_flat >= 2.0) & (z_grid_flat < 4.0),
+    f'Top (z >= 4) Mm': (z_grid_flat >= 4.0)
 }
 colors = ['blue', 'green', 'red']
 
@@ -646,18 +723,18 @@ for i in range(nlev):
     ax1.grid(True, linestyle='--', alpha=0.5)
     # if i == 0: leg1 = ax1.legend(framealpha=0.5, facecolor='white', loc='lower left', fontsize=10)
 
-    # --- Row 2: Residuals on Normalized Scale ---
+    # --- Row 2: Error in dex ---
     ax2 = axes_comp[i, 1]
-    all_norm_residuals = residuals_normalized[:, i] * 100
-    lower, upper = -50, 50 
+    all_dex = e_dex[:, i]
+    lower, upper = -0.5, 0.5 
 
     for color, (label, mask) in zip(colors, height_groups.items()):
-        data = all_norm_residuals[mask]
-        ax2.hist(data, bins=100, range=(lower, upper), density=True, alpha=0.5, label=label, color=color)
+        data = all_dex[mask]
+        ax2.hist(data[np.isfinite(data)], bins=100, range=(lower, upper), density=True, alpha=0.5, label=label, color=color)
 
     ax2.axvline(0, color='k', linestyle='--')
-    if i == 0: ax2.set_title(f'Residuals (Normalized)', fontsize=14)
-    if i == nlev-1: ax2.set_xlabel('Relative Error (%)', fontsize=14)
+    if i == 0: ax2.set_title(f'Error (dex)', fontsize=14)
+    if i == nlev-1: ax2.set_xlabel('log10(pred / target)', fontsize=14)
     
     ax2.grid(True, linestyle='--', alpha=0.5)
     if i == 0: leg2 = ax2.legend(framealpha=0.5, facecolor='white', loc='lower left', fontsize=10)
@@ -699,7 +776,7 @@ for i in range(nlev):
     # ---------------------------------------
 
 plt.tight_layout()
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_errors_hist_height_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_errors_hist_height_{tag}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
