@@ -39,12 +39,13 @@ print(f"Using device: {device}\n")
 
 # %%
 # The parameters to set manually: checkpoint, inference stride (None = the training max_stride) and split; all can be
-# given positionally:  python gnn_inference.py <checkpoint> <stride> <split> <device> [zero_features]
+# given positionally:  python gnn_inference.py <checkpoint> <stride> <split> <device> [zero_features] [grid]
 checkpoint_path = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/v2_rung4_rotation_seed777/2026.10.08-15:09:03_best.pth'
 stride = int(sys.argv[2]) if len(sys.argv) > 2 else None
 split = sys.argv[3] if len(sys.argv) > 3 else 'test'          # held-out columns only (audit E4); 'full' and 'train' still possible
 # ablation: expanded input labels set to zero after normalization, e.g. 'velx,vely' (what an inversion cannot provide); '' = none
 zero_features = [s for s in (sys.argv[5] if len(sys.argv) > 5 else '').split(',') if s]
+grid_arg = sys.argv[6] if len(sys.argv) > 6 else ''            # evaluation grid ('index' | 'two_zone'); '' = the run's own grid
 guard = 32                                                     # px next to the training region excluded from the metrics (E4)
 
 # Load the entire checkpoint
@@ -80,7 +81,8 @@ print("Creating new Z grid")
 
 z, y, x = (np.arange(d) for d in (nz, ny, nx))
 geometry_grid = np.load(config["data"]["grid_file"])["z"]              # native level heights [Mm]
-zz_grid, new_z, _ = training_grid(config, geometry_grid)               # the training grid of the run
+grid_name = grid_arg or config['dataset'].get('grid', 'index')
+zz_grid, new_z, _ = training_grid(config, geometry_grid, grid_name)    # the training grid of the run, or the grid asked for
 new_nz = len(new_z)
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
@@ -145,6 +147,7 @@ dataset_params = {
     'radius_neighbors': config['dataset'].get('radius_neighbors', 6.01),
     'stencil_radius': config['dataset'].get('stencil_radius', 4.01),
     'edge_reach_Mm': config['dataset'].get('edge_reach_Mm', 0.5),
+    'central_reach_Mm': config['dataset'].get('central_reach_Mm'),
     'split': split
 }
 
@@ -358,7 +361,7 @@ write_meta(run_dir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoc
            y0=int(datast_test.y0), y1=int(datast_test.y1), nx_size=int(nx_size), ny_size=int(ny_size),
            totals_source='checkpoint normalization_params[totals] (Bifrost sum of levels), sliced [:, y0:y1, x0:x1]',
            features_labels=features_labels_simple, features_labels_expanded=features_labels, datadir=datadir,
-           grid=config['dataset'].get('grid', 'index'), interp_log=interp_log, zero_features=zero_features,
+           grid=grid_name, train_grid=config['dataset'].get('grid', 'index'), interp_log=interp_log, zero_features=zero_features,
            z_grid_Mm=zz_grid, new_z_indices=new_z, device=device_name,
            files={'predictions': f'predictions_patch_{tag}.npy', 'targets': f'targets_patch_{tag}.npy'})
 print(f"Saved arrays, metrics.json and meta.json to {run_dir}")

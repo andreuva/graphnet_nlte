@@ -45,10 +45,11 @@ print(f"Using device: {device}\n")
 # %%
 # The parameters to set manually: checkpoint, inference stride (None = training max_stride), crop of native columns to
 # predict ('full' or 'y0,y1,x0,x1'); all can be given positionally:
-#   python muram_inference.py <checkpoint> <stride> <crop> <device>
+#   python muram_inference.py <checkpoint> <stride> <crop> <device> [grid]
 checkpoint_path = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/v2_rung4_rotation_seed777/2026.10.08-15:09:03_best.pth'
 stride = int(sys.argv[2]) if len(sys.argv) > 2 else None
 crop = sys.argv[3] if len(sys.argv) > 3 else 'full'
+grid_arg = sys.argv[5] if len(sys.argv) > 5 else ''            # evaluation grid ('index' | 'two_zone'); '' = the run's own grid
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -112,7 +113,8 @@ print(f"Original data shape: {cube.rho.shape}")
 print("Creating new Z grid aligned with Bifrost")
 
 bifrost_z_grid = np.load(config["data"]["grid_file"])["z"]
-zz_grid_bifrost, new_z_b, z_transition_b = training_grid(config, bifrost_z_grid)    # the training levels in the Bifrost FITS frame
+grid_name = grid_arg or config['dataset'].get('grid', 'index')
+zz_grid_bifrost, new_z_b, z_transition_b = training_grid(config, bifrost_z_grid, grid_name)    # the levels in the Bifrost FITS frame
 new_nz = len(new_z_b)
 
 # Map zz_grid_bifrost to fractional indices in MURaM's vertical coordinate system, both simulations aligned at tau500 = 1
@@ -197,6 +199,7 @@ dataset_params = {
     'radius_neighbors': config['dataset'].get('radius_neighbors', 6.01),
     'stencil_radius': config['dataset'].get('stencil_radius', 4.01),
     'edge_reach_Mm': config['dataset'].get('edge_reach_Mm', 0.5),
+    'central_reach_Mm': config['dataset'].get('central_reach_Mm'),
     'split': 'full'
 }
 
@@ -293,7 +296,7 @@ np.save(os.path.join(savedir, 'ne_si_avg.npy'), n_e_si[:, y0c:y1c, x0c:x1c])
 np.savez(os.path.join(savedir, 'grid.npz'), z_rel_tau1_Mm=zz_grid, z_bifrost_frame_Mm=zz_grid_bifrost, muram_fractional_index=new_z,
          x_Mm=np.arange(x0c, x1c) * dx, y_Mm=np.arange(y0c, y1c) * dy)
 write_meta(savedir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride,
-           train_stride=config['dataset'].get('max_stride', 1), features_labels=features_labels_simple, grid=config['dataset'].get('grid', 'index'),
+           train_stride=config['dataset'].get('max_stride', 1), features_labels=features_labels_simple, grid=grid_name, train_grid=config['dataset'].get('grid', 'index'),
            muram_dir=pathsource, snapshot=snap_number, dz_km=dz * 1e3, dx_km=dx * 1e3, resolution='native (no averaging)', decimate=1,
            origin=[y0c, x0c], crop=[y0c, y1c, x0c, x1c], hop_km=stride * dx * 1e3, pad=pad, tau1_index_median=tau_zero_index,
            ztau51_bifrost_Mm=mc.ZTAU51_BIFROST,

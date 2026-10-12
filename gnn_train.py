@@ -65,6 +65,7 @@ nlev = config['data']['nlev']
 interp_log = config['dataset']['interp_log']                            # interpolate scalars and populations in log10 (WP4.3)
 log_offset = config['normalization']['log_offset']
 augment_rotation = config['dataset'].get('augment_rotation', False)    # rung 4 (D-7): random rotation about z per training sample
+train_geometry = config['dataset'].get('train_geometry', 'fixed')      # rung 5 (D-9): 'random' = a random vertical grid (and hops) per training sample
 relevance_threshold = config['training'].get('relevance_threshold', 1e-2)      # loss weight w = clip(f_CaII / threshold, 0, 1) per node ...
 coronal_weight = config['training'].get('coronal_weight', 0.1)                  # ... floored at this value (coronal nodes down-weighted, not dropped)
 
@@ -84,14 +85,14 @@ if not load_checkpoint:
 # ---- memory–mapped arrays ----
 FILE_OF = {'vel': ('AR_385_veloc.dat', 3), 'temp': ('AR_385_temp.dat', 1), 'n_e': ('AR_385_ne.dat', 1), 'rho': ('AR_385_mass.dat', 1),
            'press': ('AR_385_press.dat', 1), 'n_h': ('AR_385_nh.dat', 1), 'n_p': ('AR_385_np.dat', 1)}
-pops = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
+pops_native = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
 raw = {l: np.memmap(f'{datadir}/{FILE_OF[l][0]}', dtype='<f4', mode='r', shape=(nz, ny, nx, FILE_OF[l][1])) for l in features_labels}
-for arr in [pops] + list(raw.values()):
+for arr in [pops_native] + list(raw.values()):
     assert os.path.getsize(arr.filename) == arr.size * 4, f'{arr.filename}: file size does not match the declared shape (WP4.2)'
 manifest_path = os.path.join(datadir, 'MANIFEST.json')
 data_manifest_sha256 = hashlib.sha256(open(manifest_path, 'rb').read()).hexdigest() if os.path.exists(manifest_path) else None
 
-print('Populations shape:\t', pops.shape)
+print('Populations shape:\t', pops_native.shape)
 for l, a in raw.items():
     print(f'{l} shape:\t\t', a.shape)
 print('#'*60+'\n')
@@ -110,7 +111,7 @@ def to_grid(a, log=False):           # log10 for the scalars and populations whe
     if log:
         return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
     return interpn((z, y, x), a, new_points)
-pops = to_grid(pops, interp_log)
+pops = to_grid(pops_native, interp_log)
 features_data = [to_grid(raw[l], interp_log and l != 'vel') for l in features_labels]
 
 print("Interpolation complete.")
@@ -128,7 +129,14 @@ assert model_params['edge_input_size'] == 3, model_params['edge_input_size']
 print('N. total trainable parameters : {0}\n'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
 # ---- Normalization ----
-normalized_features, feature_norm_params = normalize_features(features_data, features_labels)
+if train_geometry == 'random':     # the training data is the native cube: its statistics are stored and applied to the validation grid too
+    native_normalized, feature_norm_params = normalize_features([raw[l] for l in features_labels], features_labels)
+    normalized_features = normalize_features(features_data, features_labels, feature_norm_params)[0]
+    native_X = np.concatenate(native_normalized, axis=-1).astype(np.float32)
+    del native_normalized
+    native_Y = normalize_pops(np.asarray(pops_native), log_offset)[0].astype(np.float32)
+else:
+    normalized_features, feature_norm_params = normalize_features(features_data, features_labels)
 pops_normalized, pop_norm_params = normalize_pops(pops, log_offset)
 
 features_list = normalized_features
@@ -156,11 +164,26 @@ dataset_params = {
     'radius_neighbors': config['dataset'].get('radius_neighbors', 6.01),
     'stencil_radius': config['dataset'].get('stencil_radius', 4.01),
     'edge_reach_Mm': config['dataset'].get('edge_reach_Mm', 0.5),
+    'central_reach_Mm': config['dataset'].get('central_reach_Mm'),
     'augment_rotation': augment_rotation,
     'rot_pairs': rot_pairs,
 }
 
-datast_train = EfficientDataset(**dataset_params, split='train')
+hop_km = config['dataset'].get('hop_km')                                 # rung 5d: continuous hops (min, max) km instead of integer strides
+drop_columns = tuple(config['dataset'].get('drop_columns', (0.0, 0.0)))  # rung 5c: fraction of neighbour columns removed per sample
+if train_geometry == 'random':
+    assert dataset_params['edge_rule'] == 'physical', "random training geometry needs edge_rule = 'physical'"
+    margin = RandomGeometryDataset.stencil_margin(dataset_params['xdim'], dataset_params['ydim'], dataset_params['max_stride'], hop_km, pixel_Mm)
+    train_centres, _, _ = split_columns(nx, ny, dataset_params['xdim'], dataset_params['ydim'], margin, margin, dataset_params['max_stride'],
+                                        dataset_params['train_ratio'], 'train', dataset_params['seed'])
+    datast_train = RandomGeometryDataset(native_X, native_Y, z_native, pixel_Mm, train_centres, dataset_params['xdim'], dataset_params['ydim'],
+                                         stencil_radius=dataset_params['stencil_radius'], edge_reach_Mm=dataset_params['edge_reach_Mm'],
+                                         central_reach_Mm=dataset_params['central_reach_Mm'], max_stride=dataset_params['max_stride'],
+                                         hop_km=hop_km, drop_columns=drop_columns, augment_rotation=augment_rotation, rot_pairs=rot_pairs,
+                                         epoch_size_fraction=dataset_params['epoch_size_fraction'], log_offset=log_offset)
+    del native_X, native_Y
+else:
+    datast_train = EfficientDataset(**dataset_params, split='train')
 # D-2 validation: the held-out corner at the training stride (no random strides, no augmentation), outside the guard band, all its columns
 datast_test = EfficientDataset(**{**dataset_params, 'epoch_size_fraction': 1.0, 'random_stride': False, 'augment_rotation': False}, split='test')
 datast_test.sample_centers = [(ix, iy) for ix, iy in datast_test.sample_centers
@@ -238,20 +261,22 @@ if ema_decay > 0:                  # EMA of the weights with the (1+n)/(10+n) ra
     ema = torch.optim.swa_utils.AveragedModel(model, multi_avg_fn=ema_avg_fn)
 print(f"Recipe: optimizer {optimizer_name} (wd {weight_decay}), schedule {schedule}, grad clip {grad_clip}, EMA {ema_decay}, fresh subset {fresh_subset}")
 print(f"Representation: inputs {features_labels_expanded}, targets log10(f + {log_offset}), edges (dz, d_h, |dr|), "
-      f"grid {config['dataset'].get('grid', 'index')} ({new_nz} levels), rotation augmentation {augment_rotation}")
+      f"grid {config['dataset'].get('grid', 'index')} ({new_nz} levels), training geometry {train_geometry}, rotation augmentation {augment_rotation}")
 
 # ---- Initialize Training State Variables ----
 start_epoch = 1
 best_loss = float('inf')
 best_dex = float('inf')
-train_loss, valid_loss, valid_dex, lrs = [], [], [], []
+best_wdex = float('inf')
+train_loss, valid_loss, valid_dex, valid_wdex, lrs = [], [], [], [], []
 meta = {'conf_path': os.path.abspath(conf_path), 'features_labels': features_labels, 'features_labels_expanded': features_labels_expanded,
         'loss': f'MSE on log10 f with node weights max(clip(f_CaII / {relevance_threshold}, 0, 1), {coronal_weight})',
         'target_transform': 'log10(f + log_offset); errors are dex', 'augment_rotation': augment_rotation, 'rot_pairs': rot_pairs,
-        'grid': config['dataset'].get('grid', 'index'), 'edge_rule': config['dataset'].get('edge_rule', 'index'), 'interp_log': interp_log, 'datadir': datadir, 'data_manifest_sha256': data_manifest_sha256,
+        'grid': config['dataset'].get('grid', 'index'), 'edge_rule': config['dataset'].get('edge_rule', 'index'), 'interp_log': interp_log,
+        'train_geometry': train_geometry, 'hop_km': hop_km, 'drop_columns': drop_columns, 'central_reach_Mm': config['dataset'].get('central_reach_Mm'), 'datadir': datadir, 'data_manifest_sha256': data_manifest_sha256,
         'grid_file': grid_file, 'z_grid_Mm': zz_levels.tolist(), 'new_z_indices': new_z.tolist(),
         'validation': {'split': 'test', 'stride': datast_test.max_stride, 'guard': valid_guard, 'n_columns': len(datast_test.sample_centers),
-                       'metric': 'RMS dex over central nodes, plain mean'},
+                       'metric': 'RMS dex over central nodes, plain mean (_best.pth); Ca II-weighted RMS with w = clip(f_CaII / 1e-2, 0, 1) (_bestw.pth)'},
         'recipe': {'optimizer': optimizer_name, 'weight_decay': weight_decay, 'adam_betas': adam_betas, 'adam_eps': adam_eps, 'schedule': schedule,
                    'warmup_epochs': warmup_epochs, 'grad_clip': grad_clip, 'ema_decay': ema_decay, 'fresh_subset': fresh_subset},
         'git': git, 'start_time': start_stamp, 'seed': config['system']['seed']}
@@ -280,6 +305,8 @@ if load_checkpoint:
             train_loss = checkpoint.get('train_loss_history', []) # Use .get for backward compatibility
             valid_loss = checkpoint.get('valid_loss_history', []) # Use .get for backward compatibility
             valid_dex = checkpoint.get('valid_dex_history', [])
+            best_wdex = checkpoint.get('best_wdex', float('inf'))
+            valid_wdex = checkpoint.get('valid_wdex_history', [])
             if ema is not None and 'ema' in checkpoint:
                 ema.load_state_dict(checkpoint['ema'])
                 ema_updates = int(checkpoint.get('ema_updates', 0))
@@ -302,13 +329,20 @@ else:
 csv_path = os.path.join(savedir, 'training_log.csv')          # one row per epoch
 if not os.path.exists(csv_path) or not load_checkpoint:
     with open(csv_path, 'w', newline='') as f:
-        csv.writer(f).writerow(['epoch', 'time', 'lr', 'train_loss_ema', 'valid_loss', 'valid_dex', 'best_dex', 'epoch_seconds'])
+        csv.writer(f).writerow(['epoch', 'time', 'lr', 'train_loss_ema', 'valid_loss', 'valid_dex', 'best_dex', 'epoch_seconds', 'valid_wdex', 'best_wdex'])
 
 # grids.png: the vertical grid in use against the native grid and the Ca II formation heights (plan WP2 step 2.9)
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'muram_comparison'))
     import muram_common as mc
-    mc.plot_grids([('native Bifrost', z_native, 'royalblue'), ('training grid', zz_levels, 'forestgreen')],
+    grid_rows = [('native Bifrost', z_native, 'royalblue'), ('training grid' if train_geometry == 'fixed' else 'validation grid', zz_levels, 'forestgreen')]
+    if train_geometry == 'random':     # what the training samples look like: 8 draws of the random two-zone grid
+        from vertical_grids import random_two_zone_grid, ZTAU51_BIFROST
+        _rng = np.random.default_rng(0)
+        for _i in range(8):
+            _h, _p, _ = random_two_zone_grid(z_native[0] - ZTAU51_BIFROST, z_native[-1] - ZTAU51_BIFROST, _rng)
+            grid_rows.append((f"draw {_i}: {_p['spacing_km']:.0f} km, tr {_p['transition_Mm']:.2f} ({len(_h)})", _h + ZTAU51_BIFROST, 'k'))
+    mc.plot_grids(grid_rows,
                   bands=[(l, lo, hi) for l, lo, hi in mc.FORMATION_BANDS_BIFROST_FRAME], transition=z_transition,
                   path=os.path.join(savedir, 'grids.png'), title='Vertical grids (Bifrost FITS frame)', xlim=(-0.8, 13.0))
 except Exception as exc:                 # noqa: BLE001  (a check figure is never a reason to stop training)
@@ -346,9 +380,9 @@ for epoch in range(start_epoch, n_epochs + 1):
     train_loss.append(loss_avg)
 
     # ------------------- VALIDATION (D-2): plain mean over all held-out graphs, in loss and in dex -------------------
-    def validate(net):
+    def validate(net):   # (weighted loss, RMS dex, Ca II-relevance-weighted RMS dex with w = clip(f_CaII / 1e-2, 0, 1) as in gnn_inference.py)
         net.eval()
-        loss_sum, sq_sum, n_batches, n_nodes = 0.0, 0.0, 0, 0
+        loss_sum, sq_sum, n_batches, n_nodes, w_sq_sum, w_nodes = 0.0, 0.0, 0, 0, 0.0, 0.0
         with torch.no_grad():
             for data in tqdm(loader_test, desc="Validating"):
                 node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
@@ -357,19 +391,25 @@ for epoch in range(start_epoch, n_epochs + 1):
                 out = net(node, edge_attr, edge_index, u, batch)
                 o, t = out.squeeze()[central_mask], target.squeeze()[central_mask]
                 loss_sum += compute_loss(o, t).item(); n_batches += 1
-                sq_sum += ((o - t) ** 2).sum().item(); n_nodes += o.numel()
-        return loss_sum / max(n_batches, 1), np.sqrt(sq_sum / max(n_nodes, 1))
+                sq = (o - t) ** 2
+                sq_sum += sq.sum().item(); n_nodes += o.numel()
+                w = torch.clamp((10.0 ** t[:, :5]).sum(dim=1) / 1e-2, 0.0, 1.0)
+                w_sq_sum += (w[:, None] * sq).sum().item(); w_nodes += w.sum().item() * o.shape[1]
+        return loss_sum / max(n_batches, 1), np.sqrt(sq_sum / max(n_nodes, 1)), np.sqrt(w_sq_sum / max(w_nodes, 1e-30))
 
-    val_loss_avg, val_dex = validate(model)
-    val_dex_ema = validate(ema.module)[1] if ema is not None else None
+    val_loss_avg, val_dex, val_wdex = validate(model)
+    _, val_dex_ema, val_wdex_ema = validate(ema.module) if ema is not None else (None, None, None)
     valid_loss.append(val_loss_avg)
     valid_dex.append(val_dex)
+    valid_wdex.append(val_wdex)
     epoch_seconds = time.time() - t_epoch
-    print(f"Epoch {epoch} finished with validation loss: {val_loss_avg:.6f} | held-out RMS {val_dex:.5f} dex"
-          + (f" | EMA weights {val_dex_ema:.5f} dex" if val_dex_ema is not None else "") + f" | {epoch_seconds / 60:.1f} min")
+    print(f"Epoch {epoch} finished with validation loss: {val_loss_avg:.6f} | held-out RMS {val_dex:.5f} dex, Ca II-weighted {val_wdex:.5f}"
+          + (f" | EMA weights {val_dex_ema:.5f} / {val_wdex_ema:.5f} dex" if val_dex_ema is not None else "") + f" | {epoch_seconds / 60:.1f} min")
 
     use_ema = val_dex_ema is not None and val_dex_ema < val_dex
     candidate = val_dex_ema if use_ema else val_dex
+    use_ema_w = val_wdex_ema is not None and val_wdex_ema < val_wdex
+    candidate_w = val_wdex_ema if use_ema_w else val_wdex
     best_loss = min(best_loss, valid_loss[-1])
     checkpoint = {
         'epoch': epoch,
@@ -377,6 +417,7 @@ for epoch in range(start_epoch, n_epochs + 1):
         'weights': 'ema' if use_ema else 'raw',
         'best_loss': best_loss,
         'best_dex': min(best_dex, candidate),
+        'best_wdex': min(best_wdex, candidate_w),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         'config': config,
@@ -385,12 +426,18 @@ for epoch in range(start_epoch, n_epochs + 1):
         'train_loss_history': train_loss,
         'valid_loss_history': valid_loss,
         'valid_dex_history': valid_dex,
+        'valid_wdex_history': valid_wdex,
         'meta': meta,
     }
     if candidate < best_dex:
         best_dex = candidate
         print(f"New best held-out dex: {best_dex:.5f} ({checkpoint['weights']} weights). Saving model...")
         torch.save(checkpoint, os.path.join(savedir, f'{filename}_best.pth'))
+    if candidate_w < best_wdex:   # the best checkpoint by the Ca II-weighted RMS (a grid with many low-relevance TR nodes can rank epochs differently)
+        best_wdex = candidate_w
+        checkpoint['state_dict'], checkpoint['weights'] = (ema.module if use_ema_w else model).state_dict(), 'ema' if use_ema_w else 'raw'
+        print(f"New best Ca II-weighted held-out dex: {best_wdex:.5f} ({checkpoint['weights']} weights). Saving model...")
+        torch.save(checkpoint, os.path.join(savedir, f'{filename}_bestw.pth'))
     # last.pth is the resume point: raw weights plus optimizer, scheduler and EMA state
     checkpoint['state_dict'], checkpoint['weights'] = model.state_dict(), 'raw'
     if ema is not None:
@@ -398,7 +445,7 @@ for epoch in range(start_epoch, n_epochs + 1):
         checkpoint['ema_updates'] = ema_updates
     torch.save(checkpoint, os.path.join(savedir, 'last.pth'))
     with open(csv_path, 'a', newline='') as f:
-        csv.writer(f).writerow([epoch, filename, scheduler.get_last_lr()[0], loss_avg, valid_loss[-1], valid_dex[-1], best_dex, round(epoch_seconds, 1)])
+        csv.writer(f).writerow([epoch, filename, scheduler.get_last_lr()[0], loss_avg, valid_loss[-1], valid_dex[-1], best_dex, round(epoch_seconds, 1), valid_wdex[-1], best_wdex])
     
     lrs.append(scheduler.get_last_lr())
     if schedule != 'warmup_cosine':
@@ -409,6 +456,7 @@ for epoch in range(start_epoch, n_epochs + 1):
     plt.plot(train_loss, label='Training Loss')
     plt.plot(valid_loss, label='Validation Loss')
     plt.plot(valid_dex, label='Held-out RMS [dex]')
+    plt.plot(valid_wdex, label='Held-out Ca II-weighted RMS [dex]')
     plt.yscale('log')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')

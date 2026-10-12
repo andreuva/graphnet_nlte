@@ -45,7 +45,7 @@ def two_zone_grid(bottom, top, spacing_km=80.0, transition=4.5, n_sparse=7, dens
     return np.concatenate([sub, dense, sparse])
 
 
-def training_grid(config, z_native):
+def training_grid(config, z_native, grid=None):
     """The vertical grid of a training run from its config: (level heights in the Bifrost FITS frame [Mm], fractional
     native indices for the interpolation of the cube, transition height [Mm, FITS frame] for the grid figure).
 
@@ -54,20 +54,24 @@ def training_grid(config, z_native):
     [dataset] grid = 'two_zone' (rung 6, D-10): physical height above tau500 = 1, identical for Bifrost and MURaM: the
     bottom native level, N_SUB sub-photospheric levels, dense_spacing_km from DENSE_START_MM to transition_Mm, then
     n_sparse geometrically spaced levels up to the top native level (two_zone_grid).
+    grid (optional) overrides [dataset] grid, e.g. to evaluate a model on another grid; missing parameters take the
+    defaults of the ladder (30 + 20 levels over 0.33 of the cube; 80 km, 4.5 Mm, 7 sparse levels).
     """
     d = config['dataset']
     nz = len(z_native)
     assert nz == config['data']['nz_orig'], (nz, config['data']['nz_orig'])
-    kind = d.get('grid', 'index')
+    kind = grid or d.get('grid', 'index')
     if kind == 'index':
-        idx = np.clip(np.concatenate([np.linspace(0, nz * d['logspace_fraction'], d['nz_linear'], endpoint=False),
-                                      np.logspace(np.log10(nz * d['logspace_fraction']), np.log10(nz - 1), d['nz_log'])]), 0, nz - 1)
+        frac, n_lin, n_log = d.get('logspace_fraction', 0.33), d.get('nz_linear', 30), d.get('nz_log', 20)
+        idx = np.clip(np.concatenate([np.linspace(0, nz * frac, n_lin, endpoint=False),
+                                      np.logspace(np.log10(nz * frac), np.log10(nz - 1), n_log)]), 0, nz - 1)
         z = np.interp(idx, np.arange(nz), z_native)
-        return z, idx, z[d['nz_linear']]
+        return z, idx, z[n_lin]
     if kind == 'two_zone':
-        h = two_zone_grid(z_native[0] - ZTAU51_BIFROST, z_native[-1] - ZTAU51_BIFROST, d['dense_spacing_km'], d['transition_Mm'], d['n_sparse'])
+        transition = d.get('transition_Mm', 4.5)
+        h = two_zone_grid(z_native[0] - ZTAU51_BIFROST, z_native[-1] - ZTAU51_BIFROST, d.get('dense_spacing_km', 80), transition, d.get('n_sparse', 7))
         z = h + ZTAU51_BIFROST
-        return z, np.interp(z, z_native, np.arange(nz)), d['transition_Mm'] + ZTAU51_BIFROST
+        return z, np.interp(z, z_native, np.arange(nz)), transition + ZTAU51_BIFROST
     raise ValueError(f"unknown [dataset] grid = '{kind}'")
 
 
