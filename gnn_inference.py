@@ -5,7 +5,7 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
-from scipy.interpolate import interpn
+from scipy.interpolate import interpn, interp1d
 import matplotlib.ticker as ticker
 import multiprocessing
 
@@ -125,7 +125,7 @@ for zf in zero_features:               # ablation (zero is zero: the velocities 
     l = next(l for l in features_labels_simple if zf.startswith(l))
     normalized_features[features_labels_simple.index(l)][..., {'x': 0, 'y': 1, 'z': 2}.get(zf[len(l):], 0)] = 0.0
     print(f"Ablation: input '{zf}' set to zero")
-pops_normalized, _ = normalize_pops(pops, log_offset)
+pops_normalized, eval_norm_params = normalize_pops(pops, log_offset)   # totals of the evaluation grid (= the checkpoint's on the training grid)
 
 # ---- Create Test Dataset ----
 # All parameters are now from the loaded config object
@@ -283,7 +283,7 @@ k_indices_flat = np.concatenate(k_indices_central_flat, axis=0)
 
 # %%
 predictions_spatial.shape
-pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1]
+pop_norm_params = {**pop_norm_params, 'totals': eval_norm_params['totals'][:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1]}
 
 # %%
 # --- Denormalized Analysis ---
@@ -340,6 +340,29 @@ print('per level: ' + '  '.join(f"{k} {v['rms']:.4f}" for k, v in metrics['per_l
 print('per band : ' + '  '.join(f"{k} {v['rms']:.4f}" for k, v in metrics['per_band'].items()))
 if 'audit_region_358_484_rms_all' in metrics:
     print(f"audit-compatible RMS on [358,484)^2, no guard: {metrics['audit_region_358_484_rms_all']:.4f} dex")
+
+# --- End-to-end error at native resolution: log10 of the predictions (and of the targets on the grid = the grid's
+# interpolation floor, what a perfect model on this grid would still miss) interpolated linearly in height to the 425
+# native levels and compared with the native populations; bands on the native FITS-frame heights. Grid-independent, so
+# runs on different vertical grids can be compared (the per-grid metric above never sees the error between its levels) ---
+native = np.asarray(pops_orig[:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1, :][:, metric_mask, :], dtype=np.float64)
+with np.errstate(divide='ignore', invalid='ignore'):
+    l_native = np.log10(native)
+    z_eval = np.clip(geometry_grid, zz_grid[0], zz_grid[-1])          # the grid spans the native range up to rounding (~1e-13 Mm)
+    to_native = lambda a: interp1d(zz_grid, np.log10(a[:, metric_mask, :]), axis=0, assume_sorted=True)(z_eval)
+    e_native = to_native(predictions_denorm) - l_native                  # (425, n_columns, nlev)
+    e_floor = to_native(targets_denorm) - l_native
+e_native[~np.isfinite(e_native)] = np.nan
+e_floor[~np.isfinite(e_floor)] = np.nan
+w_native = np.clip((1.0 - native[..., -1] / native.sum(-1)) / 1e-2, 0.0, 1.0)[..., None]
+band_of = lambda e, lo, hi: e[(geometry_grid >= lo) & (geometry_grid < hi)]
+metrics['native'] = {'all': rms(e_native), 'floor_all': rms(e_floor),
+                     'relevance_weighted_rms': float(np.sqrt(np.nansum(w_native * e_native**2) / np.nansum(w_native * np.isfinite(e_native)))),
+                     'per_band': {name: {'rms': rms(band_of(e_native, lo, hi)), 'floor_rms': rms(band_of(e_floor, lo, hi))} for lo, hi, name in bands},
+                     'per_level': {level_names[l]: {'rms': rms(e_native[..., l])} for l in range(nlev)}}
+print(f"native resolution ({len(geometry_grid)} levels): RMS {metrics['native']['all']:.4f} dex, Ca II-weighted {metrics['native']['relevance_weighted_rms']:.4f}, "
+      f"interpolation floor of the grid {metrics['native']['floor_all']:.4f}")
+print('native per band : ' + '  '.join(f"{k} {v['rms']:.4f} (floor {v['floor_rms']:.4f})" for k, v in metrics['native']['per_band'].items()))
 print(f"\nMAE on original populations: {mae_denorm}")
 print(f"RMSE on original populations: {rmse_denorm}")
 
@@ -359,7 +382,7 @@ with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
 write_meta(run_dir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride,
            train_stride=train_stride, split=split, split_stride=train_stride, guard=guard, x0=int(datast_test.x0), x1=int(datast_test.x1),
            y0=int(datast_test.y0), y1=int(datast_test.y1), nx_size=int(nx_size), ny_size=int(ny_size),
-           totals_source='checkpoint normalization_params[totals] (Bifrost sum of levels), sliced [:, y0:y1, x0:x1]',
+           totals_source='Bifrost sum of the levels on the evaluation grid, sliced [:, y0:y1, x0:x1]',
            features_labels=features_labels_simple, features_labels_expanded=features_labels, datadir=datadir,
            grid=grid_name, train_grid=config['dataset'].get('grid', 'index'), interp_log=interp_log, zero_features=zero_features,
            z_grid_Mm=zz_grid, new_z_indices=new_z, device=device_name,

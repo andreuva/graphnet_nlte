@@ -1,7 +1,7 @@
 """Table of held-out dex metrics over gnn_inference.py runs (replaces the stride comparison of stride_tests.ipynb).
 
     python plot_scripts/stride_table.py [results/gnn_inference]      (default: <repo>/results/gnn_inference; prints markdown, redirect to results/stride_table.md)
-    'grid' = evaluation grid; 'zeroed' = inputs set to zero at inference (ablation runs of gnn_inference.py), '-' = none
+    'native' = end-to-end RMS at the 425 native levels (gnn_inference.py, since 2026-10-13); 'grid' = evaluation grid; 'zeroed' = inputs set to zero at inference (ablation runs of gnn_inference.py), '-' = none
 """
 import glob
 import json
@@ -23,8 +23,9 @@ for run in sorted(glob.glob(os.path.join(base, '*'))):
                  m['all']['rms'], m['relevance_weighted_rms'], m['all']['median_abs'], m['all']['p95_abs'],
                  bands['0-0.5']['rms'] if bands.get('0-0.5') else float('nan'), bands['1-1.5']['rms'] if bands.get('1-1.5') else float('nan'),
                  bands['1.5-2.2']['rms'] if bands.get('1.5-2.2') else float('nan'), bands['>3.5']['rms'] if bands.get('>3.5') else float('nan'),
-                 m.get('audit_region_358_484_rms_all', float('nan'))))
-hdr = ('run', 'checkpoint', 's', 'split', 'grid', 'zeroed', 'guard', 'ncol', 'RMS', 'wRMS', 'med|e|', 'p95|e|', '0-0.5', '1-1.5', '1.5-2.2', '>3.5', 'audit[358,484)')
+                 m.get('audit_region_358_484_rms_all', float('nan')),
+                 m['native']['all'] if 'native' in m else float('nan'), m['native']['per_band']['2.2-3.5']['rms'] if 'native' in m else float('nan')))
+hdr = ('run', 'checkpoint', 's', 'split', 'grid', 'zeroed', 'guard', 'ncol', 'RMS', 'wRMS', 'med|e|', 'p95|e|', '0-0.5', '1-1.5', '1.5-2.2', '>3.5', 'audit[358,484)', 'native', 'native 2.2-3.5')
 print('| ' + ' | '.join(hdr) + ' |'); print('|' + '---|' * len(hdr))
 for r in rows:
     print('| ' + ' | '.join(f'{v:.4f}' if isinstance(v, float) else str(v) for v in r) + ' |')

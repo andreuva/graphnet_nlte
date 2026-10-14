@@ -103,7 +103,10 @@ levels_to_compare = [0, 1, 2, 3, 4, 5]
 levels_labels = {0: "Ca II 4s (lvl 0)", 1: "Ca II 3d3/2 (lvl 1)", 2: "Ca II 3d5/2 (lvl 2)", 3: "Ca II 4p1/2 (lvl 3)", 4: "Ca II 4p3/2 (lvl 4)", 5: "Ca III (lvl 5)"}
 level_names = ['4s', '3d3/2', '3d5/2', '4p1/2', '4p3/2', 'CaIII']
 checkpoint = torch.load(meta['checkpoint'], map_location='cpu', weights_only=False)
-means = np.asarray(checkpoint['normalization_params']['means'])[valid_mask]                 # (nh, 6) Bifrost mean fractions
+means = np.asarray(checkpoint['normalization_params']['means'])                            # Bifrost mean fractions per training level
+# the run's levels may differ from the training grid (muram_inference.py [grid]): climatology interpolated in height (FITS frame, log)
+z_train, z_run = np.asarray(checkpoint.get('meta', {}).get('z_grid_Mm', grid['z_bifrost_frame_Mm'])), grid['z_bifrost_frame_Mm']
+means = (10 ** np.stack([np.interp(z_run, z_train, np.log10(means[:, l])) for l in range(means.shape[1])], axis=-1))[valid_mask]   # (nh, 6)
 rho = np.load(os.path.join(results_dir, meta['files']['rho']))[valid_mask]                    # kg m^-3, (nh, ny, nx)
 temp = np.load(os.path.join(results_dir, meta['files']['temp']))[valid_mask]
 n_e = np.load(os.path.join(results_dir, meta['files']['ne']))[valid_mask]

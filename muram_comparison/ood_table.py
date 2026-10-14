@@ -46,7 +46,7 @@ comp_names = [f'{l}{c}' for l in labels for c in (['x', 'y', 'z'] if NCOMP.get(l
 # ---- Bifrost percentiles per level in normalized space (subsampled columns) ----
 datadir = os.path.normpath(os.path.join(REPO, config['data']['datadir'])) if not os.path.isabs(config['data']['datadir']) else config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
-_, new_z_b, _ = training_grid(config, np.load(config['data']['grid_file'])['z'])
+_, new_z_b, _ = training_grid(config, np.load(config['data']['grid_file'])['z'], meta.get('grid'))   # the levels of this MURaM run
 pts = tuple(np.meshgrid(new_z_b, np.arange(0, ny, bifrost_step), np.arange(0, nx, bifrost_step), indexing='ij', sparse=True))
 feats_b = [interpn((np.arange(nz), np.arange(ny), np.arange(nx)),
                    np.memmap(os.path.join(datadir, FILE_OF[l]), dtype='<f4', mode='r', shape=(nz, ny, nx, NCOMP.get(l, 1))), pts) for l in labels]

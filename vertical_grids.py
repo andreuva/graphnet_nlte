@@ -34,7 +34,7 @@ N_SUB = 2                        # interior levels between the bottom native lev
 def two_zone_grid(bottom, top, spacing_km=80.0, transition=4.5, n_sparse=7, dense_start=DENSE_START_MM, n_sub=N_SUB):
     """Fixed two-zone grid (D-10): bottom, n_sub sub-photospheric levels, dense zone at `spacing_km` from
     `dense_start` to `transition`, `n_sparse` geometrically spaced levels up to and including `top`."""
-    sub = np.linspace(bottom, dense_start, n_sub + 2)[:-1]                       # bottom + n_sub interior
+    sub = np.linspace(bottom, dense_start, n_sub + 2)[:-1] if dense_start > bottom + 1e-9 else np.empty(0)   # bottom + n_sub interior
     dense = np.arange(dense_start, transition + 1e-9, spacing_km / 1e3)
     # geometric gaps from the dense spacing at the transition up to the top
     d0 = spacing_km / 1e3
@@ -55,21 +55,26 @@ def training_grid(config, z_native, grid=None):
     bottom native level, N_SUB sub-photospheric levels, dense_spacing_km from DENSE_START_MM to transition_Mm, then
     n_sparse geometrically spaced levels up to the top native level (two_zone_grid).
     grid (optional) overrides [dataset] grid, e.g. to evaluate a model on another grid; missing parameters take the
-    defaults of the ladder (30 + 20 levels over 0.33 of the cube; 80 km, 4.5 Mm, 7 sparse levels).
+    defaults of the ladder (30 + 20 levels over 0.33 of the cube; 80 km, 4.5 Mm, 7 sparse levels). Inference-only forms:
+    'two_zone:<km>' sets the dense spacing; 'dense[:<km>]' is the two-zone grid with its dense zone starting at the bottom
+    native level (no sparse sub-photospheric levels).
     """
     d = config['dataset']
     nz = len(z_native)
     assert nz == config['data']['nz_orig'], (nz, config['data']['nz_orig'])
-    kind = grid or d.get('grid', 'index')
+    kind, _, spacing_arg = (grid or d.get('grid', 'index')).partition(':')
     if kind == 'index':
         frac, n_lin, n_log = d.get('logspace_fraction', 0.33), d.get('nz_linear', 30), d.get('nz_log', 20)
         idx = np.clip(np.concatenate([np.linspace(0, nz * frac, n_lin, endpoint=False),
                                       np.logspace(np.log10(nz * frac), np.log10(nz - 1), n_log)]), 0, nz - 1)
         z = np.interp(idx, np.arange(nz), z_native)
         return z, idx, z[n_lin]
-    if kind == 'two_zone':
+    if kind in ('two_zone', 'dense'):
         transition = d.get('transition_Mm', 4.5)
-        h = two_zone_grid(z_native[0] - ZTAU51_BIFROST, z_native[-1] - ZTAU51_BIFROST, d.get('dense_spacing_km', 80), transition, d.get('n_sparse', 7))
+        spacing = float(spacing_arg) if spacing_arg else d.get('dense_spacing_km', 80)
+        bottom = z_native[0] - ZTAU51_BIFROST
+        h = two_zone_grid(bottom, z_native[-1] - ZTAU51_BIFROST, spacing, transition, d.get('n_sparse', 7),
+                          dense_start=bottom if kind == 'dense' else DENSE_START_MM)
         z = h + ZTAU51_BIFROST
         return z, np.interp(z, z_native, np.arange(nz)), transition + ZTAU51_BIFROST
     raise ValueError(f"unknown [dataset] grid = '{kind}'")

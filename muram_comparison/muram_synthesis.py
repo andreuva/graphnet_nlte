@@ -122,7 +122,10 @@ print("3. Loading populations for the patch...")
 # GNN populations: log fractions interpolated from the 50 levels to the native levels, times the total Ca density
 # of each native column (CA_TOTAL_PER_RHO * rho); LTE (Saha-Boltzmann) and Bifrost climatology on the same levels
 checkpoint = torch.load(meta['checkpoint'], map_location='cpu', weights_only=False)
-means = np.asarray(checkpoint['normalization_params']['means'])          # (50, 6) Bifrost mean fraction per level
+means = np.asarray(checkpoint['normalization_params']['means'])          # Bifrost mean fraction per training level
+# the run's levels may differ from the training grid (muram_inference.py [grid]): climatology interpolated in height (FITS frame, log)
+z_train = np.asarray(checkpoint.get('meta', {}).get('z_grid_Mm', grid['z_bifrost_frame_Mm']))
+means = 10 ** np.stack([np.interp(grid['z_bifrost_frame_Mm'], z_train, np.log10(means[:, l])) for l in range(means.shape[1])], axis=-1)
 
 def pops_on_native(j, i, T_top, ne_top, rho_top):
     tot_cm3 = CA_TOTAL_PER_RHO * rho_top[::-1]                                        # bottom first, cm^-3

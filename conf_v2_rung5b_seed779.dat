@@ -1,0 +1,111 @@
+# rung 7: seed 779 of conf_v2_rung5b.dat (written by launch/rung7_seeds_queue.sh)
+# conf.dat
+
+# ===================================================================
+# Rung 5b of the v2 ladder (plan D-9 (b)-(c)): rung 5a + a random sampling of the atmosphere per training sample. The cube
+# stays at its 425 native levels; every training graph draws a two-zone grid in height above tau500 = 1 (dense spacing
+# 60-110 km up to a transition at 3.8-4.8 Mm, 5-10 sparse levels, jitter, 0-15 % / 0-50 % of the interior dense / sparse
+# levels removed; bottom and top native levels kept; vertical_grids.random_two_zone_grid) and interpolates features and
+# log fractions to it. Validation and inference stay on the fixed 'index' grid at stride 4 (comparable with every rung).
+# Edges: physical rule, neighbour columns within 0.5 Mm, central column within 2.0 Mm (conf_v2_rung5a_central2.dat).
+# Rung 5a = rung 4 + edges in physical units with a fixed vertical reach (plan D-9 prerequisite);
+# rung 4 = rung 3 + one random rotation about z per training sample (D-7); rung 3 = rung 2 + log_softmax head, log10 fraction targets and Ca II-relevance-weighted MSE (D-5, D-6);
+# rung 2 inputs (plan D-4): global log10 standardization of
+# T, rho, n_e, P, v/(10 km/s), no B, no raw height feature, edges (dz, d_h, |dr|) in Mm
+# This file is the single source of truth for all parameters.
+# ===================================================================
+
+[system]
+gpu = 0
+seed = 779
+# fraction of the GPU memory the training may use (shared GPU); comment out for an exclusive GPU
+gpu_memory_fraction = 0.65
+
+[data]
+datadir = '../data_train_v2'
+grid_file = '../en024048_hion/grid_bifrost.npz'
+nx = 504
+ny = 504
+# Original nz after slicing (476 - 52 + 1)
+nz_orig = 425
+nlev = 6
+# input quantities (file map in gnn_train.py); B dropped (D-4)
+features = 'vel', 'temp', 'n_e', 'rho', 'press'
+
+[dataset]
+# Z-axis interpolation settings
+nz_linear = 30
+nz_log = 20
+logspace_fraction = 0.33
+# interpolate scalars and populations in log10 to the training grid (WP4.3; the old runs interpolated linearly)
+interp_log = True
+# rung 5b: training graphs sampled with a random two-zone grid per sample from the native cube (validation grid above)
+train_geometry = 'random'
+# vertical grid of the training run ('index' = 30 native indices linearly spaced over the first logspace_fraction of the cube + 20 log-spaced)
+grid = 'index'
+# Graph construction (rung 5a): star topology; columns within stencil_radius stencil units of the centre (49 columns, as the
+# index rule at equal strides), levels within edge_reach_Mm of the central node (adjacent central levels always linked);
+# the receptive field in km is then the same for every stride and grid (the index rule gave +-4 levels at stride 1, +-16 at stride 4)
+edge_rule = 'physical'
+stencil_radius = 4.01
+edge_reach_Mm = 0.5
+central_reach_Mm = 2.0
+x_range_graph = 4
+y_range_graph = 4
+max_stride = 4
+random_stride = True
+# rung 4 (D-7): (vx, vy) and the stencil rotated by 0/90/180/270 deg about z, one draw per training sample; nothing else
+augment_rotation = True
+# Data split for train/test
+train_ratio = 0.7
+
+[training]
+lr = 1e-3
+batch_size = 8
+epoch_size_fraction = 0.2
+n_epochs = 15
+savedir = 'checkpoints/v2_rung5b_random_grid_seed779/'
+load_checkpoint = False
+# Smoothed loss factor
+smooth = 0.01
+# D-2 validation: held-out corner at the training stride, outside this guard band (px); fraction of it to use
+valid_guard = 32
+valid_subset = 1.0
+num_workers = 8
+# rung-1 recipe (D-8): AdamW with decoupled weight decay on the weight matrices, linear warmup (1 epoch) + cosine to zero
+# stepped per batch, gradient clipping, EMA of the weights (ramped), fresh random training subset every epoch
+optimizer = 'adamw'
+weight_decay = 0.01
+adam_betas = 0.9, 0.95
+adam_eps = 1e-6
+schedule = 'warmup_cosine'
+warmup_epochs = 1
+grad_clip = 1.0
+ema_decay = 0.9998
+fresh_subset = True
+relevance_threshold = 1e-2
+coronal_weight = 0.1
+# Scheduler milestones for learning rate reduction
+milestones = 15, 30, 60, 120
+# Scheduler reduction factor
+gamma = 0.5
+
+[model]
+# Input size is 7 physical features (vx, vy, vz, log T, log n_e, log rho, log P), no z-position feature
+node_input_size = 7
+edge_input_size = 3
+global_input_size = 1
+latent_size = 128
+mlp_hidden_size = 64
+mlp_n_hidden_layers = 3
+dropout=0.25
+n_message_passing_steps = 8
+# Output size is 6 CaII levels
+output_size = 6
+# rung 3 (D-5): outputs = log10(softmax + log_offset), fractions sum exactly to one
+head = 'log_softmax'
+head_log_offset = 1e-12
+
+[normalization]
+# targets log10(f + log_offset); inputs: global log10 standardization (normalization.py)
+log_offset = 1e-12
