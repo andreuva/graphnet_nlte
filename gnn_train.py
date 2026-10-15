@@ -8,7 +8,7 @@ from tqdm import tqdm
 from graphnet import *
 from configobj import ConfigObj
 from Dataset import *
-from normalization import normalize_pops, normalize_features
+from normalization import normalize_pops, normalize_features, lte_log_fractions, expand_labels
 from vertical_grids import training_grid
 import matplotlib.pyplot as plt
 import os, time, shutil, sys, csv, hashlib
@@ -86,7 +86,9 @@ if not load_checkpoint:
 FILE_OF = {'vel': ('AR_385_veloc.dat', 3), 'temp': ('AR_385_temp.dat', 1), 'n_e': ('AR_385_ne.dat', 1), 'rho': ('AR_385_mass.dat', 1),
            'press': ('AR_385_press.dat', 1), 'n_h': ('AR_385_nh.dat', 1), 'n_p': ('AR_385_np.dat', 1)}
 pops_native = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
-raw = {l: np.memmap(f'{datadir}/{FILE_OF[l][0]}', dtype='<f4', mode='r', shape=(nz, ny, nx, FILE_OF[l][1])) for l in features_labels}
+# 'lte' (rung 8a) is derived from temp and n_e (normalization.lte_log_fractions), which are loaded even when they are not inputs
+raw_labels = [l for l in features_labels if l != 'lte'] + [l for l in ('temp', 'n_e') if 'lte' in features_labels and l not in features_labels]
+raw = {l: np.memmap(f'{datadir}/{FILE_OF[l][0]}', dtype='<f4', mode='r', shape=(nz, ny, nx, FILE_OF[l][1])) for l in raw_labels}
 for arr in [pops_native] + list(raw.values()):
     assert os.path.getsize(arr.filename) == arr.size * 4, f'{arr.filename}: file size does not match the declared shape (WP4.2)'
 manifest_path = os.path.join(datadir, 'MANIFEST.json')
@@ -111,8 +113,12 @@ def to_grid(a, log=False):           # log10 for the scalars and populations whe
     if log:
         return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
     return interpn((z, y, x), a, new_points)
+if 'lte' in features_labels:
+    t0 = time.time(); print('Computing the log10 LTE Ca fractions of the native cube from temp and n_e (rung 8a)...')
+    raw['lte'] = lte_log_fractions(raw['temp'], raw['n_e'], log_offset)       # (nz, ny, nx, 6), interpolated linearly like any log quantity
+    print(f'... done in {time.time() - t0:.0f} s, shape {raw["lte"].shape}')
 pops = to_grid(pops_native, interp_log)
-features_data = [to_grid(raw[l], interp_log and l != 'vel') for l in features_labels]
+features_data = [to_grid(raw[l], interp_log and l not in ('vel', 'lte')) for l in features_labels]
 
 print("Interpolation complete.")
 print('\n'+'#'*60)
@@ -141,7 +147,7 @@ pops_normalized, pop_norm_params = normalize_pops(pops, log_offset)
 
 features_list = normalized_features
 targets_list = [pops_normalized]
-features_labels_expanded = [f'{l}{c}' for l in features_labels for c in (['x', 'y', 'z'] if l == 'vel' else [''])]
+features_labels_expanded = expand_labels(features_labels)
 assert len(features_labels_expanded) == model_params['node_input_size'], (features_labels_expanded, model_params['node_input_size'])
 rot_pairs = [(i, i + 1) for i, l in enumerate(features_labels_expanded) if l == 'velx']   # (x, y) columns rotated as vectors (D-7)
 
@@ -270,6 +276,8 @@ best_dex = float('inf')
 best_wdex = float('inf')
 train_loss, valid_loss, valid_dex, valid_wdex, lrs = [], [], [], [], []
 meta = {'conf_path': os.path.abspath(conf_path), 'features_labels': features_labels, 'features_labels_expanded': features_labels_expanded,
+        'derived_inputs': {'lte': 'log10 LTE fractions of the six Ca II levels from temp [K] and n_e [m^-3] of the atmosphere itself '
+                                  '(lightweaver lte_pops, Debye on), computed on the native cube (normalization.lte_log_fractions)'} if 'lte' in features_labels else {},
         'loss': f'MSE on log10 f with node weights max(clip(f_CaII / {relevance_threshold}, 0, 1), {coronal_weight})',
         'target_transform': 'log10(f + log_offset); errors are dex', 'augment_rotation': augment_rotation, 'rot_pairs': rot_pairs,
         'grid': config['dataset'].get('grid', 'index'), 'edge_rule': config['dataset'].get('edge_rule', 'index'), 'interp_log': interp_log,

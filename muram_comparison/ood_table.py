@@ -17,7 +17,7 @@ from scipy.interpolate import interpn
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path[:0] = [REPO, HERE]
-from normalization import normalize_features     # noqa: E402
+from normalization import normalize_features, lte_log_fractions, expand_labels     # noqa: E402
 from vertical_grids import training_grid        # noqa: E402
 import muram_common as mc                                     # noqa: E402
 
@@ -41,24 +41,32 @@ grid = np.load(os.path.join(results_dir, meta['files']['grid']))
 new_z_m, z_rel = grid['muram_fractional_index'], grid['z_rel_tau1_Mm']
 dec = meta.get('decimate', 1)
 py, px = meta['origin'] if 'origin' in meta else meta['parities'][0]
-comp_names = [f'{l}{c}' for l in labels for c in (['x', 'y', 'z'] if NCOMP.get(l, 1) == 3 else [''])]
+comp_names = expand_labels(labels)
+# 'lte' (rung 8a) is derived from temp and n_e on both sides (normalization.lte_log_fractions)
+raw_labels = [l for l in labels if l != 'lte'] + [l for l in ('temp', 'n_e') if 'lte' in labels and l not in labels]
 
 # ---- Bifrost percentiles per level in normalized space (subsampled columns) ----
 datadir = os.path.normpath(os.path.join(REPO, config['data']['datadir'])) if not os.path.isabs(config['data']['datadir']) else config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
 _, new_z_b, _ = training_grid(config, np.load(config['data']['grid_file'])['z'], meta.get('grid'))   # the levels of this MURaM run
 pts = tuple(np.meshgrid(new_z_b, np.arange(0, ny, bifrost_step), np.arange(0, nx, bifrost_step), indexing='ij', sparse=True))
-feats_b = [interpn((np.arange(nz), np.arange(ny), np.arange(nx)),
-                   np.memmap(os.path.join(datadir, FILE_OF[l]), dtype='<f4', mode='r', shape=(nz, ny, nx, NCOMP.get(l, 1))), pts) for l in labels]
+feats_b = {l: interpn((np.arange(nz), np.arange(ny), np.arange(nx)),
+                      np.memmap(os.path.join(datadir, FILE_OF[l]), dtype='<f4', mode='r', shape=(nz, ny, nx, NCOMP.get(l, 1))), pts) for l in raw_labels}
+if 'lte' in labels:
+    feats_b['lte'] = lte_log_fractions(feats_b['temp'], feats_b['n_e'], config['normalization']['log_offset'])
+feats_b = [feats_b[l] for l in labels]
 norm_b = np.concatenate(normalize_features(feats_b, labels, fnp)[0], axis=-1)      # (nz_new, ny/s, nx/s, ncomp)
 lo = np.percentile(norm_b, plo, axis=(1, 2))                                                   # (nz_new, ncomp)
 hi = np.percentile(norm_b, phi, axis=(1, 2))
 
 # ---- MURaM in the same space ----
 cube = mc.load_snap()
-fields = mc.muram_si_on_levels(cube, new_z_m, labels)
+fields = mc.muram_si_on_levels(cube, new_z_m, raw_labels)
 ny_m, nx_m = np.load(os.path.join(results_dir, meta['files']['rho'])).shape[1:]
-feats_m = [fields[l][:, py:py + dec * ny_m:dec, px:px + dec * nx_m:dec] for l in labels]     # the predicted native columns
+feats_m = {l: fields[l][:, py:py + dec * ny_m:dec, px:px + dec * nx_m:dec] for l in raw_labels}     # the predicted native columns
+if 'lte' in labels:
+    feats_m['lte'] = lte_log_fractions(feats_m['temp'], feats_m['n_e'], config['normalization']['log_offset'])
+feats_m = [feats_m[l] for l in labels]
 norm_m = np.concatenate(normalize_features(feats_m, labels, fnp)[0], axis=-1)      # (nz_new, ny_m, nx_m, ncomp)
 outside = (norm_m < lo[:, None, None, :]) | (norm_m > hi[:, None, None, :])
 frac = outside.mean(axis=(1, 2))                                                                    # (nz_new, ncomp)

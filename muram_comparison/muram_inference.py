@@ -9,13 +9,13 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
-from scipy.interpolate import interpn
+from scipy.interpolate import interpn, interp1d
 import matplotlib.ticker as ticker
 import multiprocessing
 
 from graphnet import EncodeProcessDecode
 from Dataset import EfficientDataset
-from normalization import CA_TOTAL_PER_RHO, denormalize_pops, normalize_features
+from normalization import CA_TOTAL_PER_RHO, denormalize_pops, normalize_features, lte_log_fractions
 from vertical_grids import training_grid
 from provenance import make_run_dir, write_meta
 import muram_common as mc
@@ -173,13 +173,20 @@ pop_norm_params = checkpoint['normalization_params']
 with_h = 'n_h' in features_labels_simple    # the ChE hydrogen files: H_1 = ground-level neutral H, H_6 = protons, cm^-3 (= Bifrost's n_h, n_p in m^-3)
 n_h_si = interpn((z, x, y), cube.H_1, new_points) * 1e6 if with_h else None
 n_p_si = interpn((z, x, y), cube.H_6, new_points) * 1e6 if with_h else None
-features_data = [{'vel': vel_si, 'temp': temp_si, 'n_e': n_e_si, 'rho': rho_si, 'press': press_si, 'n_h': n_h_si, 'n_p': n_p_si}[l]
-                 for l in features_labels_simple]
-features_data = [f[:, yidx][:, :, xidx] for f in features_data]          # the padded crop (arrays are (z, y, x))
-for name, dex in input_shift.items():           # diagnostic only: the populations' totals keep the true rho
-    assert name in features_labels_simple and name != 'vel', (name, features_labels_simple)
-    features_data[features_labels_simple.index(name)] = features_data[features_labels_simple.index(name)] * 10.0 ** dex
+quantities = {'vel': vel_si, 'temp': temp_si, 'n_e': n_e_si, 'rho': rho_si, 'press': press_si, 'n_h': n_h_si, 'n_p': n_p_si}
+quantities = {k: v[:, yidx][:, :, xidx] for k, v in quantities.items() if v is not None}     # the padded crop (arrays are (z, y, x))
+for name, dex in input_shift.items():           # diagnostic only, before any derived input: the populations' totals keep the true rho
+    assert name != 'vel' and (name in features_labels_simple or ('lte' in features_labels_simple and name in ('temp', 'n_e'))), (name, features_labels_simple)
+    quantities[name] = quantities[name] * 10.0 ** dex
     print(f"Ablation: input '{name}' scaled by {dex:+.3f} dex")
+if 'lte' in features_labels_simple:             # rung 8a: on MURaM's own native levels of the crop (shifted like the inputs), then the six
+    T_nat = np.asarray(cube.Temp)[:, xidx][:, :, yidx].transpose(0, 2, 1) * 10.0 ** input_shift.get('temp', 0.0)        # log fractions interpolated
+    ne_nat = np.asarray(cube.ne)[:, xidx][:, :, yidx].transpose(0, 2, 1) * 1e6 * 10.0 ** input_shift.get('n_e', 0.0)   # linearly in z, as the Bifrost path
+    lte_nat = lte_log_fractions(T_nat, ne_nat, log_offset)                                                              # (nz_native, ny_crop, nx_crop, 6)
+    quantities['lte'] = interp1d(z, lte_nat, axis=0, assume_sorted=True)(new_z).astype(np.float32)
+    print(f"LTE input: computed on {lte_nat.shape[0]} native MURaM levels of the crop, interpolated to {len(new_z)} levels")
+    del T_nat, ne_nat, lte_nat
+features_data = [quantities[l] for l in features_labels_simple]
 rho_crop = rho_si[:, y0c:y1c, x0c:x1c]
 
 # Normalize features using the pre-computed training statistics to match the model's domain
