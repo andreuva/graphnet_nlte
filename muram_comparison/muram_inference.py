@@ -45,11 +45,13 @@ print(f"Using device: {device}\n")
 # %%
 # The parameters to set manually: checkpoint, inference stride (None = training max_stride), crop of native columns to
 # predict ('full' or 'y0,y1,x0,x1'); all can be given positionally:
-#   python muram_inference.py <checkpoint> <stride> <crop> <device> [grid]
+#   python muram_inference.py <checkpoint> <stride> <crop> <device> [grid] [input_shift, e.g. n_e:-0.059]
 checkpoint_path = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/v2_rung4_rotation_seed777/2026.10.08-15:09:03_best.pth'
 stride = int(sys.argv[2]) if len(sys.argv) > 2 else None
 crop = sys.argv[3] if len(sys.argv) > 3 else 'full'
 grid_arg = sys.argv[5] if len(sys.argv) > 5 else ''            # evaluation grid ('index' | 'two_zone'); '' = the run's own grid
+# diagnostic ablation: input quantities scaled before normalization, 'n_e:-0.059' multiplies n_e by 10**-0.059 (dex); '' = none
+input_shift = {k: float(v) for k, v in (t.split(':') for t in (sys.argv[6] if len(sys.argv) > 6 else '').split(',') if t)}
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -174,6 +176,10 @@ n_p_si = interpn((z, x, y), cube.H_6, new_points) * 1e6 if with_h else None
 features_data = [{'vel': vel_si, 'temp': temp_si, 'n_e': n_e_si, 'rho': rho_si, 'press': press_si, 'n_h': n_h_si, 'n_p': n_p_si}[l]
                  for l in features_labels_simple]
 features_data = [f[:, yidx][:, :, xidx] for f in features_data]          # the padded crop (arrays are (z, y, x))
+for name, dex in input_shift.items():           # diagnostic only: the populations' totals keep the true rho
+    assert name in features_labels_simple and name != 'vel', (name, features_labels_simple)
+    features_data[features_labels_simple.index(name)] = features_data[features_labels_simple.index(name)] * 10.0 ** dex
+    print(f"Ablation: input '{name}' scaled by {dex:+.3f} dex")
 rho_crop = rho_si[:, y0c:y1c, x0c:x1c]
 
 # Normalize features using the pre-computed training statistics to match the model's domain
@@ -295,7 +301,7 @@ np.save(os.path.join(savedir, 'temp_avg.npy'), temp_si[:, y0c:y1c, x0c:x1c])
 np.save(os.path.join(savedir, 'ne_si_avg.npy'), n_e_si[:, y0c:y1c, x0c:x1c])
 np.savez(os.path.join(savedir, 'grid.npz'), z_rel_tau1_Mm=zz_grid, z_bifrost_frame_Mm=zz_grid_bifrost, muram_fractional_index=new_z,
          x_Mm=np.arange(x0c, x1c) * dx, y_Mm=np.arange(y0c, y1c) * dy)
-write_meta(savedir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride,
+write_meta(savedir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride, input_shift=input_shift,
            train_stride=config['dataset'].get('max_stride', 1), features_labels=features_labels_simple, grid=grid_name, train_grid=config['dataset'].get('grid', 'index'),
            muram_dir=pathsource, snapshot=snap_number, dz_km=dz * 1e3, dx_km=dx * 1e3, resolution='native (no averaging)', decimate=1,
            origin=[y0c, x0c], crop=[y0c, y1c, x0c, x1c], hop_km=stride * dx * 1e3, pad=pad, tau1_index_median=tau_zero_index,
