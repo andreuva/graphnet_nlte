@@ -230,6 +230,15 @@ class MuramCube(np.memmap):
                        ('J','Jtot'),
                        ('S','Stot'),
                        ('tau','tau'),
+                       ('H_1','H_1'),        # hydrogen level populations of the non-equilibrium
+                       ('H_2','H_2'),        # (ChE) treatment: H_1 ground state ... H_6 protons
+                       ('H_3','H_3'),
+                       ('H_4','H_4'),
+                       ('H_5','H_5'),
+                       ('H_6','H_6'),
+                       ('HH','HH'),          # H2 molecules
+                       ('HHp','HHp'),        # H2+
+                       ('Hm','Hm'),          # H-
                        ('QxH','QxH'),
                        ('QxCa','QxCa'),
                        ('QxMg','QxMg'),

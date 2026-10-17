@@ -10,39 +10,41 @@ from lightweaver.rh_atoms import H_6_atom, H_6_CRD_atom, H_3_atom, C_atom, O_ato
 
 import numpy as np
 from scipy.interpolate import interpn, interp1d
-import os, time
+import os, time, sys, json, glob
+import lightweaver.constants as const
+from lightweaver.atomic_table import DefaultAtomicAbundance
 import torch
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from joblib import Parallel, delayed
 
 # %%
-# Load the saved predictions and targets from the GNN inference step.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+# The run to synthesize: a gnn_inference.py results directory (default: the most recent one); its meta.json gives the
+# checkpoint, stride, split, the patch origin and the evaluation grid.   python synthesis.py [results/gnn_inference/<stamp>]
+_here = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+results_dir = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(os.path.join(_here, 'results', 'gnn_inference', '*', 'meta.json')))[-1][:-len('meta.json')]
+meta = json.load(open(os.path.join(results_dir, 'meta.json')))
+checkpoint_path = meta['checkpoint']
 
 # Load the entire checkpoint
-checkpoint = torch.load(checkpoint_path, weights_only=False)
+checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
 # Extract the configuration object used for training
 config = checkpoint['config']
 datadir = config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
 nlev = config['data']['nlev']
-nz_linear = config['dataset']['nz_linear']
-nz_log = config['dataset']['nz_log']
-new_nz = nz_linear + nz_log
-logspace_fraction = config['dataset']['logspace_fraction']
 log_offset = config['normalization']['log_offset']
-normalization_type = config['normalization'].get('type', 'log')
 
 print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
 # %%
 # Load the saved predictions and targets from the GNN inference step.
-stride = 3
-dataset_type = 'full'
-predictions_denorm = np.load(f'{config['training']['savedir']}predictions_patch_stride_{stride}_{dataset_type}.npy')
-targets_denorm = np.load(f'{config['training']['savedir']}targets_patch_stride_{stride}_{dataset_type}.npy')
+stride = meta['stride']
+dataset_type = meta['split']
+predictions_denorm = np.load(os.path.join(results_dir, meta['files']['predictions']))
+targets_denorm = np.load(os.path.join(results_dir, meta['files']['targets']))
+metric_mask = np.load(os.path.join(results_dir, 'metric_mask.npy'))          # (y, x): the held-out columns outside the guard band
 
 _, ny_patch, nx_patch, _ = predictions_denorm.shape
 
@@ -51,11 +53,8 @@ print(f"Targets shape: {targets_denorm.shape}")
 
 # %%
 z, y, x = (np.arange(d) for d in (nz, ny, nx))
-new_z_log = np.concatenate([
-    np.linspace(0, nz * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz * logspace_fraction), np.log10(nz - 1), nz_log)
-])
-new_z = np.clip(new_z_log, 0, nz - 1)
+new_z = np.asarray(meta['new_z_indices'])                                                # the evaluation grid of the run (fractional native indices)
+new_nz = len(new_z)
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
@@ -66,8 +65,8 @@ b_xyz_orig = np.memmap(f'{datadir}/AR_385_B.dat', dtype='<f4', mode='r', shape=(
 temp_orig = np.memmap(f'{datadir}/AR_385_temp.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 vel_orig = np.memmap(f'{datadir}/AR_385_veloc.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 n_e_orig = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-# n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
-# n_p_orig = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+n_h_orig = np.memmap(f'{datadir}/AR_385_nh.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
+n_p_orig = np.memmap(f'{datadir}/AR_385_np.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 rho_orig = np.memmap(f'{datadir}/AR_385_mass.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 press_orig = np.memmap(f'{datadir}/AR_385_press.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 
@@ -88,18 +87,24 @@ z_shift = 0
 print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
 
 new_points = (new_zv, new_yv, new_xv)
-pops = interpn((z, y, x), pops_orig, new_points)
-temp = interpn((z, y, x), temp_orig, new_points)
+def interp_log(a):                    # the scalars and populations in log10, as the network saw them (gnn_inference.py); velocities linear
+    return 10.0 ** interpn((z, y, x), np.log10(np.asarray(a, dtype=np.float64)), new_points)
+pops = interp_log(pops_orig)
+temp = interp_log(temp_orig)
 b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
 vel = interpn((z, y, x), vel_orig, new_points)
-n_e = interpn((z, y, x), n_e_orig, new_points)
-# n_h = interpn((z, y, x), n_h_orig, new_points)
-# n_p = interpn((z, y, x), n_p_orig, new_points)
-rho = interpn((z, y, x), rho_orig, new_points)
-press = interpn((z, y, x), press_orig, new_points)
+n_e = interp_log(n_e_orig)
+n_h = interp_log(n_h_orig)
+n_p = interp_log(n_p_orig)
+rho = interp_log(rho_orig)
+press = interp_log(press_orig)
 print("Interpolation complete.")
 print(f"Original shape: ({nz}, {ny}, {nx})")
 print(f"New shape: {pops.shape}")
+# the patch arrays start at the patch origin saved by gnn_inference.py: crop the cubes the same way (the old code indexed
+# the full cube with patch-local indices, i.e. the wrong columns)
+y0, y1, x0, x1 = meta['y0'], meta['y1'], meta['x0'], meta['x1']
+pops, temp, b_xyz, vel, n_e, n_h, n_p, rho, press = (a[:, y0:y1, x0:x1] for a in (pops, temp, b_xyz, vel, n_e, n_h, n_p, rho, press))
 
 # %%
 atmosRef = Falc82()
@@ -130,8 +135,8 @@ def process_single_row(row_idx, ny_patch,
                        b_xyz,
                        vel, 
                        n_e,
-                      # n_h, 
-                      # n_p,
+                       n_h,
+                       n_p,
                       rho,
                       press,
                       # pops, 
@@ -141,91 +146,85 @@ def process_single_row(row_idx, ny_patch,
     
     # Pre-allocate arrays for this specific row to store results
     # Shape: (ny_patch, nwave)
-    row_lte = np.zeros((ny_patch, len(wave)))
-    row_1dnlte = np.zeros((ny_patch, len(wave)))
-    row_target = np.zeros((ny_patch, len(wave)))
-    row_pred = np.zeros((ny_patch, len(wave)))
+    row_lte = np.full((ny_patch, len(wave)), np.nan)        # NaN = column failed (excluded from the means)
+    row_1dnlte = np.full((ny_patch, len(wave)), np.nan)
+    row_target = np.full((ny_patch, len(wave)), np.nan)
+    row_pred = np.full((ny_patch, len(wave)), np.nan)
     
     # Iterate over columns in this row
     for col_pix in range(ny_patch):
         
         # --- 1. Extract Data (Slicing logic from original code) ---
         # Note: We slice at [row_idx] fixed, iterating [col_pix]
-        temp_atm = np.ascontiguousarray(temp[-1:1:-1, col_pix, row_idx, 0])
-        b_xyz_atm = np.ascontiguousarray(b_xyz[-1:1:-1, col_pix, row_idx, 2])
-        vel_atm = np.ascontiguousarray(vel[-1:1:-1, col_pix, row_idx, 2])/1e2
-        n_e_atm = np.ascontiguousarray(n_e[-1:1:-1, col_pix, row_idx, 0])*1e6
-        # n_h_atm = np.ascontiguousarray(n_h[-1:1:-1, col_pix, row_idx, 0])*1e6
-        # n_p_atm = np.ascontiguousarray(n_p[-1:1:-1, col_pix, row_idx, 0])*1e6
-        # rho_atm = np.ascontiguousarray(rho[-1:1:-1, col_pix, row_idx, 0])
-        press_atm = np.ascontiguousarray(press[-1:1:-1, col_pix, row_idx, 0])
-        pops_atm = np.ascontiguousarray(pops[-1:1:-1, col_pix, row_idx, :])*1e6
+        temp_atm = np.ascontiguousarray(temp[::-1, col_pix, row_idx, 0])
+        b_xyz_atm = np.ascontiguousarray(b_xyz[::-1, col_pix, row_idx, 2])
+        vel_atm = np.ascontiguousarray(vel[::-1, col_pix, row_idx, 2])          # m/s already (positive = upward)
+        n_e_atm = np.ascontiguousarray(n_e[::-1, col_pix, row_idx, 0])          # m^-3 already
+        rho_atm = np.ascontiguousarray(rho[::-1, col_pix, row_idx, 0])          # kg m^-3
+        nH_atm = np.ascontiguousarray((n_h[::-1, col_pix, row_idx, 0] + n_p[::-1, col_pix, row_idx, 0]))   # total hydrogen: neutral + protons, m^-3
+        press_atm = np.ascontiguousarray(press[::-1, col_pix, row_idx, 0])
+        pops_atm = np.ascontiguousarray(pops[::-1, col_pix, row_idx, :])*1e6
         
-        prediction_atm = np.ascontiguousarray(predictions_denorm[-1:1:-1, col_pix, row_idx, :])*1e6
-        target_atm = np.ascontiguousarray(targets_denorm[-1:1:-1, col_pix, row_idx, :])*1e6
+        prediction_atm = np.ascontiguousarray(predictions_denorm[::-1, col_pix, row_idx, :])*1e6
+        target_atm = np.ascontiguousarray(targets_denorm[::-1, col_pix, row_idx, :])*1e6
 
         # --- 3. Lightweaver Setup (Pre/LTE) ---
         atmos_pre = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
-                                          depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]),
+                                          depthScale=np.ascontiguousarray(zz_grid_m[::-1]),
                                           convertScales=False,
                                           temperature=temp_atm,
-                                          # ne=n_e_atm,
-                                          # nHTot=n_h_atm,
-                                          Pgas=press_atm,
-                                          vturb=1e3*np.ones_like(temp_atm),
+                                          ne=n_e_atm,
+                                          nHTot=nH_atm,
+                                          vturb=np.zeros_like(temp_atm),      # as in porta_scripts/caiigen.c
                                           vlos=vel_atm)
         atmos_pre.quadrature(5)
         
         # Re-instantiate atoms inside the worker to avoid pickling issues with C++ objects
         aSet_pre = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
                                     Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
-        aSet_pre.set_active('H', 'Ca')
+        aSet_pre.set_active('Ca')                     # Ca active only, as muram_comparison/bifrost_15d_floor.py (hydrogen in LTE)
         spect_pre = aSet_pre.compute_wavelength_grid()
 
         eqPops_pre = aSet_pre.compute_eq_pops(atmos_pre)
         ctx_pre = lw.Context(atmos_pre, spect_pre, eqPops_pre, Nthreads=1, conserveCharge=False)
 
-        # Compute LTE intensity
-        row_lte[col_pix, :] = ctx_pre.compute_rays(wave, [atmos_pre.muz[-1]], stokes=False)
+        # Compute LTE intensity (mu = 1)
+        row_lte[col_pix, :] = ctx_pre.compute_rays(wave, [1.0], stokes=False)
 
-        # CONVERGE 1D NLTE ATMOSPHERE
+        # CONVERGE 1D NLTE ATMOSPHERE (Ca active, Bifrost n_e kept: the 1.5D reference setup assumed for MURaM)
         try:
-            aSet_pre.set_active('H', 'Ca')
-            eqPops_pre = aSet_pre.iterate_lte_ne_eq_pops(atmos_pre, quiet=True, direct=True)
-            ctx_pre = lw.Context(atmos_pre, spect_pre, eqPops_pre, conserveCharge=True, Nthreads=2)
+            ctx_pre = lw.Context(atmos_pre, spect_pre, eqPops_pre, conserveCharge=False, Nthreads=1)
             lw.iterate_ctx_se(ctx_pre, quiet=True)
-            eqPops_pre.update_lte_atoms_Hmin_pops(atmos_pre)
-            row_1dnlte[col_pix, :] = ctx_pre.compute_rays(wave, [atmos_pre.muz[-1]], stokes=False)
+            row_1dnlte[col_pix, :] = ctx_pre.compute_rays(wave, [1.0], stokes=False)
         except Exception as e:
             print(f'Error catched: {e}')
-            print(f'Convergence of pix ({row_idx},{col_pix}) failed, intensity zeroed.')
+            print(f'Convergence of pix ({row_idx},{col_pix}) failed, intensity set to NaN.')
 
         # --- 4. NLTE Computations ---
         atmos = lw.Atmosphere.make_1d(scale=lw.ScaleType.Geometric, 
-                                      depthScale=np.ascontiguousarray(zz_grid_m[-1:1:-1]),
+                                      depthScale=np.ascontiguousarray(zz_grid_m[::-1]),
                                       convertScales=False,
                                       temperature=temp_atm, 
-                                      # ne=n_e_atm,
-                                      # nHTot=n_h_atm,
-                                      Pgas=press_atm,
-                                      vturb=1e3*np.ones_like(temp_atm),
+                                      ne=n_e_atm,
+                                      nHTot=nH_atm,
+                                      vturb=np.zeros_like(temp_atm),
                                       vlos=vel_atm)
         atmos.quadrature(5)
         aSet = lw.RadiativeSet([H_6_atom(), C_atom(), OI_ord_atom(), Si_atom(), Al_atom(), CaII_atom(),
                                 Fe_atom(), He_9_atom(), MgII_atom(), N_atom(), Na_atom(), S_atom()])
-        aSet.set_active('H', 'Ca')
+        aSet.set_active('Ca')
         spect = aSet.compute_wavelength_grid()
         eqPops = aSet.compute_eq_pops(atmos)
 
-        # Target Populations
-        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(prediction_atm, 1, 0))
-        ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
-        row_target[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
-
-        # Predicted Populations
+        # Target Populations (the old code injected the predictions here and the targets below: E3)
         eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(target_atm, 1, 0))
         ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
-        row_pred[col_pix, :] = ctx.compute_rays(wave, [atmos.muz[-1]], stokes=False)
+        row_target[col_pix, :] = ctx.compute_rays(wave, [1.0], stokes=False)
+
+        # Predicted Populations
+        eqPops.atomicPops['Ca'].n = np.ascontiguousarray(np.moveaxis(prediction_atm, 1, 0))
+        ctx = lw.Context(atmos, spect, eqPops, Nthreads=1, conserveCharge=False)
+        row_pred[col_pix, :] = ctx.compute_rays(wave, [1.0], stokes=False)
 
     return row_idx, row_lte, row_1dnlte, row_target, row_pred
 
@@ -240,7 +239,7 @@ start_time = time.time()
 
 # n_jobs=-1 uses all available cores. 
 # verbose=5 provides progress updates.
-results = Parallel(n_jobs=100, verbose=5)(
+results = Parallel(n_jobs=32, verbose=5)(
     delayed(process_single_row)(
         row, ny_patch,
         # nx_patch, nz, 
@@ -248,8 +247,8 @@ results = Parallel(n_jobs=100, verbose=5)(
         b_xyz,
         vel, 
         n_e,
-        # n_h,
-        # n_p,
+        n_h,
+        n_p,
         rho,
         press,
         # pops, 
@@ -281,28 +280,52 @@ print("Done.")
 
 # %%
 # Save the results
-np.save(f'{config["training"]["savedir"]}Iwave_lte_stride_{stride}_{dataset_type}.npy', Iwave_lte)
-np.save(f'{config["training"]["savedir"]}Iwave_nlte_stride_{stride}_{dataset_type}.npy', Iwave_nlte)
-np.save(f'{config["training"]["savedir"]}Iwave_target_stride_{stride}_{dataset_type}.npy', Iwave_target)
-np.save(f'{config["training"]["savedir"]}Iwave_predicted_stride_{stride}_{dataset_type}.npy', Iwave_predicted)
+np.save(os.path.join(results_dir, f'Iwave_lte_stride_{stride}_{dataset_type}.npy'), Iwave_lte)
+np.save(os.path.join(results_dir, f'Iwave_nlte_stride_{stride}_{dataset_type}.npy'), Iwave_nlte)
+np.save(os.path.join(results_dir, f'Iwave_target_stride_{stride}_{dataset_type}.npy'), Iwave_target)
+np.save(os.path.join(results_dir, f'Iwave_predicted_stride_{stride}_{dataset_type}.npy'), Iwave_predicted)
+
+# %%
+# Core-window metrics next to the band MAPE: the band averages 1001 wavelengths over 1 nm of which 100 are in the core
+lambda0 = 854.4438                                    # Ca II 8542 rest wavelength of CaII_atom (nm, vacuum)
+core = np.abs(wave - lambda0) <= 0.050
+i0 = int(np.argmin(np.abs(wave - lambda0)))
+ok = np.isfinite(Iwave_target[..., 0]) & metric_mask.T          # the Iwave arrays are (x, y); metrics on the held-out columns outside the guard band
+def core_position(I):                                  # wavelength of the core minimum, parabolic refinement
+    k = np.clip(np.argmin(np.where(core, I, np.inf), axis=-1), 1, nwave - 2)
+    idx = np.arange(I.shape[0]); ym, yc, yp = I[idx, k - 1], I[idx, k], I[idx, k + 1]
+    den = ym - 2 * yc + yp
+    return wave[k] + np.where(den != 0, 0.5 * (ym - yp) / np.where(den != 0, den, 1), 0.0) * (wave[1] - wave[0])
+T_ok = Iwave_target[ok]
+synth_metrics = {'n_columns': int(ok.sum()), 'vturb_m_s': 0.0, 'mu': 1.0, 'lambda0_nm': lambda0,
+                 'target_core_shift_rms_pm': float(np.sqrt(np.mean((core_position(T_ok) - lambda0)**2)) * 1e3)}
+for name, I in (('gnn', Iwave_predicted), ('lte', Iwave_lte), ('nlte1d', Iwave_nlte)):
+    M = I[ok]; good = np.isfinite(M[:, 0])
+    rel = (M[good] - T_ok[good]) / T_ok[good]
+    synth_metrics[name] = {'n': int(good.sum()), 'band_mape_pct': float(np.mean(np.abs(rel)) * 100), 'core_mape_pct': float(np.mean(np.abs(rel[:, core])) * 100),
+                           'centre_median_abs_pct': float(np.median(np.abs(rel[:, i0])) * 100), 'centre_bias_pct': float(np.median(rel[:, i0]) * 100),
+                           'core_shift_vs_target_rms_pm': float(np.sqrt(np.mean((core_position(M[good]) - core_position(T_ok[good]))**2)) * 1e3)}
+with open(os.path.join(results_dir, f'synthesis_metrics_stride_{stride}_{dataset_type}.json'), 'w') as f:
+    json.dump(synth_metrics, f, indent=1)
+print(json.dumps(synth_metrics, indent=1))
 
 # %%
 # plot the atmosRef and atmos_pre stratification in all the quantities to compare
 # 1. Select a pixel to compare (e.g., the center of the patch)
-r_idx = 75
-c_idx = 175
+r_idx = nx_patch // 2
+c_idx = ny_patch // 2
 
 print(f"Plotting comparison for pixel coordinates: ({r_idx}, {c_idx})")
 
 # 2. Extract Data for this pixel (using the same logic as your loop)
-# Note: applying the [-1:1:-1] slicing as done in the loop
-temp_atm_slice = np.ascontiguousarray(temp[-1:1:-1, c_idx, r_idx, 0]) 
-vel_atm_slice = np.ascontiguousarray(vel[-1:1:-1, c_idx, r_idx, 2])/1e2 
-# n_e_atm_slice = np.ascontiguousarray(n_e[-1:1:-1, c_idx, r_idx, 0])*1e6 
-# n_h_atm_slice = np.ascontiguousarray(n_h[-1:1:-1, c_idx, r_idx, 0])*1e6
-rho = np.ascontiguousarray(rho[-1:1:-1, c_idx, r_idx, 0])
-press = np.ascontiguousarray(press[-1:1:-1, c_idx, r_idx, 0])
-height_slice = np.ascontiguousarray(zz_grid_m[-1:1:-1])
+# Note: applying the [::-1] slicing as done in the loop
+temp_atm_slice = np.ascontiguousarray(temp[::-1, c_idx, r_idx, 0]) 
+vel_atm_slice = np.ascontiguousarray(vel[::-1, c_idx, r_idx, 2])
+# n_e_atm_slice = np.ascontiguousarray(n_e[::-1, c_idx, r_idx, 0])*1e6 
+# n_h_atm_slice = np.ascontiguousarray(n_h[::-1, c_idx, r_idx, 0])*1e6
+rho = np.ascontiguousarray(rho[::-1, c_idx, r_idx, 0])
+press = np.ascontiguousarray(press[::-1, c_idx, r_idx, 0])
+height_slice = np.ascontiguousarray(zz_grid_m[::-1])
 
 # 3. Re-create the Lightweaver atmosphere for this specific pixel
 # (We recreate it here to ensure we have the specific object handle for plotting)
@@ -311,10 +334,9 @@ atmos_pre_plot = lw.Atmosphere.make_1d(
     depthScale=height_slice,
     convertScales=False,
     temperature=temp_atm_slice,
-    # ne=n_e_atm_slice,
-    # nHTot=n_h_atm_slice, 
-    Pgas=press,
-    vturb=1e3*np.ones_like(temp_atm_slice),
+    ne=np.ascontiguousarray(n_e[::-1, c_idx, r_idx, 0]),
+    nHTot=rho / (const.Amu * DefaultAtomicAbundance.massPerH),
+    vturb=np.zeros_like(temp_atm_slice),
     vlos=vel_atm_slice, 
     verbose=True
 )
@@ -385,7 +407,7 @@ axs[2].legend()
 
 plt.tight_layout()
 
-save_path_dist = os.path.join(config['training']['savedir'], f'comparison_atmosphere_pixel_{stride}_{dataset_type}_{r_idx}_{c_idx}.png')
+save_path_dist = os.path.join(results_dir, f'comparison_atmosphere_pixel_{stride}_{dataset_type}_{r_idx}_{c_idx}.png')
 plt.savefig(save_path_dist, dpi=300)
 
 # plt.show()
@@ -446,7 +468,7 @@ ax2.text(0.05, 0.95, 'Positive means data is pulled\nfrom higher up (atmosphere 
          transform=ax2.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
 plt.tight_layout()
-save_path_dist = os.path.join(config['training']['savedir'], f'geometry_shift_effect_pixel_{stride}_{dataset_type}_{pixel_x}_{pixel_y}.png')
+save_path_dist = os.path.join(results_dir, f'geometry_shift_effect_pixel_{stride}_{dataset_type}_{pixel_x}_{pixel_y}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -457,7 +479,7 @@ print(f"Shape of the synthesized intensities: {Iwave_predicted.shape}, {Iwave_ta
 # %%
 # Calculate Spatially Averaged Spectra for comparison
 mean_I_lte = np.mean(Iwave_lte, axis=(0, 1))
-mean_I_nlte = np.mean(Iwave_nlte, axis=(0,1), where= Iwave_nlte != 0)
+mean_I_nlte = np.nanmean(Iwave_nlte, axis=(0,1))        # NaN where the 1D NLTE did not converge
 mean_I_orig = np.mean(Iwave_target, axis=(0, 1))
 mean_I_pred = np.mean(Iwave_predicted, axis=(0, 1))
 
@@ -526,7 +548,7 @@ cbar = fig.colorbar(im_pred, ax=[ax_map_target, ax_map_pred],
 cbar.set_label('Intensity [W / (m$^2$ Hz sr)]', fontsize=16)
 
 # plt.tight_layout()
-save_path_dist = os.path.join(config['training']['savedir'], f'synthesis_maps_s{stride}_{dataset_type}_{pixel_x}_{pixel_y}.png')
+save_path_dist = os.path.join(results_dir, f'synthesis_maps_s{stride}_{dataset_type}_{pixel_x}_{pixel_y}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -547,7 +569,7 @@ plt.legend()
 # plt.grid(True, alpha=0.3)
 
 plt.tight_layout()
-save_path_dist = os.path.join(config['training']['savedir'], f'synthesis_spectra_s{stride}_{dataset_type}_{pixel_x}_{pixel_y}.png')
+save_path_dist = os.path.join(results_dir, f'synthesis_spectra_s{stride}_{dataset_type}_{pixel_x}_{pixel_y}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -802,7 +824,7 @@ cbar.set_label('Mean Absolute Relative Error [%]', fontsize=16)
 plt.tight_layout()
 
 # Save logic
-save_path_dist = os.path.join(config['training']['savedir'], f'synthesis_error_distribution_s{stride}_{dataset_type}.png')
+save_path_dist = os.path.join(results_dir, f'synthesis_error_distribution_s{stride}_{dataset_type}.png')
 plt.savefig(save_path_dist, dpi=300)
 print(f"Error distribution plot saved to: {save_path_dist}")
 # plt.show()
@@ -895,7 +917,7 @@ cbar = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 cbar.set_label('Mean Absolute Relative Error [%]', fontsize=14)
 
 # plt.tight_layout() # tight_layout can sometimes conflict with complex gridspecs, simple show works best with manual gs spacing
-save_path_dist = os.path.join(config['training']['savedir'], f'synthesis_error_distribution_v2_s{stride}_{dataset_type}.png')
+save_path_dist = os.path.join(results_dir, f'synthesis_error_distribution_v2_s{stride}_{dataset_type}.png')
 plt.savefig(save_path_dist, dpi=300)
 print(f"Error distribution plot saved to: {save_path_dist}")
 

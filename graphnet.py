@@ -5,17 +5,6 @@ from torch_geometric.data import Data
 from torch_scatter import scatter_mean
 
 
-def kaiming_init(m):
-    if isinstance(m, (nn.Linear)):
-        init.kaiming_normal_(m.weight)
-        if m.bias is not None:
-            m.bias.data.fill_(0)
-    elif isinstance(m, (nn.BatchNorm1d)):
-        m.weight.data.fill_(1)
-        if m.bias is not None:
-            m.bias.data.fill_(0)
-
-
 class GraphIndependent(nn.Module):
     def __init__(self, edge_model_fn=None, node_model_fn=None, global_model_fn=None):
         """
@@ -78,12 +67,14 @@ class MLP(nn.Module):
 
         if (activation == 'relu'):
             self.activation = nn.ReLU()
-        if (activation == 'leakyrelu'):
+        elif (activation == 'leakyrelu'):
             self.activation = nn.LeakyReLU()
-        if (activation == 'elu'):
+        elif (activation == 'elu'):
             self.activation = nn.ELU()
-        if (activation == 'gelu'):
+        elif (activation == 'gelu'):
             self.activation = nn.GELU()
+        else:
+            raise ValueError(f"Unknown activation '{activation}'; use 'relu', 'leakyrelu', 'elu' or 'gelu'")
 
         self.layers = nn.ModuleList([])
 
@@ -106,10 +97,6 @@ class MLP(nn.Module):
             x = layer(x)
 
         return x
-
-    def weights_init(self):
-        for module in self.modules():
-            kaiming_init(module)
 
 
 class EdgeModel(torch.nn.Module):
@@ -226,7 +213,7 @@ class EncodeProcessDecode(nn.Module):
     def __init__(self, node_input_size, edge_input_size, global_input_size, 
                  latent_size, mlp_hidden_size, mlp_n_hidden_layers,
                  n_message_passing_steps,output_size,
-                 dropout=None):
+                 dropout=None, head='log_softmax', head_log_offset=1e-12):
         """
         Encode-Process-Decode Network (https://arxiv.org/abs/2010.03409)
 
@@ -248,6 +235,9 @@ class EncodeProcessDecode(nn.Module):
             Number of message passing steps
         output_size : int
             Output size of the decode node representations
+        head : str
+            'log_softmax': the decoded outputs are turned into log10(softmax + head_log_offset), i.e. log10 level
+            fractions that sum exactly to one, in the representation of normalization.normalize_pops (same log_offset).
         """
         super(EncodeProcessDecode, self).__init__()
 
@@ -260,6 +250,10 @@ class EncodeProcessDecode(nn.Module):
         self.n_message_passing_steps = n_message_passing_steps
         self.output_size = output_size
         self.dropout = dropout
+        self.head = head
+        self.head_log_offset = head_log_offset
+        if head != 'log_softmax':
+            raise ValueError(f"Unknown head '{head}'; the targets are log10 fractions, use 'log_softmax'")
 
         # ---------------------
         # ENCODER
@@ -332,8 +326,7 @@ class EncodeProcessDecode(nn.Module):
 
     def decode(self, node):
         node_out = self.decoder_network(node)
-
-        return node_out
+        return torch.log10(torch.softmax(node_out, dim=-1) + self.head_log_offset)
 
     def process_step(self, processor_network, node, edge_attr, edge_index, u, batch):
 
@@ -398,83 +391,3 @@ class EncodeProcessDecode(nn.Module):
         node_out = self.decode(node_k)
 
         return node_out
-
-    def weights_init(self):
-        for module in self.modules():
-            kaiming_init(module)
-
-
-if (__name__ == '__main__'):
-
-    # We define a simple graph with 20 nodes. Each node encodes one single number. The edges
-    # also encode one single property (egdes). There is a global property of the graph with 1 property (u).
-    # Since we are using one single graph, we set batch_size=1
-    n_node = 20
-    n_node_attr = 1
-    n_edge_attr = 1
-    n_u_attr = 1
-
-    # Count the number of edges in the graph
-    n_edges = 2*(n_node - 2) + 2
-
-    # Nodes
-    node = torch.zeros((n_node, n_node_attr), dtype=torch.float)
-
-    # Desired target, in this case of dimension 1, but can be different
-    target = torch.zeros((n_node, n_node_attr), dtype=torch.float)
-
-    # Indices of the nodes that each edge connects
-    edge_index = torch.zeros((2, n_edges), dtype=torch.long)
-
-    # Edge attributes
-    edge_attr = torch.zeros((n_edges, n_edge_attr), dtype=torch.float)
-
-    # Global properties
-    u = torch.zeros((1, n_u_attr), dtype=torch.float)
-
-    # Node for each batch
-    batch = torch.zeros(n_node, dtype=torch.long)
-
-    # Fill some arbitrary numbers in the graph
-    for i in range(n_node):
-        node[i, :] = i / 10.0
-
-    loop = 0
-    for i in range(n_node):
-        if (i == 0):
-            edge_index[0, loop] = 0
-            edge_index[1, loop] = 1
-            edge_attr[loop, :] = torch.ones(1)
-            loop += 1
-        if (i == n_node-1):
-            edge_index[0, loop] = n_node-1
-            edge_index[1, loop] = n_node-2
-            edge_attr[loop, :] = torch.ones(1)
-            loop += 1
-        if (i > 0 and i < n_node-1):
-            edge_index[0, loop] = i
-            edge_index[1, loop] = i-1
-            edge_attr[loop, :] = torch.ones(1)
-            loop += 1
-            edge_index[0, loop] = i
-            edge_index[1, loop] = i+1
-            edge_attr[loop, :] = torch.ones(1)
-            loop += 1
-
-    # Generate a Data containing all relevant information of the graph
-    data = Data(x=node, edge_index=edge_index,
-                edge_attr=edge_attr, y=target, u=u, batch=batch)
-
-    # Define the network
-    net = EncodeProcessDecode(
-        node_input_size=1,
-        edge_input_size=1,
-        global_input_size=1,
-        latent_size=16,
-        mlp_hidden_size=16,
-        mlp_n_hidden_layers=2,
-        n_message_passing_steps=2,
-        output_size=1)
-
-    # Forward evaulation
-    tmp = net(data.x, data.edge_attr, data.edge_index, data.u, data.batch)

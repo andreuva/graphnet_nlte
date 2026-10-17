@@ -2,18 +2,23 @@
 import muram as mio  
 
 import numpy as np
-import torch, os
+import torch, os, sys
+_here = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+sys.path[:0] = [_here, os.path.join(_here, '..')]      # this folder and the repo root (graphnet, Dataset, normalization, provenance)
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
-from scipy.interpolate import interpn
+from scipy.interpolate import interpn, interp1d
 import matplotlib.ticker as ticker
 import multiprocessing
 
 from graphnet import EncodeProcessDecode
 from Dataset import EfficientDataset
-from normalization import denormalize_pops, normalize_features_with_params
+from normalization import CA_TOTAL_PER_RHO, denormalize_pops, normalize_features, lte_log_fractions
+from vertical_grids import training_grid
+from provenance import make_run_dir, write_meta
+import muram_common as mc
 
 # %%
 import matplotlib.colors as colors
@@ -31,14 +36,20 @@ plt.rcParams.update({
 # %%
 # Check if CUDA is available and set the device
 # Set device
-gpu = 1
-cuda_available = torch.cuda.is_available()
-device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+# CPU unless a device is given as 4th argument (e.g. 'cuda:0' with CUDA_VISIBLE_DEVICES=<a GPU nobody else uses>) (M7)
+device_name = sys.argv[4] if len(sys.argv) > 4 else 'cpu'
+cuda_available = device_name.startswith('cuda')
+device = torch.device(device_name)
 print(f"Using device: {device}\n")
 
 # %%
-# The ONLY parameter you need to set manually is the path to the checkpoint.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+# The parameters: checkpoint, inference stride ('' = the training max_stride; 8 = 188 km, the training footprint), crop of
+# native columns to predict ('full' or 'y0,y1,x0,x1'), device and grid, all positional:
+#   python muram_inference.py <checkpoint> <stride> <crop> <device> [grid]
+checkpoint_path = sys.argv[1]
+stride = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+crop = sys.argv[3] if len(sys.argv) > 3 else 'full'
+grid_arg = sys.argv[5] if len(sys.argv) > 5 else ''            # evaluation grid ('two_zone[:km]' | 'dense[:km]', e.g. dense:60); '' = the validation grid of the run
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -48,9 +59,10 @@ config = checkpoint['config']
 nlev = config['data']['nlev']
 
 log_offset = config['normalization']['log_offset']
-normalization_type = config['normalization'].get('type', 'log')
+features_labels_simple = list(checkpoint['meta']['features_labels'])      # the input quantities of the run
 
 print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
+print(f"Inputs {features_labels_simple}, grid {config['dataset']['grid']}")
 
 # %%
 # For the SSD data with ch and corona - you can use this path:
@@ -67,11 +79,9 @@ snap_number = 499000
 cube = mio.MuramSnap(pathsource, snap_number)
 # But for the other one, they are so called SUBSNAPS - so you use MuramSubSnap
 #cube = mio.MuramSubSnap(path3D, 0)
-cube.available
 
 # %%
-cube.Temp.shape
-# This means NZ, NX, NY - so the axis are transposed 
+# cube.Temp.shape is (NZ, NX, NY) - so the axis are transposed 
 # you need to transpose them back as T = cube.Temp.transpose(1,2,0)
 
 # BUT the same way these are transposed, meaning of vector components is also tranposed:
@@ -79,87 +89,74 @@ cube.Temp.shape
 # And same for V_x
 
 # %%
-# The easiest way to look for log tau = 0 layer is: 
-tau_mean = np.mean(cube.tau, axis=(1,2))
-tau_zero_index = np.argmin(np.abs(tau_mean - 1))
-print(f"Index of log tau = 0 layer: {tau_zero_index}")
+# tau500 = 1 from the per-column crossing (median fractional index 47.6; the argmin of the mean tau gives 49, 28 km too high: M5)
+muram_z_grid, tau_zero_index = mc.muram_heights(cube)      # heights [Mm] relative to tau500 = 1, fractional index
+print(f"Index of log tau = 0 layer: {tau_zero_index:.2f}")
 
 # %%
-# construct the grid knowing that this is enhanced network simulation from Przybylski 2022 (or something like that), and what you need to have for the use is 
-# dx = dy = 24 km 
-# dz = 20 km
-dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
+# grid spacing from the header (dx = dy = 23.4375 km, dz = 20 km; M6). Native resolution: the data are never averaged,
+# the multi-stride training is what makes the network adapt to the horizontal resolution.
+dz, dx, dy = (np.asarray(cube.Temp.dX) / 1e5) / 1e3
 
 nz, nx, ny  = cube.Temp.shape
 z, x, y = (np.arange(d) for d in (nz, nx, ny))
 z_geom, x_geom, y_geom = z*dz, x*dx, y*dy
-muram_z_grid = z_geom-z_geom[tau_zero_index]
 
 # %%
 datadir_bifrost = config['data']['datadir']
 nx_bifrost, ny_bifrost, nz_bifrost = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
 
-nz_linear = config['dataset']['nz_linear']      # number of linear points in the grid
-nz_log = config['dataset']['nz_log']            # number of log points in the grid
-new_nz = nz_linear + nz_log
-logspace_fraction = config['dataset']['logspace_fraction']  # fraction of the grid in logspace
-
 # %%
 print(f"Original data shape: {cube.rho.shape}")
 print("Creating new Z grid aligned with Bifrost")
 
-bifrost_geometry_file = config["data"]["grid_file"]
-bifrost_z_grid = np.load(bifrost_geometry_file)["z"]
+bifrost_z_grid = np.load(config["data"]["grid_file"])["z"]
+grid_name = grid_arg or config['dataset']['grid']
+zz_grid_bifrost, new_z_b, z_transition_b = training_grid(config, bifrost_z_grid, grid_name)    # the levels in the Bifrost FITS frame
+new_nz = len(new_z_b)
 
-# Compute zz_grid_bifrost
-z_b = np.arange(nz_bifrost) # Wait, is nz_bifrost or nz_b used? In config it is nz_bifrost
-new_z_b_log = np.concatenate([
-    np.linspace(0, nz_bifrost * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz_bifrost * logspace_fraction), np.log10(nz_bifrost - 1), nz_log)
-])
-new_z_b = np.clip(new_z_b_log, 0, nz_bifrost - 1)
-zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
-
-# Map zz_grid_bifrost to fractional indices in MURaM's vertical coordinate system
-new_z = np.interp(zz_grid_bifrost, muram_z_grid, z)
+# Map zz_grid_bifrost to fractional indices in MURaM's vertical coordinate system, both simulations aligned at tau500 = 1
+# (the Bifrost grid has <tau500> = 1 at ZTAU51 = 0.0614 Mm, M5)
+new_z = np.interp(zz_grid_bifrost - mc.ZTAU51_BIFROST, muram_z_grid, z)
 new_z = np.clip(new_z, 0, nz - 1)
 
 new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
 new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
 
 # %%
-zz_grid = np.interp(new_z, z, muram_z_grid)
-zz_grid.shape
+# Crop of native columns to predict, padded with the periodic neighbours of the full domain so that the border is
+# predicted too (M7); the stride sets the stencil footprint
+stride = stride or config['dataset'].get('max_stride', 1)
+xdim_g = config['dataset']['x_range_graph']
+y0c, y1c, x0c, x1c = (0, ny, 0, nx) if crop == 'full' else [int(v) for v in crop.split(',')]
+pad = xdim_g * stride
+yidx = np.arange(y0c - pad, y1c + pad) % ny
+xidx = np.arange(x0c - pad, x1c + pad) % nx
+print(f"Predicting columns y in [{y0c},{y1c}), x in [{x0c},{x1c}) at stride {stride} ({stride * dx * 1e3:.0f} km hops), {pad} px periodic padding")
 
-# %%
-# Save the grid as required by GNN positions loader
-np.savez_compressed(f'muram_grid.npz', x=x_geom, y=y_geom, z=zz_grid)
+savedir = make_run_dir(os.path.join(_here, 'muram_inference.py'))
 
 # %%
 print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
 new_points = (new_zv, new_xv, new_yv)
 
-temp = interpn((z, x, y), cube.Temp, new_points)
-b_z = interpn((z, x, y), cube.Bx, new_points)
-b_x = interpn((z, x, y), cube.By, new_points)
-b_y = interpn((z, x, y), cube.Bz, new_points)
+def interp_log(a):                   # the scalars in log10 (as the Bifrost cubes in gnn_train.py / gnn_inference.py), the velocities linearly
+    return 10.0 ** interpn((z, x, y), np.log10(np.asarray(a, dtype=np.float64)), new_points)
+temp = interp_log(cube.Temp)
 v_z = interpn((z, x, y), cube.vx , new_points)
 v_x = interpn((z, x, y), cube.vy , new_points)
 v_y = interpn((z, x, y), cube.vz , new_points)
-rho = interpn((z, x, y), cube.rho, new_points)
-n_e = interpn((z, x, y), cube.ne, new_points)
-press = interpn((z, x, y), cube.Pres, new_points)
+rho = interp_log(cube.rho)
+n_e = interp_log(cube.ne)
+press = interp_log(cube.Pres)
 print("Interpolation complete.")
 
 # %%
-b_xyz = np.stack([b_x, b_y, b_z], axis=-1)
 vel = np.stack([v_x, v_y, v_z], axis=-1)
-print(f"B field shape stacked: {b_xyz.shape}")
 print(f"Velocity shape stacked: {vel.shape}")
 
 # Convert MURaM features to SI units to match Bifrost units before normalization
 vel_si = vel / 100.0
-b_xyz_si = b_xyz * (4.0 * np.pi) / 10000.0
 temp_si = temp
 n_e_si = n_e * 1e6
 rho_si = rho * 1000.0
@@ -171,44 +168,54 @@ press_si = press / 10.0
 feature_norm_params = checkpoint['feature_norm_params']
 pop_norm_params = checkpoint['normalization_params']
 
-features_labels_simple = ['vel', 'b', 'temp', 'n_e', 'rho', 'press']
-features_data = [vel_si, b_xyz_si, temp_si, n_e_si, rho_si, press_si]
+quantities = {'vel': vel_si, 'temp': temp_si, 'n_e': n_e_si, 'rho': rho_si, 'press': press_si}
+quantities = {k: v[:, yidx][:, :, xidx] for k, v in quantities.items()}     # the padded crop (arrays are (z, y, x))
+if 'lte' in features_labels_simple:             # the LTE input on MURaM's own native levels of the crop, then the six log fractions
+    T_nat = np.asarray(cube.Temp)[:, xidx][:, :, yidx].transpose(0, 2, 1)                 # interpolated linearly in z, as the Bifrost path
+    ne_nat = np.asarray(cube.ne)[:, xidx][:, :, yidx].transpose(0, 2, 1) * 1e6
+    lte_nat = lte_log_fractions(T_nat, ne_nat, log_offset)                                                              # (nz_native, ny_crop, nx_crop, 6)
+    quantities['lte'] = interp1d(z, lte_nat, axis=0, assume_sorted=True)(new_z).astype(np.float32)
+    print(f"LTE input: computed on {lte_nat.shape[0]} native MURaM levels of the crop, interpolated to {len(new_z)} levels")
+    del T_nat, ne_nat, lte_nat
+features_data = [quantities[l] for l in features_labels_simple]
+rho_crop = rho_si[:, y0c:y1c, x0c:x1c]
 
 # Normalize features using the pre-computed training statistics to match the model's domain
-normalized_features = normalize_features_with_params(
-    features_data, features_labels_simple, feature_norm_params, normalization_type
-)
+normalized_features = normalize_features(features_data, features_labels_simple, feature_norm_params)[0]
 
 # %%
 # ---- Create Test Dataset ----
 # All parameters are now from the loaded config object
+assert abs(dx - dy) < 1e-9, (dx, dy)
 dataset_params = {
     'list_X': normalized_features,
-    'list_Y': [np.zeros((new_nz, nx, ny, 1))],
-    'radius_neighbors': config['dataset']['radius_neighbors'],
+    'list_Y': [np.zeros(features_data[0].shape[:3] + (1,))],
     'xdim': config['dataset']['x_range_graph'],
     'ydim': config['dataset']['y_range_graph'],
-    'fully_connected': config['dataset']['fully_connected'],
-    'pos_file': 'muram_grid.npz' ,
+    'z_levels': zz_grid_bifrost,      # the training levels (only height differences enter the edge features)
+    'pixel_Mm': dx,
     'seed': config['system']['seed'],
     'train_ratio': config['dataset']['train_ratio'],
-    'nz_linear': config['dataset']['nz_linear'],
-    'nz_log': config['dataset']['nz_log'],
-    'logspace_fraction': config['dataset']['logspace_fraction'],
     'epoch_size_fraction': 1.0,  # Use full dataset for testing
-    'max_stride': 4, # config["dataset"].get("max_stride", 2),
-    'random_stride': False, #config["dataset"].get("random_stride", False),
+    'max_stride': stride,
+    'stencil_radius': config['dataset'].get('stencil_radius', 4.01),
+    'edge_reach_Mm': config['dataset'].get('edge_reach_Mm', 0.5),
+    'central_reach_Mm': config['dataset'].get('central_reach_Mm'),
     'split': 'full'
 }
 
 datast_test = EfficientDataset(**dataset_params)
+assert (datast_test.x0, datast_test.x1, datast_test.y0, datast_test.y1) == (pad, x1c - x0c + pad, pad, y1c - y0c + pad)
 
 # %%
 # ---- Setup DataLoader ----
 num_workers = min(12, multiprocessing.cpu_count())
+# graphs per batch scaled with the edges per graph, as gnn_inference.py (48 graphs of ~139k edges, the dense:60 grid, take ~31 GB)
+edges_per_graph = datast_test.templates[(stride, stride)]['edge_index'].shape[1]
+inference_batch = max(1, min(config['training']['batch_size'] * 6, int(config['training']['batch_size'] * 6 * 140000 / edges_per_graph)))
 loader_test = DataLoader(
     datast_test, 
-    batch_size=config['training']['batch_size']*6,
+    batch_size=inference_batch,
     shuffle=False, 
     num_workers=num_workers,
     pin_memory=cuda_available,
@@ -275,31 +282,37 @@ for i in tqdm(range(num_test_samples), desc="Reconstructing"):
 # %%
 # ---- Denormalization ----
 print("Denormalizing predicted populations...")
-# Interpolate pop_norm_params['totals'] to match predictions_spatial shape
-nz_t, ny_t, nx_t = pop_norm_params['totals'].shape
-z_t = np.linspace(0, 1, nz_t)
-y_t = np.linspace(0, 1, ny_t)
-x_t = np.linspace(0, 1, nx_t)
+# Total Ca density of the MURaM columns themselves (sum of the training targets is 9.65e14 * rho exactly; M2)
+pop_norm_params = dict(pop_norm_params)
+pop_norm_params['totals'] = CA_TOTAL_PER_RHO * rho_crop                 # (nz, ny, nx): the interpolated arrays have no component axis
 
-z_new = np.linspace(0, 1, new_nz)
-y_new = np.linspace(0, 1, ny_size)
-x_new = np.linspace(0, 1, nx_size)
-
-zv_new, yv_new, xv_new = np.meshgrid(z_new, y_new, x_new, indexing='ij', sparse=True)
-totals_interpolated = interpn((z_t, y_t, x_t), pop_norm_params['totals'], (zv_new, yv_new, xv_new))
-pop_norm_params['totals'] = totals_interpolated
-
-predictions_denorm = denormalize_pops(predictions_spatial, pop_norm_params, normalization_type)
+predictions_denorm = denormalize_pops(predictions_spatial, pop_norm_params)
 
 # %%
 # ---- Save Outputs ----
-savedir = '.' # config['training']['savedir']
-if not os.path.exists(savedir):
-    os.makedirs(savedir)
-
-save_pred_path = os.path.join(savedir, f'muram_predictions_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy')
-np.save(save_pred_path, predictions_denorm)
-print(f"Saved synthesized absolute populations to {save_pred_path}")
+save_pred_name = f'muram_predictions_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy'
+np.save(os.path.join(savedir, save_pred_name), predictions_denorm)
+print(f"Saved synthesized absolute populations to {os.path.join(savedir, save_pred_name)}")
+zz_grid = np.interp(new_z, z, muram_z_grid)                 # heights of the grid levels above MURaM's tau500 = 1
+np.save(os.path.join(savedir, 'rho_si_avg.npy'), rho_crop)
+np.save(os.path.join(savedir, 'temp_avg.npy'), temp_si[:, y0c:y1c, x0c:x1c])
+np.save(os.path.join(savedir, 'ne_si_avg.npy'), n_e_si[:, y0c:y1c, x0c:x1c])
+np.savez(os.path.join(savedir, 'grid.npz'), z_rel_tau1_Mm=zz_grid, z_bifrost_frame_Mm=zz_grid_bifrost, muram_fractional_index=new_z,
+         x_Mm=np.arange(x0c, x1c) * dx, y_Mm=np.arange(y0c, y1c) * dy)
+write_meta(savedir, checkpoint=os.path.abspath(checkpoint_path), checkpoint_epoch=int(checkpoint['epoch']), stride=stride,
+           train_stride=config['dataset'].get('max_stride', 1), features_labels=features_labels_simple, grid=grid_name, train_grid=config['dataset']['grid'],
+           muram_dir=pathsource, snapshot=snap_number, dz_km=dz * 1e3, dx_km=dx * 1e3, resolution='native (no averaging)', decimate=1,
+           origin=[y0c, x0c], crop=[y0c, y1c, x0c, x1c], hop_km=stride * dx * 1e3, pad=pad, tau1_index_median=tau_zero_index,
+           ztau51_bifrost_Mm=mc.ZTAU51_BIFROST,
+           totals_source=f'CA_TOTAL_PER_RHO={CA_TOTAL_PER_RHO:.3e} * rho_MURaM[kg m^-3] at the native columns',
+           layout='(z, y, x, level) of the crop; y = MURaM cube axis 2, x = MURaM cube axis 1 (native column = origin + i); cm^-3',
+           device=device_name, files={'predictions': save_pred_name, 'grid': 'grid.npz', 'rho': 'rho_si_avg.npy', 'temp': 'temp_avg.npy', 'ne': 'ne_si_avg.npy'})
+# grids.png: the vertical grids aligned at tau500 = 1 (plan WP2 step 2.9)
+mc.plot_grids([('native Bifrost (tau=1 frame)', bifrost_z_grid - mc.ZTAU51_BIFROST, 'royalblue'), ('native MURaM (tau=1 frame)', muram_z_grid, 'darkorange'),
+               ('training grid on Bifrost', zz_grid_bifrost - mc.ZTAU51_BIFROST, 'forestgreen'), ('training levels sampled in MURaM', zz_grid, 'crimson')],
+              bands=[(l, lo - mc.ZTAU51_BIFROST, hi - mc.ZTAU51_BIFROST) for l, lo, hi in mc.FORMATION_BANDS_BIFROST_FRAME],
+              transition=z_transition_b - mc.ZTAU51_BIFROST, path=os.path.join(savedir, 'grids.png'),
+              title='Vertical grids aligned at tau500 = 1', xlim=(-1.0, 13.0))
 
 # %%
 # ---- Plot 1: Reconstructed Populations Slices ----

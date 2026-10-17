@@ -2,6 +2,8 @@
 # Import only the necessary libraries for data loading and plotting
 import numpy as np
 import os
+import sys
+import json
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -22,18 +24,18 @@ except (ImportError, RuntimeError, Exception):
         ipy.run_line_magic('matplotlib', 'inline')
 
 # %%
-# Load configuration to get directory paths
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
-checkpoint = torch.load(checkpoint_path, weights_only=False)
-config = checkpoint['config']
-savedir = config['training']['savedir']
+# The gnn_inference.py run directory holding the synthesis.py arrays (results/gnn_inference/<stamp>)
+run_dir = sys.argv[1] if len(sys.argv) > 1 else '/dat/andreuva/gpu/graphnet/graphnet_nlte/results/gnn_inference/20261006-2156'
+meta = json.load(open(os.path.join(run_dir, 'meta.json')))
+checkpoint_path = meta['checkpoint']
+savedir = run_dir + '/'
 
 print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
 # %%
-# Define parameters
-stride = 3
-dataset_type = 'full'
+# Define parameters (from the run)
+stride = meta['stride']
+dataset_type = meta['split']
 nwave = 1001
 wave = np.linspace(853.9444, 854.9444, nwave)
 
@@ -51,10 +53,10 @@ print(f"Shape of the synthesized intensities: Predicted: {Iwave_predicted.shape}
 
 # %%
 # Calculate Spatially Averaged Spectra
-mean_I_lte = np.mean(Iwave_lte, axis=(0, 1))
-mean_I_nlte = np.mean(Iwave_nlte, axis=(0,1), where= Iwave_nlte != 0)
-mean_I_orig = np.mean(Iwave_target, axis=(0, 1))
-mean_I_pred = np.mean(Iwave_predicted, axis=(0, 1))
+mean_I_lte = np.nanmean(Iwave_lte, axis=(0, 1))          # NaN where a column failed
+mean_I_nlte = np.nanmean(Iwave_nlte, axis=(0,1))
+mean_I_orig = np.nanmean(Iwave_target, axis=(0, 1))
+mean_I_pred = np.nanmean(Iwave_predicted, axis=(0, 1))
 
 # Calculate the index for the line core (approx 854.21 nm for Ca II)
 line_core_idx = np.argmin(mean_I_orig)
@@ -89,13 +91,13 @@ vmax_pred = max(np.max(Iwave_target[:, :, line_core_idx]), np.max(Iwave_predicte
 # --- Bottom Rows: Intensity Maps (Target/Predicted) ---
 ax_map_target = fig.add_subplot(gs[1, 0], sharex=ax_map_lte)
 im_target = ax_map_target.imshow(Iwave_target[:, :, line_core_idx].T, origin='lower', cmap='magma', vmin=vmin_pred, vmax=vmax_pred)
-ax_map_target.set_title('Target', fontsize=16)
+ax_map_target.set_title('Target populations (3D NLTE)', fontsize=16)
 ax_map_target.set_xlabel('x pixel', fontsize=16)
 ax_map_target.set_ylabel('y pixel', fontsize=16)
 
 ax_map_pred = fig.add_subplot(gs[1, 1], sharey=ax_map_target, sharex=ax_map_nlte)
 im_pred = ax_map_pred.imshow(Iwave_predicted[:, :, line_core_idx].T, origin='lower', cmap='magma', vmin=vmin_pred, vmax=vmax_pred)
-ax_map_pred.set_title('Predicted', fontsize=16)
+ax_map_pred.set_title('GNN populations', fontsize=16)
 ax_map_pred.set_xlabel('x pixel', fontsize=16)
 
 cbar2 = fig.colorbar(im_pred, ax=[ax_map_target, ax_map_pred], location='right', pad=0.02, aspect=30)
@@ -111,8 +113,8 @@ plt.show()
 fig = plt.figure(figsize=(12, 4), dpi=100)
 plt.plot(wave, mean_I_lte, label='LTE Assumption', color='gray', linestyle='--', alpha=0.7)
 plt.plot(wave, mean_I_nlte, label='NLTE 1D', color='blue', linestyle='--', alpha=0.7)
-plt.plot(wave, mean_I_orig, label='Target (Non-LTE)', color='black', linewidth=2)
-plt.plot(wave, mean_I_pred, label='GNN Prediction', color='red', linestyle=':', linewidth=2)
+plt.plot(wave, mean_I_orig, label='Target populations (3D NLTE)', color='black', linewidth=2)
+plt.plot(wave, mean_I_pred, label='GNN populations', color='red', linestyle=':', linewidth=2)
 
 plt.xlabel('Wavelength [nm]', fontsize=16)
 plt.ylabel('Intensity [W / (m$^2$ Hz sr)]', fontsize=16)
@@ -208,12 +210,12 @@ epsilon = 1e-32
 diff = Iwave_predicted - Iwave_target
 rel_error = (diff / (Iwave_target + epsilon)) * 100
 
-median_error_spec = np.median(rel_error, axis=(0, 1))
-p05_error_spec = np.percentile(rel_error, 5, axis=(0, 1))
-p16_error_spec = np.percentile(rel_error, 16, axis=(0, 1))
-p84_error_spec = np.percentile(rel_error, 84, axis=(0, 1))
-p95_error_spec = np.percentile(rel_error, 95, axis=(0, 1))
-mare_map = np.mean(np.abs(rel_error), axis=2)
+median_error_spec = np.nanmedian(rel_error, axis=(0, 1))
+p05_error_spec = np.nanpercentile(rel_error, 5, axis=(0, 1))
+p16_error_spec = np.nanpercentile(rel_error, 16, axis=(0, 1))
+p84_error_spec = np.nanpercentile(rel_error, 84, axis=(0, 1))
+p95_error_spec = np.nanpercentile(rel_error, 95, axis=(0, 1))
+mare_map = np.nanmean(np.abs(rel_error), axis=2)
 
 fig = plt.figure(figsize=(12, 10))
 gs_err = fig.add_gridspec(2, 2, height_ratios=[1, 1], width_ratios=[1, 1.2], wspace=0.25, hspace=0.17)
@@ -241,7 +243,7 @@ ax1.legend(lines + lines2, labels + labels2, loc='upper right', framealpha=0.9)
 
 # --- Bottom Left: Global Histogram ---
 ax2 = fig.add_subplot(gs_err[1, 0])
-flat_rel_error = rel_error.flatten()
+flat_rel_error = rel_error[np.isfinite(rel_error)].flatten()
 viz_range = np.percentile(flat_rel_error, [0.1, 99.9])
 ax2.hist(flat_rel_error, bins=100, range=viz_range, density=True, color='gray', alpha=1.0)
 # ax2.set_title('Global Histogram of Relative Errors', fontsize=14)
@@ -252,7 +254,7 @@ ax2.axvline(0, color='black', linestyle='--', linewidth=1)
 
 # --- Bottom Right: Spatial Map of mare ---
 ax3 = fig.add_subplot(gs_err[1, 1])
-im3 = ax3.imshow(mare_map.T, origin='lower', cmap='inferno', vmin=0, vmax=np.percentile(mare_map, 98), aspect='auto')
+im3 = ax3.imshow(mare_map.T, origin='lower', cmap='inferno', vmin=0, vmax=np.nanpercentile(mare_map, 98), aspect='auto')
 # ax3.set_title('Spatial Map of MARE', fontsize=14)
 ax3.set_xlabel('x pixel', fontsize=14)
 ax3.set_ylabel('y pixel', fontsize=14)
@@ -269,5 +271,5 @@ mu, std = np.mean(flat_rel_error), np.std(flat_rel_error)
 print("=== Error Statistics ===")
 print(f"Global Mean Relative Error (Bias): {mu:.4f} %")
 print(f"Global Std Dev of Relative Error:  {std:.4f} %")
-print(f"Max Pixel MARE: {np.max(mare_map):.4f} %")
-print(f"Mean Pixel MARE: {np.mean(mare_map):.4f} %")
+print(f"Max Pixel MARE: {np.nanmax(mare_map):.4f} %")
+print(f"Mean Pixel MARE: {np.nanmean(mare_map):.4f} %")

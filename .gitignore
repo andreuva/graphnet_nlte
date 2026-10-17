@@ -136,3 +136,6 @@ checkpoints*
 plots*
 *.npz
 *.npy
+# per-run outputs with meta.json sidecars (provenance.py)
+results/
+smoke_tests/
