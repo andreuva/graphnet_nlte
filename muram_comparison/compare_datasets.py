@@ -3,47 +3,37 @@
 import numpy as np
 import torch
 import os
+import sys
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from scipy.interpolate import interpn
 import muram as mio
-from normalization import normalize_features_with_params
+# Add the repository folder to path (normalization, vertical_grids)
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from normalization import normalize_features_with_params, lte_log_fractions
+from vertical_grids import fixed_grid, random_grid, to_levels, ZTAU51_BIFROST
 
-# Use GPU 2 if available
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+# Only the checkpoint is read here: no GPU needed
+device = torch.device("cpu")
 print(f"Using device: {device}")
 
 # ---- Load Checkpoint ----
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+# python muram_comparison/compare_datasets.py <checkpoint> [grid] (default dense:60); the figures go to the current folder
+checkpoint_path = sys.argv[1]
+grid_name = sys.argv[2] if len(sys.argv) > 2 else 'dense:60'
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 config = checkpoint['config']
 feature_norm_params = checkpoint['feature_norm_params']
-normalization_type = config['normalization'].get('type', 'log')
 print("Loaded checkpoint and parameters successfully.")
 
 # ---- Load Bifrost Geometry & Height Grid First ----
 print("\n--- Loading Bifrost Geometry & Grid ---")
-datadir_bifrost = '/dat/andreuva/gpu/graphnet/data_train'
+datadir_bifrost = '/dat/andreuva/gpu/graphnet/data_train_v2'
 bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
-nx_b, ny_b, nz_b = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
-logspace_fraction = config['dataset']['logspace_fraction']
-nz_linear = config['dataset']['nz_linear']
-nz_log = config['dataset']['nz_log']
 
-bifrost_z_grid = np.load(bifrost_grid_file)["z"]
+bifrost_z_grid = np.load(bifrost_grid_file)["z"].astype(np.float64) - ZTAU51_BIFROST   # heights above tau500 = 1 [Mm]
 
-# Grid setup for Bifrost
-z_b, y_b, x_b = (np.arange(d) for d in (nz_b, ny_b, nx_b))
-new_z_b_log = np.concatenate([
-    np.linspace(0, nz_b * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz_b * logspace_fraction), np.log10(nz_b - 1), nz_log)
-])
-new_z_b = np.clip(new_z_b_log, 0, nz_b - 1)
-zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
-
-new_y_b, new_x_b = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny_b, nx_b), (ny_b, nx_b)))
-new_zv_b, new_yv_b, new_xv_b = np.meshgrid(new_z_b, new_y_b, new_x_b, indexing='ij', sparse=True)
-new_points_bifrost = (new_zv_b, new_yv_b, new_xv_b)
+# Grid setup for Bifrost: the vertical grid of the network on the height range of Bifrost
+zz_grid_bifrost = fixed_grid(grid_name, bifrost_z_grid[0], bifrost_z_grid[-1])
 
 # ===================================================================
 # 1. LOAD AND PREPARE MURAM DATASET
@@ -53,37 +43,28 @@ pathsource = '/dat/milic/MURaM_enhanced_network/'
 snap_number = 499000
 cube = mio.MuramSnap(pathsource, snap_number)
 
-# Grid parameters
-dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
-nz, nx, ny = cube.Temp.shape
-z, x, y = (np.arange(d) for d in (nz, nx, ny))
-z_geom, x_geom, y_geom = z*dz, x*dx, y*dy
-
-tau_mean = np.mean(cube.tau, axis=(1,2))
-tau_zero_index = np.argmin(np.abs(tau_mean - 1))
-muram_z_grid = z_geom - z_geom[tau_zero_index]
+# Heights [Mm] of the MURaM levels above the column-median tau500 = 1 (as muram_inference.py)
+muram_z_grid, tau_zero_index = mio.muram_heights(cube)
 
 # Align height interpolation exactly with Bifrost:
-# Map zz_grid_bifrost to fractional indices in MURaM's vertical coordinate system
-new_z = np.interp(zz_grid_bifrost, muram_z_grid, z)
-new_z = np.clip(new_z, 0, nz - 1)
-
-new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
-new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
-
-zz_grid_muram = np.interp(new_z, z, muram_z_grid)
-new_points_muram = (new_zv, new_xv, new_yv)
+# both are heights above tau500 = 1, so MURaM is interpolated to the heights of the Bifrost grid
+zz_grid_muram = zz_grid_bifrost
 
 # --- PLOT COMPARISON OF GRIDS ---
-plt.figure(figsize=(12, 4))
+plt.figure(figsize=(12, 6))
 plt.plot(muram_z_grid, np.ones_like(muram_z_grid) * 3, '|', markersize=15, label='Original MURaM Grid', color='darkorange')
 plt.plot(bifrost_z_grid, np.ones_like(bifrost_z_grid) * 2, '|', markersize=15, label='Original Bifrost Grid', color='royalblue')
 plt.plot(zz_grid_muram, np.ones_like(zz_grid_muram) * 1, '|', markersize=15, label='Interpolated MURaM Grid (from Bifrost)', color='crimson')
 plt.plot(zz_grid_bifrost, np.ones_like(zz_grid_bifrost) * 0, '|', markersize=15, label='Interpolated Bifrost Grid', color='forestgreen')
-plt.yticks([0, 1, 2, 3], ['Interp. Bifrost', 'Interp. MURaM', 'Original Bifrost', 'Original MURaM'])
-plt.xlabel('Height (Mm)', fontsize=12)
-plt.ylim(-0.5, 3.5)
-plt.legend(loc='best')
+# Four of the random grids that training draws per sample (Dataset.py random_geometry)
+np.random.seed(0)
+for i in range(4):
+    zz_grid_random = random_grid(bifrost_z_grid[0], bifrost_z_grid[-1])
+    plt.plot(zz_grid_random, np.ones_like(zz_grid_random) * (-1 - i), '|', markersize=15, label='Random Training Grids' if i == 0 else None, color='gray')
+plt.yticks([-4, -3, -2, -1, 0, 1, 2, 3], ['Random 4', 'Random 3', 'Random 2', 'Random 1', 'Interp. Bifrost', 'Interp. MURaM', 'Original Bifrost', 'Original MURaM'])
+plt.xlabel('Height above tau500 = 1 (Mm)', fontsize=12)
+plt.ylim(-4.5, 3.5)
+plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=3)   # below the axes: no level hidden
 plt.title('Comparison of Original and Interpolated Geometry Grids', fontsize=14)
 plt.grid(True, axis='x', linestyle='--', alpha=0.5)
 plt.tight_layout()
@@ -93,16 +74,17 @@ plt.close()
 print(f"Saved grid comparison plot to {grid_plot_path}")
 
 print("Interpolating MURaM features...")
-temp_muram = interpn((z, x, y), cube.Temp, new_points_muram)
-b_z_m = interpn((z, x, y), cube.Bx, new_points_muram)
-b_x_m = interpn((z, x, y), cube.By, new_points_muram)
-b_y_m = interpn((z, x, y), cube.Bz, new_points_muram)
-v_z_m = interpn((z, x, y), cube.vx, new_points_muram)
-v_x_m = interpn((z, x, y), cube.vy, new_points_muram)
-v_y_m = interpn((z, x, y), cube.vz, new_points_muram)
-rho_muram = interpn((z, x, y), cube.rho, new_points_muram)
-ne_muram = interpn((z, x, y), cube.ne, new_points_muram)
-press_muram = interpn((z, x, y), cube.Pres, new_points_muram)
+# linear in height, the positive quantities linear in log10 (as the network sees them); MURaM (z, x, y) -> (z, y, x) as Bifrost
+temp_muram = to_levels(cube.Temp, muram_z_grid, zz_grid_muram, log=True).transpose(0, 2, 1)
+b_z_m = to_levels(cube.Bx, muram_z_grid, zz_grid_muram).transpose(0, 2, 1)
+b_x_m = to_levels(cube.By, muram_z_grid, zz_grid_muram).transpose(0, 2, 1)
+b_y_m = to_levels(cube.Bz, muram_z_grid, zz_grid_muram).transpose(0, 2, 1)
+v_z_m = to_levels(cube.vx, muram_z_grid, zz_grid_muram).transpose(0, 2, 1)
+v_x_m = to_levels(cube.vy, muram_z_grid, zz_grid_muram).transpose(0, 2, 1)
+v_y_m = to_levels(cube.vz, muram_z_grid, zz_grid_muram).transpose(0, 2, 1)
+rho_muram = to_levels(cube.rho, muram_z_grid, zz_grid_muram, log=True).transpose(0, 2, 1)
+ne_muram = to_levels(cube.ne, muram_z_grid, zz_grid_muram, log=True).transpose(0, 2, 1)
+press_muram = to_levels(cube.Pres, muram_z_grid, zz_grid_muram, log=True).transpose(0, 2, 1)
 
 # Stack variables to Bifrost layout
 b_xyz_muram = np.stack([b_x_m, b_y_m, b_z_m], axis=-1)
@@ -110,28 +92,32 @@ vel_muram = np.stack([v_x_m, v_y_m, v_z_m], axis=-1)
 
 # Convert MURaM features to SI units to match Bifrost units before normalization
 vel_muram_si = vel_muram / 100.0
-b_xyz_muram_si = b_xyz_muram * (4.0 * np.pi) / 10000.0
+b_xyz_muram_si = b_xyz_muram * np.sqrt(4.0 * np.pi) / 10000.0   # MURaM stores B / sqrt(4 pi) in G
 temp_muram_si = temp_muram
 ne_muram_si = ne_muram * 1e6
 rho_muram_si = rho_muram * 1000.0
 press_muram_si = press_muram / 10.0
 
-features_labels = ['vel', 'b', 'temp', 'n_e', 'rho', 'press']
+# The inputs of the checkpoint in its order; 'lte' = log10 LTE fractions of the six levels from T and n_e (the network
+# computes them on the native levels and interpolates them, a negligible difference for these distributions)
+features_labels = ['vel', 'temp', 'rho', 'press', 'lte']
+assert features_labels == list(checkpoint['features_labels']), checkpoint['features_labels']
 features_data_muram = [vel_muram_si, b_xyz_muram_si, temp_muram_si, ne_muram_si, rho_muram_si, press_muram_si]
 
+lte_muram = lte_log_fractions(temp_muram_si[..., np.newaxis], ne_muram_si[..., np.newaxis], config['normalization']['log_offset'])
 norm_features_muram = normalize_features_with_params(
-    features_data_muram, features_labels, feature_norm_params, normalization_type
+    [vel_muram_si, temp_muram_si, rho_muram_si, press_muram_si, lte_muram], features_labels, feature_norm_params
 )
 
 # ===================================================================
 # 2. LOAD AND PREPARE BIFROST DATASET
 # ===================================================================
 print("\n--- Loading Bifrost Dataset ---")
-datadir_bifrost = '/dat/andreuva/gpu/graphnet/data_train'
+datadir_bifrost = '/dat/andreuva/gpu/graphnet/data_train_v2'
 bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
 nx_b, ny_b, nz_b = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
 
-bifrost_z_grid = np.load(bifrost_grid_file)["z"]
+bifrost_z_grid = np.load(bifrost_grid_file)["z"].astype(np.float64) - ZTAU51_BIFROST   # heights above tau500 = 1 [Mm]
 
 # Memory mapped arrays
 pops_b = np.memmap(f'{datadir_bifrost}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz_b, ny_b, nx_b, config['data']['nlev']))
@@ -143,30 +129,22 @@ rho_b = np.memmap(f'{datadir_bifrost}/AR_385_mass.dat', dtype='<f4', mode='r', s
 press_b = np.memmap(f'{datadir_bifrost}/AR_385_press.dat', dtype='<f4', mode='r', shape=(nz_b, ny_b, nx_b, 1))
 
 # Grid setup
-z_b, y_b, x_b = (np.arange(d) for d in (nz_b, ny_b, nx_b))
-new_z_b_log = np.concatenate([
-    np.linspace(0, nz_b * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz_b * logspace_fraction), np.log10(nz_b - 1), nz_log)
-])
-new_z_b = np.clip(new_z_b_log, 0, nz_b - 1)
-new_y_b, new_x_b = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny_b, nx_b), (ny_b, nx_b)))
-new_zv_b, new_yv_b, new_xv_b = np.meshgrid(new_z_b, new_y_b, new_x_b, indexing='ij', sparse=True)
-
-zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
-new_points_bifrost = (new_zv_b, new_yv_b, new_xv_b)
+zz_grid_bifrost = fixed_grid(grid_name, bifrost_z_grid[0], bifrost_z_grid[-1])
 
 print("Interpolating Bifrost features...")
-temp_bifrost = interpn((z_b, y_b, x_b), temp_b, new_points_bifrost)
-b_xyz_bifrost = interpn((z_b, y_b, x_b), b_xyz_b, new_points_bifrost)
-vel_bifrost = interpn((z_b, y_b, x_b), vel_b, new_points_bifrost)
-ne_bifrost = interpn((z_b, y_b, x_b), ne_b, new_points_bifrost)
-rho_bifrost = interpn((z_b, y_b, x_b), rho_b, new_points_bifrost)
-press_bifrost = interpn((z_b, y_b, x_b), press_b, new_points_bifrost)
+# linear in height, the positive quantities linear in log10 (as the network sees them)
+temp_bifrost = to_levels(temp_b, bifrost_z_grid, zz_grid_bifrost, log=True)
+b_xyz_bifrost = to_levels(b_xyz_b, bifrost_z_grid, zz_grid_bifrost)
+vel_bifrost = to_levels(vel_b, bifrost_z_grid, zz_grid_bifrost)
+ne_bifrost = to_levels(ne_b, bifrost_z_grid, zz_grid_bifrost, log=True)
+rho_bifrost = to_levels(rho_b, bifrost_z_grid, zz_grid_bifrost, log=True)
+press_bifrost = to_levels(press_b, bifrost_z_grid, zz_grid_bifrost, log=True)
 
 features_data_bifrost = [vel_bifrost, b_xyz_bifrost, temp_bifrost, ne_bifrost, rho_bifrost, press_bifrost]
 
+lte_bifrost = lte_log_fractions(temp_bifrost, ne_bifrost, config['normalization']['log_offset'])
 norm_features_bifrost = normalize_features_with_params(
-    features_data_bifrost, features_labels, feature_norm_params, normalization_type
+    [vel_bifrost, temp_bifrost, rho_bifrost, press_bifrost, lte_bifrost], features_labels, feature_norm_params
 )
 
 # ===================================================================
@@ -556,30 +534,30 @@ print(f"Saved temperature comparison at different heights plot to {save_path_tem
 print("\nGenerating normalized feature distribution comparison plot...")
 
 # Extract normalized arrays (norm_features_* are lists in the same order as features_labels)
-# features_labels = ['vel', 'b', 'temp', 'n_e', 'rho', 'press']
-norm_vel_b, norm_b_b, norm_temp_b, norm_ne_b, norm_rho_b, norm_press_b = norm_features_bifrost
-norm_vel_m, norm_b_m, norm_temp_m, norm_ne_m, norm_rho_m, norm_press_m = norm_features_muram
+# features_labels = ['vel', 'temp', 'rho', 'press', 'lte']
+norm_vel_b, norm_temp_b, norm_rho_b, norm_press_b, norm_lte_b = norm_features_bifrost
+norm_vel_m, norm_temp_m, norm_rho_m, norm_press_m, norm_lte_m = norm_features_muram
 
 # Ensure 4D
 def ensure_4d(arr):
     return arr[..., np.newaxis] if arr.ndim == 3 else arr
 
 norm_vel_b = ensure_4d(norm_vel_b)
-norm_b_b   = ensure_4d(norm_b_b)
+norm_lte_b = ensure_4d(norm_lte_b)
 norm_temp_b= ensure_4d(norm_temp_b)
-norm_ne_b  = ensure_4d(norm_ne_b)
 norm_rho_b = ensure_4d(norm_rho_b)
 norm_press_b = ensure_4d(norm_press_b)
 
 norm_vel_m = ensure_4d(norm_vel_m)
-norm_b_m   = ensure_4d(norm_b_m)
+norm_lte_m = ensure_4d(norm_lte_m)
 norm_temp_m= ensure_4d(norm_temp_m)
-norm_ne_m  = ensure_4d(norm_ne_m)
 norm_rho_m = ensure_4d(norm_rho_m)
 norm_press_m = ensure_4d(norm_press_m)
 
-fig_norm, axes_norm = plt.subplots(6, 2, figsize=(14, 24))
+fig_norm, axes_norm = plt.subplots(5, 2, figsize=(14, 20))
 colors_components = ['crimson', 'forestgreen', 'royalblue']
+level_names = ['4s', '3d3/2', '3d5/2', '4p1/2', '4p3/2', 'CaIII']
+colors_levels = plt.cm.viridis(np.linspace(0, 0.9, 6))
 
 # Helper: histogram with 1-99 percentile range
 def plot_hist_norm(ax, arr, label, color, alpha=0.4, linscale=True):
@@ -614,25 +592,25 @@ ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 ax.legend(fontsize=8)
 
-# --- ROW 1: Normalized Magnetic Field ---
+# --- ROW 1: Normalized LTE Fractions (six levels) ---
 ax = axes_norm[1, 0]
-for c in range(3):
-    plot_hist_norm(ax, norm_b_b[..., c], f'B{chr(120+c)}', colors_components[c])
-p1b, p99b = np.percentile(norm_b_b, 1), np.percentile(norm_b_b, 99)
+for c in range(6):
+    plot_hist_norm(ax, norm_lte_b[..., c], level_names[c], colors_levels[c])
+p1b, p99b = np.percentile(norm_lte_b, 1), np.percentile(norm_lte_b, 99)
 ax.set_xlim(p1b, p99b)
-ax.set_title("Bifrost (Training) Normalized Magnetic Field", fontsize=12)
-ax.set_xlabel("Normalized B", fontsize=10)
+ax.set_title("Bifrost (Training) Normalized LTE Fractions", fontsize=12)
+ax.set_xlabel("Normalized log10 LTE fraction", fontsize=10)
 ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 ax.legend(fontsize=8)
 
 ax = axes_norm[1, 1]
-for c in range(3):
-    plot_hist_norm(ax, norm_b_m[..., c], f'B{chr(120+c)}', colors_components[c])
-p1m, p99m = np.percentile(norm_b_m, 1), np.percentile(norm_b_m, 99)
+for c in range(6):
+    plot_hist_norm(ax, norm_lte_m[..., c], level_names[c], colors_levels[c])
+p1m, p99m = np.percentile(norm_lte_m, 1), np.percentile(norm_lte_m, 99)
 ax.set_xlim(p1m, p99m)
-ax.set_title("MURaM (Synthesis) Normalized Magnetic Field", fontsize=12)
-ax.set_xlabel("Normalized B", fontsize=10)
+ax.set_title("MURaM (Synthesis) Normalized LTE Fractions", fontsize=12)
+ax.set_xlabel("Normalized log10 LTE fraction", fontsize=10)
 ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 ax.legend(fontsize=8)
@@ -652,45 +630,30 @@ ax.set_xlabel("Normalized T", fontsize=10)
 ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 
-# --- ROW 3: Normalized Electron Density ---
+# --- ROW 3: Normalized Mass Density ---
 ax = axes_norm[3, 0]
-plot_hist_norm(ax, norm_ne_b[..., 0], 'ne', 'teal', alpha=0.6)
-ax.set_title("Bifrost (Training) Normalized Electron Density", fontsize=12)
-ax.set_xlabel("Normalized ne", fontsize=10)
-ax.set_ylabel("Probability Density", fontsize=10)
-ax.grid(True, linestyle='--', alpha=0.5)
-
-ax = axes_norm[3, 1]
-plot_hist_norm(ax, norm_ne_m[..., 0], 'ne', 'teal', alpha=0.6)
-ax.set_title("MURaM (Synthesis) Normalized Electron Density", fontsize=12)
-ax.set_xlabel("Normalized ne", fontsize=10)
-ax.set_ylabel("Probability Density", fontsize=10)
-ax.grid(True, linestyle='--', alpha=0.5)
-
-# --- ROW 4: Normalized Mass Density ---
-ax = axes_norm[4, 0]
 plot_hist_norm(ax, norm_rho_b[..., 0], 'rho', 'saddlebrown', alpha=0.6)
 ax.set_title("Bifrost (Training) Normalized Mass Density", fontsize=12)
 ax.set_xlabel("Normalized rho", fontsize=10)
 ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 
-ax = axes_norm[4, 1]
+ax = axes_norm[3, 1]
 plot_hist_norm(ax, norm_rho_m[..., 0], 'rho', 'saddlebrown', alpha=0.6)
 ax.set_title("MURaM (Synthesis) Normalized Mass Density", fontsize=12)
 ax.set_xlabel("Normalized rho", fontsize=10)
 ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 
-# --- ROW 5: Normalized Gas Pressure ---
-ax = axes_norm[5, 0]
+# --- ROW 4: Normalized Gas Pressure ---
+ax = axes_norm[4, 0]
 plot_hist_norm(ax, norm_press_b[..., 0], 'press', 'olive', alpha=0.6)
 ax.set_title("Bifrost (Training) Normalized Gas Pressure", fontsize=12)
 ax.set_xlabel("Normalized press", fontsize=10)
 ax.set_ylabel("Probability Density", fontsize=10)
 ax.grid(True, linestyle='--', alpha=0.5)
 
-ax = axes_norm[5, 1]
+ax = axes_norm[4, 1]
 plot_hist_norm(ax, norm_press_m[..., 0], 'press', 'olive', alpha=0.6)
 ax.set_title("MURaM (Synthesis) Normalized Gas Pressure", fontsize=12)
 ax.set_xlabel("Normalized press", fontsize=10)

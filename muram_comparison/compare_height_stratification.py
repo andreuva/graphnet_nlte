@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 import scipy.interpolate as interp
 from astropy.io import fits
 import muram as mio
+# Add the repository folder to path (vertical_grids)
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from vertical_grids import ZTAU51_BIFROST
 
 # Configure matplotlib for premium, publication-quality plots
 plt.rcParams.update({
@@ -35,13 +38,13 @@ def main():
     # 1. LOAD AND PROCESS BIFROST DATASET (ORIGINAL COORDINATES)
     # ===================================================================
     print("\n--- Loading Bifrost Original Dataset ---")
-    datadir_bifrost = '/dat/andreuva/gpu/graphnet/data_train'
+    datadir_bifrost = '/dat/andreuva/gpu/graphnet/data_train_v2'
     bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
     
     if not os.path.exists(bifrost_grid_file):
         raise FileNotFoundError(f"Bifrost grid file not found at {bifrost_grid_file}")
     
-    bifrost_z_grid = np.load(bifrost_grid_file)["z"] # Shape (nz_b,)
+    bifrost_z_grid = np.load(bifrost_grid_file)["z"].astype(np.float64) - ZTAU51_BIFROST # Shape (nz_b,); above tau500 = 1
     
     # Memory mapped arrays (original grid, no interpolation)
     print("Memory-mapping original Bifrost data cubes...")
@@ -90,15 +93,13 @@ def main():
     nz, nx, ny = cube.Temp.shape
     print(f"MURaM original shape: nz={nz}, nx={nx}, ny={ny}")
 
-    # Build height grid: dz = 20 km = 0.02 Mm
-    dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
-    z_geom = np.arange(nz) * dz
+    # Build height grid: dz = 20 km = 0.02 Mm (dx = dy = 23.4375 km), from the header
+    dz, dx, dy = (np.asarray(cube.Temp.dX) / 1e5) / 1e3
     
     print("   Loading full tau cube to locate tau=1 layer...")
-    tau_mean = np.mean(cube.tau, axis=(1, 2))
-    tau_zero_index = np.argmin(np.abs(tau_mean - 1))
-    muram_z_grid = z_geom - z_geom[tau_zero_index]
-    print(f"   MURaM tau=1 index: {tau_zero_index} (z={z_geom[tau_zero_index]:.4f} Mm)")
+    # heights above the column-median tau500 = 1 (fractional index), as muram_inference.py
+    muram_z_grid, tau_zero_index = mio.muram_heights(cube)
+    print(f"   MURaM tau=1 index: {tau_zero_index:.2f} (z={tau_zero_index * dz:.4f} Mm)")
     print(f"   MURaM grid range: {muram_z_grid.min():.4f} to {muram_z_grid.max():.4f} Mm")
 
     # Keep in mind: MURaM shape is (nz, nx, ny).
@@ -134,8 +135,8 @@ def main():
     mean_Vz_muram_si = mean_Vz_muram / 100.0
     mean_V_muram_si  = mean_V_muram / 100.0
 
-    # Magnetic field: Gauss -> Tesla (factor of (4*pi)/10000.0 used in repo)
-    scale_B = (4.0 * np.pi) / 10000.0
+    # Magnetic field: Gauss -> Tesla (MURaM stores B / sqrt(4 pi) in G)
+    scale_B = np.sqrt(4.0 * np.pi) / 10000.0
     mean_Bx_muram_si = mean_Bx_muram * scale_B
     mean_By_muram_si = mean_By_muram * scale_B
     mean_Bz_muram_si = mean_Bz_muram * scale_B
@@ -277,11 +278,12 @@ def main():
         muram_z_grid=muram_z_grid,
         nx_b=nx_b, ny_b=ny_b, nz_b=nz_b,
         datadir_bifrost=datadir_bifrost,
+        run_dir=sys.argv[1] if len(sys.argv) > 1 else None,   # a muram_inference.py output folder for the GNN curve
     )
 
 
 def plot_population_stratification(bifrost_z_grid, muram_z_grid,
-                                   nx_b, ny_b, nz_b, datadir_bifrost):
+                                   nx_b, ny_b, nz_b, datadir_bifrost, run_dir=None):
     """
     Plot the mean height stratification of Ca II level populations for:
       - Bifrost original NLTE populations (training data)
@@ -301,7 +303,7 @@ def plot_population_stratification(bifrost_z_grid, muram_z_grid,
         "Ca II Ground (lvl 0)",
         "Ca II 1st excited (lvl 1)",
         "Ca II 2nd excited (lvl 2)",
-        "Ca II Metastable (lvl 3)",
+        "Ca II 3rd excited (lvl 3)",
         "Ca II 4th excited (lvl 4)",
         "Ca III Ion (lvl 5)",
     ]
@@ -335,10 +337,20 @@ def plot_population_stratification(bifrost_z_grid, muram_z_grid,
 
     fits_heights = muram_z_grid[15:416]  # shape (401,)
 
+    if run_dir is not None:
+        # the columns of the GNN run: its predictions are (z, y, x, nlev) from the crop origin (y0, x0), and
+        # FITS[a, b] = MURaM (x = a, y = b)
+        grid = np.load(os.path.join(run_dir, 'muram_grid.npz'))
+        pred = np.load(os.path.join(run_dir, f'muram_predictions_stride_{int(grid["stride"])}_full.npy'), mmap_mode='r')
+        oy, ox = grid['origin']
+        xs, ys = slice(ox, ox + pred.shape[2]), slice(oy, oy + pred.shape[1])
+    else:
+        xs = ys = slice(16, -16)
+
     print("  Memory-mapping FITS file and cropping horizontal domain...")
     with fits.open(fits_path, memmap=True) as hdul:
         # hdul[2].data shape: (1024, 1024, nlev, 401)
-        fits_cropped = hdul[2].data[16:-16, 16:-16, :, :]  # (992, 992, nlev, 401)
+        fits_cropped = hdul[2].data[xs, ys, :, :]  # (992, 992, nlev, 401) without a GNN run
 
     # Reverse vertical axis so height increases from photosphere to chromosphere
     fits_cropped = fits_cropped[..., ::-1]  # still (992, 992, nlev, 401)
@@ -353,61 +365,27 @@ def plot_population_stratification(bifrost_z_grid, muram_z_grid,
     print(f"  MURaM mean pops shape: {mean_pops_muram.shape}")
 
     # ------------------------------------------------------------------
-    # C. GNN predicted populations  shape: (50, 992, 992, nlev)
-    #    Native grid: zz_grid_muram  (50,) -- subset clipped to FITS range
+    # C. GNN predicted populations  shape: (n_levels, ny, nx, nlev)
+    #    Grid: the run's muram_grid.npz z (heights above MURaM's tau500 = 1) -- subset clipped to FITS range
     # ------------------------------------------------------------------
-    print("\n--- Loading GNN predictions ---")
-    # Re-build the interpolated GNN height grid (same logic as compare_populations.py)
-    nz_b_orig = nz_b
-    logspace_fraction = 0.33
-    nz_linear = 30
-    nz_log = 20
+    if run_dir is not None:
+        print(f"\n--- Loading GNN predictions from {run_dir} ---")
+        zz_grid_muram_interp = grid['z']
 
-    z_b_idx = np.arange(nz_b_orig)
-    new_z_b_log = np.concatenate([
-        np.linspace(0, nz_b_orig * logspace_fraction, nz_linear, endpoint=False),
-        np.logspace(np.log10(nz_b_orig * logspace_fraction),
-                    np.log10(nz_b_orig - 1), nz_log)
-    ])
-    new_z_b = np.clip(new_z_b_log, 0, nz_b_orig - 1)
-    zz_grid_bifrost_interp = np.interp(new_z_b, z_b_idx, bifrost_z_grid)
+        # Clip to the FITS vertical range
+        valid_mask = ((zz_grid_muram_interp >= fits_heights.min()) &
+                      (zz_grid_muram_interp <= fits_heights.max()))
+        zz_gnn_clipped = zz_grid_muram_interp[valid_mask]  # subset of the grid heights
 
-    # Map to MURaM height coordinate
-    nz_m = len(muram_z_grid)
-    z_m_idx = np.arange(nz_m)
-    new_z_m = np.interp(zz_grid_bifrost_interp, muram_z_grid, z_m_idx)
-    new_z_m = np.clip(new_z_m, 0, nz_m - 1)
-    zz_grid_muram_interp = np.interp(new_z_m, z_m_idx, muram_z_grid)  # (50,)
+        # Clip to valid heights
+        pred_cgs_clipped = pred[valid_mask, :, :, :]  # (n_valid, ny, nx, nlev) in cm^-3
 
-    # Clip to the FITS vertical range
-    valid_mask = ((zz_grid_muram_interp >= fits_heights.min()) &
-                  (zz_grid_muram_interp <= fits_heights.max()))
-    zz_gnn_clipped = zz_grid_muram_interp[valid_mask]  # subset of 50 heights
-
-    pred_path_candidates = [
-        'muram_predictions_stride_4_full.npy',
-        '../muram_predictions_stride_4_full.npy',
-        '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy',
-    ]
-    pred_path = None
-    for p in pred_path_candidates:
-        if os.path.exists(p):
-            pred_path = p
-            break
-    if pred_path is None:
-        print("  ERROR: GNN predictions file not found.")
-        sys.exit(1)
-
-    print(f"  Loading GNN predictions from: {pred_path}")
-    pred = np.load(pred_path)   # shape (50, 992, 992, nlev)  in cm^-3
-
-    # Clip to valid heights
-    pred_cgs_clipped = pred[valid_mask, :, :, :]  # (n_valid, 992, 992, nlev)
-
-    # Mean over horizontal axes (1, 2) -> shape (n_valid, nlev)
-    print("  Computing GNN mean population profiles...")
-    mean_pops_gnn = np.mean(pred_cgs_clipped, axis=(1, 2))  # (n_valid, nlev)
-    print(f"  GNN mean pops shape: {mean_pops_gnn.shape}")
+        # Mean over horizontal axes (1, 2) -> shape (n_valid, nlev)
+        print("  Computing GNN mean population profiles...")
+        mean_pops_gnn = np.mean(pred_cgs_clipped, axis=(1, 2))  # (n_valid, nlev)
+        print(f"  GNN mean pops shape: {mean_pops_gnn.shape}")
+    else:
+        print("\n--- No muram_inference.py output folder given: GNN curve skipped ---")
 
     # ------------------------------------------------------------------
     # D. PLOT
@@ -439,10 +417,11 @@ def plot_population_stratification(bifrost_z_grid, muram_z_grid,
         ax.plot(fits_heights, mean_pops_muram[lvl, :],
                 label='MURaM NLTE', color=color_m, linewidth=2.0, zorder=2)
 
-        # --- GNN predicted (50 heights, clipped to FITS range) ---
-        ax.plot(zz_gnn_clipped, mean_pops_gnn[:, lvl],
-                label='GNN predicted', color=color_g,
-                linewidth=2.0, linestyle='--', zorder=4)
+        # --- GNN predicted (grid heights, clipped to FITS range) ---
+        if run_dir is not None:
+            ax.plot(zz_gnn_clipped, mean_pops_gnn[:, lvl],
+                    label='GNN predicted', color=color_g,
+                    linewidth=2.0, linestyle='--', zorder=4)
 
         ax.set_yscale('log')
         ax.set_xlabel("Height $z$ [Mm]")

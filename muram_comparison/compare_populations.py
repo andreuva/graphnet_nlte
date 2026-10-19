@@ -7,6 +7,11 @@ import os
 import sys
 import muram as mio
 
+# Add the repository folder to path (normalization, vertical_grids)
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from normalization import CA_TOTAL_PER_RHO, lte_log_fractions
+from vertical_grids import to_levels
+
 # Configure matplotlib for premium, publication-quality plots
 plt.rcParams.update({
     'font.size': 12,
@@ -21,50 +26,19 @@ plt.rcParams.update({
 
 print("1. Constructing grids and setting up vertical coordinates...")
 
-# Config parameters from training (saved in conf.dat)
-nz_b = 425
-logspace_fraction = 0.33
-nz_linear = 30
-nz_log = 20
+# The run to compare, a muram_inference.py output folder:   python compare_populations.py <run_dir>
+results_dir = sys.argv[1]
+# Its grid (heights above MURaM's tau500 = 1 [Mm], aligned with Bifrost in muram_inference.py), the heights of all the
+# MURaM levels and the MURaM column (y, x) of the first predicted column
+muram_grid = np.load(os.path.join(results_dir, 'muram_grid.npz'))
+zz_grid_muram = muram_grid['z']
+muram_z_grid = muram_grid['z_native']
+oy, ox = muram_grid['origin']
 
-bifrost_grid_file = '/dat/andreuva/gpu/graphnet/en024048_hion/grid_bifrost.npz'
-if not os.path.exists(bifrost_grid_file):
-    print(f"Error: Bifrost grid file not found at {bifrost_grid_file}")
-    sys.exit(1)
-bifrost_z_grid = np.load(bifrost_grid_file)["z"]
-
-# Grid setup for Bifrost
-z_b = np.arange(nz_b)
-new_z_b_log = np.concatenate([
-    np.linspace(0, nz_b * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz_b * logspace_fraction), np.log10(nz_b - 1), nz_log)
-])
-new_z_b = np.clip(new_z_b_log, 0, nz_b - 1)
-zz_grid_bifrost = np.interp(new_z_b, z_b, bifrost_z_grid)
-
-# Load MURaM snap to compute vertical coordinate muram_z_grid
+# Load MURaM snap (temperature, electron density and density of the LTE baseline)
 pathsource = '/dat/milic/MURaM_enhanced_network/'
 snap_number = 499000
 cube = mio.MuramSnap(pathsource, snap_number)
-
-dx, dy, dz = 24/1e3, 24/1e3, 20/1e3
-nz, nx, ny = cube.Temp.shape
-z = np.arange(nz)
-z_geom = z * dz
-
-# Load the full cube tau to prioritize accuracy (per user instruction)
-print("Loading full cube tau to compute tau=1 layer...")
-tau_mean = np.mean(cube.tau, axis=(1, 2))
-tau_zero_index = np.argmin(np.abs(tau_mean - 1))
-print(f"   tau=1 layer index: {tau_zero_index} (z={z_geom[tau_zero_index]:.4f} Mm)")
-
-muram_z_grid = z_geom - z_geom[tau_zero_index]
-
-# Align height interpolation exactly with Bifrost:
-# Map zz_grid_bifrost to fractional indices in MURaM's vertical coordinate system
-new_z = np.interp(zz_grid_bifrost, muram_z_grid, z)
-new_z = np.clip(new_z, 0, nz - 1)
-zz_grid_muram = np.interp(new_z, z, muram_z_grid)
 
 print(f"   GNN vertical heights (Mm): min={zz_grid_muram.min():.4f}, max={zz_grid_muram.max():.4f}")
 
@@ -76,31 +50,18 @@ print(f"   NLTE vertical heights (Mm): min={fits_heights.min():.4f}, max={fits_h
 valid_mask = (zz_grid_muram >= fits_heights.min()) & (zz_grid_muram <= fits_heights.max())
 zz_gnn_clipped = zz_grid_muram[valid_mask]
 print(f"   Clipped GNN vertical heights (Mm): min={zz_gnn_clipped.min():.4f}, max={zz_gnn_clipped.max():.4f}")
-print(f"   Keeping {len(zz_gnn_clipped)} GNN heights out of 50.")
+print(f"   Keeping {len(zz_gnn_clipped)} GNN heights out of {len(zz_grid_muram)}.")
 
 # Load GNN predictions
-pred_path = 'muram_predictions_stride_4_full.npy'
-if not os.path.exists(pred_path):
-    # Try parent directory
-    pred_path_parent = os.path.join('..', 'muram_predictions_stride_4_full.npy')
-    if os.path.exists(pred_path_parent):
-        pred_path = pred_path_parent
-    else:
-        # Try absolute path
-        pred_path_abs = '/dat/andreuva/gpu/graphnet/graphnet_nlte/muram_predictions_stride_4_full.npy'
-        if os.path.exists(pred_path_abs):
-            pred_path = pred_path_abs
-
+pred_path = os.path.join(results_dir, f"muram_predictions_stride_{int(muram_grid['stride'])}_full.npy")
 if not os.path.exists(pred_path):
     print(f"Error: GNN predictions not found at {pred_path}")
     sys.exit(1)
 print(f"Loading GNN predictions from {pred_path}...")
-pred = np.load(pred_path) # Shape: (50, 992, 992, 6) in m^-3
-# Convert GNN predictions to CGS (cm^-3)
-# pred = pred * 1e6
+pred = np.load(pred_path) # Shape: (n_levels, ny_p, nx_p, 6) in cm^-3
 
 # Clip GNN predictions to the same heights
-pred_clipped = pred[valid_mask, :, :, :] # Shape: (len(zz_gnn_clipped), 992, 992, 6)
+pred_clipped = pred[valid_mask, :, :, :] # Shape: (len(zz_gnn_clipped), ny_p, nx_p, 6)
 
 fits_path = "/dat/milic/MURaM_enhanced_network/che_full_499000_lwsynth_200.0.fits"
 if not os.path.exists(fits_path):
@@ -108,10 +69,11 @@ if not os.path.exists(fits_path):
     sys.exit(1)
 
 print("2. Memory-mapping the 29 GB FITS file...")
+ny_p, nx_p = pred.shape[1:3]
 with fits.open(fits_path, memmap=True) as hdul:
-    # FITS shape in Python: (1024, 1024, 6, 401) representing [x_idx, y_idx, level, z_fits_idx]
+    # FITS shape in Python: (1024, 1024, 6, 401) representing [x_idx, y_idx, level, z_fits_idx]; FITS[a, b] = MURaM (x=a, y=b)
     print("   Loading cropped horizontal domain...")
-    fits_cropped = hdul[2].data[16:-16, 16:-16, :, :] # Shape: (992, 992, 6, 401)
+    fits_cropped = hdul[2].data[ox:ox + nx_p, oy:oy + ny_p, :, :] # Shape: (nx_p, ny_p, 6, 401)
     
 # Reverse the FITS vertical axis to match the increasing order of fits_heights (from photosphere to chromosphere)
 fits_cropped = fits_cropped[..., ::-1]
@@ -126,23 +88,25 @@ fits_cropped = fits_cropped * 1e-6
 
 print("3. Reinterpolating NLTE populations onto clipped GNN heights grid...")
 # fits_heights has shape (401,), and is strictly increasing.
-# fits_cropped has shape (992, 992, 6, 401).
-# We interpolate along the last axis (axis=-1) to target heights zz_gnn_clipped.
-fits_interp_func = interp.interp1d(fits_heights, fits_cropped, axis=-1, bounds_error=False, fill_value="extrapolate")
-fits_on_gnn = fits_interp_func(zz_gnn_clipped) # Shape: (992, 992, 6, len(zz_gnn_clipped))
+# fits_cropped has shape (nx_p, ny_p, 6, 401).
+# We interpolate along the last axis (axis=-1) to target heights zz_gnn_clipped,
+# linearly in log10 (a linear interpolation mixes chromospheric and coronal states at the transition region)
+fits_interp_func = interp.interp1d(fits_heights, np.log10(np.clip(fits_cropped, 1e-30, None)), axis=-1, bounds_error=False, fill_value="extrapolate")
+fits_on_gnn = 10.0 ** fits_interp_func(zz_gnn_clipped) # Shape: (nx_p, ny_p, 6, len(zz_gnn_clipped))
 print(f"   Interpolated NLTE shape: {fits_on_gnn.shape}")
 
 print("4. Aligning coordinate axes...")
-# GNN predictions has shape (len(zz_gnn_clipped), 992, 992, 6) -> (z, y, x, npops).
+# GNN predictions has shape (len(zz_gnn_clipped), ny_p, nx_p, 6) -> (z, y, x, npops).
 # We transpose to (x, y, npops, z) to match fits_on_gnn.
 pred_aligned = pred_clipped.transpose(2, 1, 3, 0)
 print(f"   Aligned GNN shape: {pred_aligned.shape}")
 
 print("\n5. Computing comparison statistics at each height...")
 
-# We will compare levels 0, 3, 5
-levels_to_compare = [0, 3, 5]
-levels_labels = {0: "Ca II Ground (lvl 0)", 3: "Ca II Metastable (lvl 3)", 5: "Ca III Ion (lvl 5)"}
+# We will compare all six levels (0 = 4s ground; 1, 2 = 3d metastable; 3, 4 = 4p; 5 = Ca III)
+levels_to_compare = [0, 1, 2, 3, 4, 5]
+levels_labels = {0: "Ca II 4s (lvl 0)", 1: "Ca II 3d3/2 (lvl 1)", 2: "Ca II 3d5/2 (lvl 2)", 3: "Ca II 4p1/2 (lvl 3)",
+                 4: "Ca II 4p3/2 (lvl 4)", 5: "Ca III (lvl 5)"}
 
 # Clean terminal table formatting
 print("\n" + "=" * 105)
@@ -173,10 +137,48 @@ for h_idx, h in enumerate(zz_gnn_clipped):
     print("-" * 105)
 print("=" * 105 + "\n")
 
+# Errors in dex per height band (Mm above tau500 = 1) on the nodes where the reference has Ca II (Ca II fraction > 1e-2),
+# for the GNN and for the LTE baseline: the Saha-Boltzmann populations of MURaM's T and n_e times the total Ca of the GNN
+# (CA_TOTAL_PER_RHO * rho). T, n_e and rho of the predicted columns (cube (z, x, y)) interpolated in log10 to the heights
+print("   Reading T, n_e and rho of the predicted columns for the LTE baseline...")
+def crop_on_grid(q):
+    return to_levels(q[:, ox:ox + nx_p, oy:oy + ny_p], muram_z_grid, zz_gnn_clipped, log=True)   # (z, x, y)
+
+temp = crop_on_grid(cube.Temp)                                 # K
+n_e = crop_on_grid(cube.ne) * 1e6                              # cm^-3 -> m^-3
+totals = CA_TOTAL_PER_RHO * crop_on_grid(cube.rho) * 1e3       # g cm^-3 -> kg m^-3, total Ca in cm^-3
+lte = (10.0 ** lte_log_fractions(temp[..., np.newaxis], n_e[..., np.newaxis]) * totals[..., np.newaxis]).transpose(1, 2, 3, 0)   # (x, y, npops, z)
+
+level_names = ['4s', '3d3/2', '3d5/2', '4p1/2', '4p3/2', 'CaIII']
+bands = [(-np.inf, 0.0, 'z<0'), (0.0, 0.5, '0-0.5'), (0.5, 1.0, '0.5-1'), (1.0, 1.5, '1-1.5'), (1.5, 2.2, '1.5-2.2'), (2.2, 3.5, '2.2-3.5'), (3.5, np.inf, '>3.5')]
+f_ref = fits_on_gnn / fits_on_gnn.sum(2, keepdims=True)
+relevant = (1.0 - f_ref[:, :, 5, :]) > 1e-2                    # (x, y, z)
+
+def dex_stats(d):           # median |dlog n|, signed median, p84 |dlog n|
+    return f"{np.nanmedian(np.abs(d)):12.4f}   | {np.nanmedian(d):+12.4f}   | {np.nanpercentile(np.abs(d), 84):12.4f}   |"
+
+print("=" * 109)
+print(f"{'Method':^6} | {'Band (Mm)':^9} | {'Level':^6} | {'med |dlog n|':^14} | {'signed median':^14} | {'p84 |dlog n|':^14} | {'med dlog total':^14} | {'n nodes':^9} |")
+print("=" * 109)
+for name, arr in (('gnn', pred_aligned), ('lte', lte)):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dlog = np.log10(arr) - np.log10(fits_on_gnn)                    # (x, y, npops, z)
+        dtot = np.log10(arr.sum(2)) - np.log10(fits_on_gnn.sum(2))      # (x, y, z)
+    for lo, hi, band in bands:
+        hsel = (zz_gnn_clipped >= lo) & (zz_gnn_clipped < hi)
+        m = relevant[:, :, hsel] & np.isfinite(dtot[:, :, hsel])
+        if m.sum() == 0:
+            continue
+        d_band = dlog[:, :, :, hsel].transpose(0, 1, 3, 2)[m]           # (n nodes, npops)
+        for lvl in levels_to_compare:
+            print(f"{name:^6} | {band:^9} | {level_names[lvl]:^6} | " + dex_stats(d_band[:, lvl]))
+        print(f"{name:^6} | {band:^9} | {'all':^6} | " + dex_stats(d_band) + f" {np.nanmedian(dtot[:, :, hsel][m]):+12.4f}   | {m.sum():9d} |")
+        print("-" * 109)
+print("=" * 109 + "\n")
+
 print("6. Generating premium population comparison plots...")
 
-plot_dir = "plots_comparison"
-os.makedirs(plot_dir, exist_ok=True)
+plot_dir = results_dir
 
 # Select a representative set of 5 heights distributed across zz_gnn_clipped
 selected_indices = np.linspace(0, len(zz_gnn_clipped) - 1, 5, dtype=int)
@@ -185,7 +187,7 @@ for idx in selected_indices:
     h = zz_gnn_clipped[idx]
     print(f"   Plotting comparison maps at height: {h:.4f} Mm...")
     
-    fig, axes = plt.subplots(len(levels_to_compare), 3, figsize=(18, 14), dpi=150)
+    fig, axes = plt.subplots(len(levels_to_compare), 3, figsize=(18, 4.7 * len(levels_to_compare)), dpi=150)
     fig.suptitle(f"$z = {h:.4f}$ Mm\n(Left: GNN | Middle: 1.5D NLTE | Right: Difference)", y=0.98)
     
     for row_idx, lvl in enumerate(levels_to_compare):

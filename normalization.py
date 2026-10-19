@@ -1,457 +1,164 @@
 """
 Normalization and denormalization functions for NLTE populations and physical features.
 
-This module contains the normalization strategy from porta_graph_test.ipynb
-to ensure consistency across training and inference scripts.
+Inputs: velocities divided by a fixed 10 km/s; the other quantities (temp, rho, press) as log10, standardized by ONE
+mean and standard deviation of the whole training cube and clipped at +-5 sigma; 'lte', the six log10 LTE fractions
+of the Ca levels (lte_log_fractions), standardized per level. The statistics are fitted once on the training cube,
+stored in the checkpoint and applied unchanged to any other atmosphere (normalize_features_with_params).
+Targets: log10 of the fractions of the six levels, log10(n_level / n_total + log_offset).
 """
 
 import numpy as np
 
-# ===================================================================
-# ORIGINAL 'POW' NORMALIZATION
-# ===================================================================
-def normalize_pops_pow(pops, factor=4., log_offset=1e-12):
+VEL_SCALE = 1e4                 # [m/s]: velocities enter as v / 10 km/s, with no offset (Dataset.py rotates them)
+CLIP = 5.0                      # standardized log10 scalars are clipped at +-CLIP
+
+# Total Ca number density per unit mass density of the training targets: the sum over the six levels of
+# AR_385_CaII_5L_pops.dat [cm^-3] divided by AR_385_mass.dat [kg m^-3] is 9.65e14 at every node (scatter 2e-7)
+CA_TOTAL_PER_RHO = 9.65e14
+
+
+def normalize_pops(pops, log_offset=1e-12):
     """
-    Normalize populations using logarithmic transformation with height-stratified statistics.
+    Normalize populations as the log10 of the fraction of every level.
 
     Args:
         pops: Population array of shape (nz, ny, nx, nlev)
-        factor: Scaling factor for the normalized populations (default: 4.0)
         log_offset: Small value to avoid log(0) (default: 1e-12)
 
     Returns:
-        normalized_pops: Normalized populations
-        norm_params: Dictionary with normalization parameters for denormalization
-    """
-    total_pops_all = np.sum(pops, axis=-1)
-    fractional_pops = pops / (total_pops_all[:, :, :, np.newaxis] + log_offset)
-    normalized_pops = np.log10(1 / (fractional_pops + log_offset))**(1 / factor)
-
-    norm_params = {
-        'totals': total_pops_all,
-        'factor': factor,
-        'log_offset': log_offset
-    }
-
-    return normalized_pops, norm_params
-
-def denormalize_pops_pow(normalized_pops, norm_params):
-    """
-    Denormalize populations back to original space.
-
-    Args:
-        normalized_pops: Normalized population array
-        norm_params: Dictionary with 'totals', 'factor', and 'log_offset' keys
-
-    Returns:
-        reconstructed_pops: Populations in original space
-    """
-    total_pops_all = norm_params['totals']
-    factor = norm_params['factor']
-    log_offset = norm_params['log_offset']
-
-    # normalized_pops = np.log10(fractional_pops + log_offset)**(1/factor)
-    reconstructed_fractional_pops = np.power(10, -normalized_pops**factor) - log_offset
-    reconstructed_pops = reconstructed_fractional_pops * \
-        (total_pops_all[:, :, :, np.newaxis] + log_offset)
-
-    return reconstructed_pops
-
-# ===================================================================
-# ORIGINAL 'LOG' NORMALIZATION
-# ===================================================================
-def normalize_pops_log(pops, factor=4., log_offset=1e-12):
-    """
-    Normalize populations using logarithmic transformation with height-stratified statistics.
-
-    Args:
-        pops: Population array of shape (nz, ny, nx, nlev)
-        factor: Scaling factor for the normalized populations (default: 4.0)
-        log_offset: Small value to avoid log(0) (default: 1e-12)
-
-    Returns:
-        normalized_pops: Normalized populations
-        norm_params: Dictionary with normalization parameters for denormalization
+        normalized_pops: log10(fractions + log_offset)
+        norm_params: Dictionary with the totals (nz, ny, nx) and log_offset for denormalization
     """
     total_pops_all = np.sum(pops, axis=3)
-    # total_pops_mean = np.mean(total_pops_all, axis=(1,2))
-    # fractional_pops = pops / (total_pops_mean[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
     fractional_pops = pops / (total_pops_all[:, :, :, np.newaxis] + log_offset)
-    mean_populations = np.mean(fractional_pops, axis=(1, 2))
-
-    mean_broadcast = mean_populations[:, np.newaxis, np.newaxis, :]
-    normalized_pops = np.log10(fractional_pops / (mean_broadcast + log_offset)) / factor
+    normalized_pops = np.log10(fractional_pops + log_offset)
 
     norm_params = {
-        'means': mean_populations,
         'totals': total_pops_all,
-        # 'totals': total_pops_mean,
-        'factor': factor,
         'log_offset': log_offset
     }
 
     return normalized_pops, norm_params
 
-def denormalize_pops_log(normalized_pops, norm_params):
+def denormalize_pops(normalized_pops, norm_params):
     """
-    Denormalize populations back to original space.
+    Denormalize populations back to original space: the fractions times the totals of the atmosphere predicted.
 
     Args:
-        normalized_pops: Normalized population array
-        norm_params: Dictionary with 'means', 'totals', 'factor', and 'log_offset' keys
+        normalized_pops: Normalized population array (nz, ny, nx, nlev)
+        norm_params: Dictionary with 'totals' (nz, ny, nx) and 'log_offset' keys
 
     Returns:
         reconstructed_pops: Populations in original space
     """
-    mean_populations = norm_params['means']
     total_pops_all = norm_params['totals']
-    # total_pops_all = norm_params['totals'][:, ::2, ::2]
-    factor = norm_params['factor']
     log_offset = norm_params['log_offset']
 
-    temp = normalized_pops * factor
-    temp = 10**temp
-
-    mean_broadcast = mean_populations[:, np.newaxis, np.newaxis, :]
-    reconstructed_fractional_pops = temp * (mean_broadcast + log_offset)
-
+    reconstructed_fractional_pops = np.maximum(10**normalized_pops - log_offset, 0.0)
     reconstructed_pops = reconstructed_fractional_pops * \
         (total_pops_all[:, :, :, np.newaxis] + log_offset)
-        # (total_pops_all[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
 
     return reconstructed_pops
+
+def lte_log_fractions(temp, n_e, log_offset=1e-12):
+    """
+    log10 of the LTE (Saha-Boltzmann) fractions of the six levels of the Ca II model atom (4s, 3d3/2, 3d5/2, 4p1/2,
+    4p3/2, Ca III: the order of the targets) from the atmosphere's own temperature and electron density
+    (Lightweaver lte_pops).
+
+    Args:
+        temp: Temperature [K], array (nz, ny, nx, 1) like the other feature arrays (or (nz, n, 1))
+        n_e: Electron density [m^-3], same shape
+
+    Returns:
+        lte: float32 array (..., 6), the fractions floored at log_offset
+    """
+    from lightweaver.atomic_set import lte_pops
+    from lightweaver.rh_atoms import CaII_atom
+    atom = CaII_atom()
+    lte = np.empty(temp.shape[:-1] + (6,), dtype=np.float32)
+    for k in range(temp.shape[0]):
+        T = np.asarray(temp[k], dtype=np.float64).ravel()
+        f = lte_pops(atom, T, np.asarray(n_e[k], dtype=np.float64).ravel(), np.ones_like(T))     # (6, n) fractions
+        lte[k] = np.log10(np.maximum(f.T, log_offset)).reshape(lte.shape[1:])
+    return lte
 
 def calculate_mean_std(features, labels):
     """
-    Calculate mean and standard deviation for each feature type.
+    Calculate the mean and standard deviation of each feature over the whole cube.
 
-    For velocities and magnetic fields, statistics are computed on the magnitude.
-    For other quantities, statistics are computed directly on the values.
+    Velocities are not standardized (mean 0, std VEL_SCALE). 'lte' has one mean and std per level.
+    The other quantities are standardized in log10.
 
     Args:
-        features: List of feature arrays
-        labels: List of feature labels (e.g., 'vel', 'b', 'temp', 'n_h', 'n_e', 'n_p')
+        features: List of feature arrays (nz, ny, nx, ncomp)
+        labels: List of feature labels ('vel', 'temp', 'rho', 'press', 'lte')
 
     Returns:
-        means: List of mean values per height
-        stds: List of standard deviations per height
+        means: List of means (lists of six for 'lte')
+        stds: List of standard deviations
     """
     means = []
     stds = []
     for feature, label in zip(features, labels):
-        if 'vel' in label or 'b' in label:
-            means.append(np.mean(np.linalg.norm(feature, axis=3), axis=(1, 2)))
-            stds.append(np.std(np.linalg.norm(feature, axis=3), axis=(1, 2)))
+        if 'vel' in label:
+            means.append(0.0)
+            stds.append(VEL_SCALE)
+        elif label == 'lte':
+            means.append(feature.mean(axis=(0, 1, 2), dtype=np.float64).tolist())
+            stds.append(feature.std(axis=(0, 1, 2), dtype=np.float64).tolist())
         else:
-            means.append(np.mean(feature, axis=(1, 2, 3)))
-            stds.append(np.std(feature, axis=(1, 2, 3)))
+            log_feature = np.log10(feature)
+            means.append(float(log_feature.mean(dtype=np.float64)))
+            stds.append(float(log_feature.std(dtype=np.float64)))
     return means, stds
 
-# ===================================================================
-# ORIGINAL 'POW' NORMALIZATION
-# ===================================================================
-def normalize_features_pow(features, labels, log_offset=1e-12):
+def normalize_features(features, labels):
     """
-    Normalize physical features using height-stratified statistics and scale to [-1, 1] range.
-
-    - Velocities and magnetic fields: divided by std of magnitude, then scaled to [-1, 1]
-    - Densities (n_*): log10(value / mean), then scaled to [-1, 1]
-    - Other quantities: (value - mean) / std, then scaled to [-1, 1]
+    Fit the normalization on the training cube and normalize the features with it.
 
     Args:
         features: List of feature arrays
         labels: List of feature labels
-        log_offset: Small value to avoid division by zero (default: 1e-12)
 
     Returns:
-        normalized: List of normalized feature arrays (scaled to [-1, 1])
-        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
+        normalized: List of normalized feature arrays
+        norm_params: Dictionary with 'means', 'stds' and 'clip', saved in the checkpoint
     """
-    # Normalize features and targets as done during training
-
-    normalized = []
-    scale_factors = []
     means, stds = calculate_mean_std(features, labels)
-
-    for feature, label, mean, std in zip(features, labels, means, stds):
-        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
-        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis]
-        
-        if 'vel' in label or 'b' in label:
-            scale_factor = 4.0
-            # Normalize by std, then apply a power-law transformation
-            z = (feature - mean_broadcast) / std_broadcast
-            normed = np.sign(z) * np.abs(z)**(1 / scale_factor)
-        elif 'n_' in label:
-            scale_factor = 10.0
-            # Logarithmic transformation relative to the mean, scaled by a factor
-            normed = np.log10(feature / mean_broadcast) / scale_factor
-        else: # Assuming 'temp' or other quantities
-            scale_factor = 1.0
-             # Logarithmic transformation relative to the mean, scaled by a factor
-            normed = np.log10(feature / mean_broadcast) / scale_factor
-
-        normalized.append(normed)
-        scale_factors.append(scale_factor)
-
     norm_params = {
         'means': means,
         'stds': stds,
-        'scale_factors': scale_factors,
-        'log_offset': log_offset
+        'clip': CLIP
     }
 
-    return normalized, norm_params
+    return normalize_features_with_params(features, labels, norm_params), norm_params
 
-def denormalize_features_pow(normalized_features, labels, norm_params):
+def normalize_features_with_params(features, labels, norm_params):
     """
-    Denormalize features back to original space.
-
-    Args:
-        normalized_features: List of normalized feature arrays
-        labels: List of feature labels
-        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
-
-    Returns:
-        denormalized: List of feature arrays in original space
-    """
-    means = norm_params['means']
-    stds = norm_params['stds']
-    scale_factors = norm_params['scale_factors']
-
-    denormalized = []
-    for feature, label, mean, std, scale_factor in zip(normalized_features, labels, means, stds, scale_factors):
-        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis]
-        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
-
-        if 'vel' in label or 'b' in label:
-            z_reconstructed = np.sign(feature) * (np.abs(feature)**scale_factor)
-            denormalized.append(z_reconstructed * std_broadcast + mean_broadcast)
-        elif 'n_' in label:
-            denormalized.append(mean_broadcast * 10**(feature * scale_factor))
-        else:
-            denormalized.append(mean_broadcast * 10**(feature * scale_factor))
-
-    return denormalized
-
-
-def normalize_features_log(features, labels, log_offset=1e-12):
-    """
-    Normalize physical features using height-stratified statistics and scale to [-1, 1] range.
-
-    - Velocities and magnetic fields: divided by std of magnitude, then scaled to [-1, 1]
-    - Densities (n_*): log10(value / mean), then scaled to [-1, 1]
-    - Other quantities: (value - mean) / std, then scaled to [-1, 1]
+    Normalize physical features using pre-computed statistics (the ones of the training run).
 
     Args:
         features: List of feature arrays
         labels: List of feature labels
-        log_offset: Small value to avoid division by zero (default: 1e-12)
+        norm_params: Dictionary with 'means', 'stds' and 'clip'
 
     Returns:
-        normalized: List of normalized feature arrays (scaled to [-1, 1])
-        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
+        normalized: List of normalized float32 feature arrays
     """
     normalized = []
-    scale_factors = []
-    means, stds = calculate_mean_std(features, labels)
-
-    for feature, label, mean, std in zip(features, labels, means, stds):
-        # First apply the standard normalization
-        if 'vel' in label or 'b' in label:
-            normed = (feature) / (std[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
-        elif 'n_' in label:
-            normed = np.log10(feature / (mean[:, np.newaxis, np.newaxis, np.newaxis] + log_offset))
-        else:
-            normed = (feature - mean[:, np.newaxis, np.newaxis, np.newaxis]) / \
-                    (std[:, np.newaxis, np.newaxis, np.newaxis] + log_offset)
-
-        # Calculate scaling factor to map to [-1, 1]
-        # Find the maximum absolute value
-        max_abs_value = np.max(np.abs(normed))
-        scale_factor = max_abs_value if max_abs_value > 0 else 1.0
-
-        # Scale to [-1, 1]
-        normed_scaled = normed / scale_factor
-
-        normalized.append(normed_scaled)
-        scale_factors.append(scale_factor)
-
-    # Return normalization parameters
-    norm_params = {
-        'means': means,
-        'stds': stds,
-        'scale_factors': scale_factors,
-        'log_offset': log_offset
-    }
-
-    return normalized, norm_params
- 
-def denormalize_features_log(normalized_features, labels, norm_params):
-    """
-    Denormalize features back to original space.
-
-    Args:
-        normalized_features: List of normalized feature arrays
-        labels: List of feature labels
-        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
-
-    Returns:
-        denormalized: List of feature arrays in original space
-    """
-    means = norm_params['means']
-    stds = norm_params['stds']
-    scale_factors = norm_params['scale_factors']
-    log_offset = norm_params['log_offset']
-
-    denormalized = []
-    for feature, label, mean, std, scale_factor in zip(normalized_features, labels, means, stds, scale_factors):
-        # First reverse the [-1, 1] scaling
-        feature_unscaled = feature * scale_factor
-
-        # Then reverse the standard normalization
-        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis] + log_offset
-        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
-
-        if 'vel' in label or 'b' in label:
-            denormalized.append(feature_unscaled * std_broadcast)
-        elif 'n_' in label:
-            denormalized.append((10**feature_unscaled) * (mean_broadcast + log_offset))
-        else:
-            denormalized.append((feature_unscaled * std_broadcast) + mean_broadcast)
-
-    return denormalized
-
-# ===================================================================
-# UNIFIED INTERFACE
-# ===================================================================
-def normalize_features(features, labels, log_offset=1e-12, type='log'):
-    print(f"Nomalaizing features with {type}")
-    if type == 'log':
-        return normalize_features_log(features, labels, log_offset)
-    elif type == 'pow':
-        return normalize_features_pow(features, labels, log_offset)
-    else:
-        raise ValueError("Normalization type not implemented. Choose 'log' 'pow'.")
-
-def denormalize_features(normalized_features, labels, norm_params, type='log'):
-    print(f"Denomalaizing features with {type}")
-    if type == 'log':
-        return denormalize_features_log(normalized_features, labels, norm_params)
-    elif type == 'pow':
-        return denormalize_features_pow(normalized_features, labels, norm_params)
-    else:
-        raise ValueError("Normalization type not implemented. Choose 'log' 'pow'.")
-
-# ===================================================================
-# PRE-COMPUTED PARAMETER NORMALIZATION (FOR PURE INFERENCE)
-# ===================================================================
-def normalize_features_log_with_params(features, labels, norm_params):
-    """
-    Normalize physical features using pre-computed log statistics.
-
-    Args:
-        features: List of feature arrays
-        labels: List of feature labels
-        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
-
-    Returns:
-        normalized: List of normalized feature arrays
-    """
-    means = norm_params['means']
-    stds = norm_params['stds']
-    scale_factors = norm_params['scale_factors']
-    log_offset = norm_params.get('log_offset', 1e-12)
-
-    normalized = []
-    for feature, label, mean, std, scale_factor in zip(features, labels, means, stds, scale_factors):
+    for feature, label, mean, std in zip(features, labels, norm_params['means'], norm_params['stds']):
         if feature.ndim == 3:
             feature = feature[:, :, :, np.newaxis]
-        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis]
-        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
 
-        if 'vel' in label or 'b' in label:
-            normed = feature / (std_broadcast + log_offset)
-        elif 'n_' in label:
-            normed = np.log10(feature / (mean_broadcast + log_offset))
+        if 'vel' in label:
+            normed = feature / std
+        elif label == 'lte':           # already log10 and bounded by the floor: no clip
+            normed = (feature - np.asarray(mean, dtype=np.float32)) / np.asarray(std, dtype=np.float32)
         else:
-            normed = (feature - mean_broadcast) / (std_broadcast + log_offset)
+            normed = np.clip((np.log10(feature) - mean) / std, -norm_params['clip'], norm_params['clip'])
 
-        normed_scaled = normed / scale_factor
-        normalized.append(normed_scaled)
+        normalized.append(normed.astype(np.float32))
 
     return normalized
-
-def normalize_features_pow_with_params(features, labels, norm_params):
-    """
-    Normalize physical features using pre-computed pow statistics.
-
-    Args:
-        features: List of feature arrays
-        labels: List of feature labels
-        norm_params: Dictionary with 'means', 'stds', 'scale_factors', and 'log_offset'
-
-    Returns:
-        normalized: List of normalized feature arrays
-    """
-    means = norm_params['means']
-    stds = norm_params['stds']
-    scale_factors = norm_params['scale_factors']
-
-    normalized = []
-    for feature, label, mean, std, scale_factor in zip(features, labels, means, stds, scale_factors):
-        if feature.ndim == 3:
-            feature = feature[:, :, :, np.newaxis]
-        std_broadcast = std[:, np.newaxis, np.newaxis, np.newaxis]
-        mean_broadcast = mean[:, np.newaxis, np.newaxis, np.newaxis]
-
-        if 'vel' in label or 'b' in label:
-            z = (feature - mean_broadcast) / std_broadcast
-            normed = np.sign(z) * np.abs(z)**(1 / scale_factor)
-        elif 'n_' in label:
-            normed = np.log10(feature / mean_broadcast) / scale_factor
-        else:
-            normed = np.log10(feature / mean_broadcast) / scale_factor
-
-        normalized.append(normed)
-
-    return normalized
-
-def normalize_features_with_params(features, labels, norm_params, type='log'):
-    """
-    Normalize features using pre-computed statistics from training.
-
-    Args:
-        features: List of feature arrays
-        labels: List of feature labels
-        norm_params: Pre-computed normalization parameters dictionary
-        type: Normalization type ('log' or 'pow')
-
-    Returns:
-        normalized: List of normalized feature arrays
-    """
-    print(f"Normalizing features with pre-computed parameters using {type}")
-    if type == 'log':
-        return normalize_features_log_with_params(features, labels, norm_params)
-    elif type == 'pow':
-        return normalize_features_pow_with_params(features, labels, norm_params)
-    else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
-
-def normalize_pops(pops, factor=4., log_offset=1e-12, type='log'):
-    print(f"Nomalaizing populations with {type}")
-    if type == 'log':
-        return normalize_pops_log(pops, factor, log_offset)
-    elif type == 'pow':
-        return normalize_pops_pow(pops, factor, log_offset)
-    else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")
-
-def denormalize_pops(normalized_pops, norm_params, type='log'):
-    print(f"Denomalaizing populations with {type}")
-    if type == 'log':
-        return denormalize_pops_log(normalized_pops, norm_params)
-    elif type == 'pow':
-        return denormalize_pops_pow(normalized_pops, norm_params)
-    else:
-        raise ValueError("Normalization type not implemented. Choose 'log', 'pow'.")

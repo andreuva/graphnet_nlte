@@ -2,7 +2,7 @@
 # Import only the necessary libraries for data loading and plotting
 import numpy as np
 import os
-import torch
+import sys
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import ipywidgets as widgets
@@ -22,27 +22,27 @@ except (ImportError, RuntimeError, Exception):
         ipy.run_line_magic('matplotlib', 'inline')
 
 # %%
-# Load configuration to get directory paths
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
-checkpoint = torch.load(checkpoint_path, weights_only=False)
-config = checkpoint['config']
-savedir = config['training']['savedir']
+# The output folder of gnn_inference.py holding the synthesis.py spectra (<checkpoint dir>/bifrost_stride{s}_{split}_{grid}):
+#   python plot_scripts/synthesis_plots.py <run_dir>
+run_dir = sys.argv[1]
+side = np.load(os.path.join(run_dir, 'inference.npz'))
+savedir = run_dir # Directory where plots will be saved
 
-print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
+print(f"Plotting the synthesis of the run in {run_dir}.")
 
 # %%
 # Define parameters
-stride = 3
-dataset_type = 'full'
+stride = int(side['stride'])
+dataset_type = str(side['split'])
 nwave = 1001
 wave = np.linspace(853.9444, 854.9444, nwave)
 
 # Load the synthesized intensity profiles
 print("Loading synthesized profiles...")
-Iwave_lte = np.load(f'{savedir}Iwave_lte_stride_{stride}_{dataset_type}.npy')
-Iwave_nlte = np.load(f'{savedir}Iwave_nlte_stride_{stride}_{dataset_type}.npy')
-Iwave_target = np.load(f'{savedir}Iwave_target_stride_{stride}_{dataset_type}.npy')
-Iwave_predicted = np.load(f'{savedir}Iwave_predicted_stride_{stride}_{dataset_type}.npy')
+Iwave_lte = np.load(os.path.join(savedir, f'Iwave_lte_stride_{stride}_{dataset_type}.npy'))
+Iwave_nlte = np.load(os.path.join(savedir, f'Iwave_nlte_stride_{stride}_{dataset_type}.npy'))
+Iwave_target = np.load(os.path.join(savedir, f'Iwave_target_stride_{stride}_{dataset_type}.npy'))
+Iwave_predicted = np.load(os.path.join(savedir, f'Iwave_predicted_stride_{stride}_{dataset_type}.npy'))
 
 nx_patch, ny_patch, _ = Iwave_target.shape
 pixel_x, pixel_y = nx_patch // 2, ny_patch // 2  # Center pixel for naming/references
@@ -52,7 +52,7 @@ print(f"Shape of the synthesized intensities: Predicted: {Iwave_predicted.shape}
 # %%
 # Calculate Spatially Averaged Spectra
 mean_I_lte = np.mean(Iwave_lte, axis=(0, 1))
-mean_I_nlte = np.mean(Iwave_nlte, axis=(0,1), where= Iwave_nlte != 0)
+mean_I_nlte = np.nanmean(Iwave_nlte, axis=(0,1))        # NaN where the 1D NLTE did not converge
 mean_I_orig = np.mean(Iwave_target, axis=(0, 1))
 mean_I_pred = np.mean(Iwave_predicted, axis=(0, 1))
 

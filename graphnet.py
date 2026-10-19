@@ -5,17 +5,6 @@ from torch_geometric.data import Data
 from torch_scatter import scatter_mean
 
 
-def kaiming_init(m):
-    if isinstance(m, (nn.Linear)):
-        init.kaiming_normal_(m.weight)
-        if m.bias is not None:
-            m.bias.data.fill_(0)
-    elif isinstance(m, (nn.BatchNorm1d)):
-        m.weight.data.fill_(1)
-        if m.bias is not None:
-            m.bias.data.fill_(0)
-
-
 class GraphIndependent(nn.Module):
     def __init__(self, edge_model_fn=None, node_model_fn=None, global_model_fn=None):
         """
@@ -106,10 +95,6 @@ class MLP(nn.Module):
             x = layer(x)
 
         return x
-
-    def weights_init(self):
-        for module in self.modules():
-            kaiming_init(module)
 
 
 class EdgeModel(torch.nn.Module):
@@ -226,9 +211,11 @@ class EncodeProcessDecode(nn.Module):
     def __init__(self, node_input_size, edge_input_size, global_input_size, 
                  latent_size, mlp_hidden_size, mlp_n_hidden_layers,
                  n_message_passing_steps,output_size,
-                 dropout=None):
+                 dropout=None, head_log_offset=1e-12):
         """
         Encode-Process-Decode Network (https://arxiv.org/abs/2010.03409)
+        The outputs are log10(softmax + head_log_offset) of the decoded nodes: the log10 fractions of the output_size
+        levels, which sum exactly to one (the targets of normalization.normalize_pops with the same log_offset).
 
         Parameters
         ----------
@@ -248,6 +235,8 @@ class EncodeProcessDecode(nn.Module):
             Number of message passing steps
         output_size : int
             Output size of the decode node representations
+        head_log_offset : float
+            Offset added to the softmax before the log10
         """
         super(EncodeProcessDecode, self).__init__()
 
@@ -260,6 +249,7 @@ class EncodeProcessDecode(nn.Module):
         self.n_message_passing_steps = n_message_passing_steps
         self.output_size = output_size
         self.dropout = dropout
+        self.head_log_offset = head_log_offset
 
         # ---------------------
         # ENCODER
@@ -333,7 +323,8 @@ class EncodeProcessDecode(nn.Module):
     def decode(self, node):
         node_out = self.decoder_network(node)
 
-        return node_out
+        # log10 of the level fractions (not torch.log_softmax: the offset matches the log10(f + offset) targets)
+        return torch.log10(torch.softmax(node_out, dim=-1) + self.head_log_offset)
 
     def process_step(self, processor_network, node, edge_attr, edge_index, u, batch):
 
@@ -398,10 +389,6 @@ class EncodeProcessDecode(nn.Module):
         node_out = self.decode(node_k)
 
         return node_out
-
-    def weights_init(self):
-        for module in self.modules():
-            kaiming_init(module)
 
 
 if (__name__ == '__main__'):

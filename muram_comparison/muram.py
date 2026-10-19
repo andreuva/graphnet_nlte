@@ -415,3 +415,18 @@ class MuramSubSnap():
                 continue
             setattr(self, var, cube)
             self.available.append(var) 
+
+def muram_heights(snap, step=4):
+    """Heights [Mm] of all levels of a MuramSnap above its tau500 = 1 level, and that level as a fractional index.
+
+    The tau500 = 1 level is the median over the columns (every step-th column per axis) of the highest crossing of
+    tau500 = 1 in each column, interpolated linearly in log10(tau). The level spacing is read from the header.
+    """
+    log_tau = np.log10(np.clip(np.asarray(snap.tau[:, ::step, ::step]), 1e-30, None))
+    nz = log_tau.shape[0]
+    k = np.clip(nz - 1 - np.argmax((log_tau >= 0)[::-1], axis=0), 0, nz - 2)     # highest level with tau >= 1
+    i, j = np.indices(k.shape)
+    c0, c1 = log_tau[k, i, j], log_tau[k + 1, i, j]
+    tau1_index = float(np.nanmedian(k + c0 / (c0 - c1)))
+    dz = float(np.asarray(snap.Temp.dX)[0]) / 1e8                                  # cm -> Mm
+    return (np.arange(snap.Temp.shape[0]) - tau1_index) * dz, tau1_index

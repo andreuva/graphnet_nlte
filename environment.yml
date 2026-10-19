@@ -142,6 +142,7 @@ dependencies:
   - jedi=0.19.2=pyhd8ed1ab_1
   - jinja2=3.1.6=pyhd8ed1ab_0
   - jmespath=1.0.1=pyhd8ed1ab_1
+  - joblib=1.5.2=py312h06a4308_0
   - jplephem=2.23=pyha4b2019_0
   - jsonschema=4.25.0=py312h06a4308_0
   - jsonschema-specifications=2023.7.1=py312h06a4308_0
@@ -345,6 +346,7 @@ dependencies:
   - rpds-py=0.22.3=py312h4aa5aa6_0
   - s2n=1.5.26=h5ac9029_0
   - s3fs=2025.9.0=pyhd8ed1ab_0
+  - scikit-learn=1.7.2=py312h505adc9_0
   - scipy=1.16.2=py312h7a1785b_0
   - setuptools=78.1.1=py312h06a4308_0
   - six=1.17.0=pyhe01879c_1
@@ -356,6 +358,7 @@ dependencies:
   - stack_data=0.6.3=pyhd8ed1ab_1
   - sympy=1.14.0=pyh2585a3b_105
   - tbb=2021.13.0=hb60516a_3
+  - threadpoolctl=3.5.0=py312he106c6f_0
   - tk=8.6.15=h54e0aa7_0
   - toolz=1.0.0=pyhd8ed1ab_1
   - torch-scatter=2.1.1=cpu_h55dfd04_14
@@ -408,7 +411,7 @@ dependencies:
       - asdf-transform-schemas==0.6.0
       - asdf-wcs-schemas==0.5.0
       - gwcs==0.26.0
-      - lightweaver==0.15.0
+      - lightweaver @ git+https://github.com/Goobley/Lightweaver.git@dcb4d266493feb3f57e69bc51e1947c1b831c805
       - ndcube==2.3.2
       - nvidia-cublas-cu11==11.11.3.6
       - nvidia-cuda-cupti-cu11==11.8.87

@@ -1,17 +1,17 @@
 # %%
 import numpy as np
-import torch, os
+import torch, os, sys
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
-from scipy.interpolate import interpn
 import matplotlib.ticker as ticker
 import multiprocessing
 
 from graphnet import EncodeProcessDecode
 from Dataset import EfficientDataset
-from normalization import denormalize_pops, normalize_features, normalize_pops
+from normalization import denormalize_pops, normalize_features_with_params, normalize_pops, lte_log_fractions
+from vertical_grids import fixed_grid, to_levels, ZTAU51_BIFROST
 
 # %%
 import matplotlib.colors as colors
@@ -28,15 +28,17 @@ plt.rcParams.update({
 
 # %%
 # Check if CUDA is available and set the device
-# Set device
-gpu = 0
-cuda_available = torch.cuda.is_available()
-device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+# Set device: CPU unless a device is given as 4th argument (e.g. 'cuda:0')
+device = torch.device(sys.argv[4] if len(sys.argv) > 4 else 'cpu')
+cuda_available = device.type == 'cuda'
 print(f"Using device: {device}\n")
 
 # %%
-# The ONLY parameter you need to set manually is the path to the checkpoint.
-checkpoint_path = '/dat/andreuva/gpu/graphnet/graphnet_nlte/checkpoints/multistride_cpudtst_4x4_s4_m8_b8_r6_d025_press/2026.03.01-02:16:27_best.pth'
+# The parameters, all positional:
+#   python gnn_inference.py <checkpoint> [stride] [test|full] [device] [grid]
+# stride: hops of the graphs in pixels (default: the training max_stride); 'test' = the held-out corner of the training
+# run (default), 'full' = every column whose stencil fits in the cube; grid: the vertical grid (vertical_grids.fixed_grid)
+checkpoint_path = sys.argv[1]
 
 # Load the entire checkpoint
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -47,19 +49,18 @@ datadir = config['data']['datadir']
 nx, ny, nz = config['data']['nx'], config['data']['ny'], config['data']['nz_orig']
 nlev = config['data']['nlev']
 
-nz_linear = config['dataset']['nz_linear']
-nz_log = config['dataset']['nz_log']
-new_nz = nz_linear + nz_log
-logspace_fraction = config['dataset']['logspace_fraction']
+train_stride = config['dataset']['max_stride']
+stride = int(sys.argv[2]) if len(sys.argv) > 2 else train_stride
+split = sys.argv[3] if len(sys.argv) > 3 else 'test'
+grid_name = sys.argv[5] if len(sys.argv) > 5 else 'dense:60'
 log_offset = config['normalization']['log_offset']
-normalization_type = config['normalization'].get('type', 'log')
+guard = config['training']['valid_guard']      # px next to the training region excluded from the metrics
 
 print(f"Successfully loaded configuration from checkpoint {checkpoint_path}.")
 
 # %%
 # ---- memory–mapped arrays ----
 pops_orig = np.memmap(f'{datadir}/AR_385_CaII_5L_pops.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, nlev))
-b_xyz_orig = np.memmap(f'{datadir}/AR_385_B.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 temp_orig = np.memmap(f'{datadir}/AR_385_temp.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
 vel_orig = np.memmap(f'{datadir}/AR_385_veloc.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 3))
 n_e_orig = np.memmap(f'{datadir}/AR_385_ne.dat', dtype='<f4', mode='r', shape=(nz, ny, nx, 1))
@@ -72,96 +73,74 @@ press_orig = np.memmap(f'{datadir}/AR_385_press.dat', dtype='<f4', mode='r', sha
 print(f"Original data shape: {pops_orig.shape}")
 print("Creating new Z grid")
 
-z, y, x = (np.arange(d) for d in (nz, ny, nx))
-new_z_log = np.concatenate([
-    np.linspace(0, nz * logspace_fraction, nz_linear, endpoint=False),
-    np.logspace(np.log10(nz * logspace_fraction), np.log10(nz - 1), nz_log)
-])
-new_z = np.clip(new_z_log, 0, nz - 1)
-new_y, new_x = (np.linspace(0, d - 1, new_d) for d, new_d in zip((ny, nx), (ny, nx)))
-new_zv, new_yv, new_xv = np.meshgrid(new_z, new_y, new_x, indexing='ij', sparse=True)
-
-# %%
+# Heights above tau500 = 1 [Mm] of the native levels and of the evaluation grid. The data stay on the native levels:
+# the dataset interpolates every node linearly in height between the two native levels around it
 geometry_file = config["data"]["grid_file"]
-geometry_grid = np.load(geometry_file)["z"]
-zz_grid = np.interp(new_z, z, geometry_grid)
+z_native = np.load(geometry_file)["z"].astype(np.float64) - ZTAU51_BIFROST
+zz_grid = fixed_grid(grid_name, z_native[0], z_native[-1])
+new_nz = len(zz_grid)
 
 # %%
 print(f"Loaded geometry grid from {geometry_file} with shape {zz_grid.shape}.")
 plt.figure(figsize=(20, 2))
 plt.plot(zz_grid, zz_grid * 0, '|', markersize=20, label='Interpolated grid')
-plt.plot(geometry_grid, geometry_grid * 0, '|', label='Original grid')
-plt.xlabel('Height (Mm)')
+plt.plot(z_native, z_native * 0, '|', label='Original grid')
+plt.xlabel('Height above tau500 = 1 (Mm)')
 plt.legend()
 plt.title('Comparison of Original and Interpolated Geometry Grids')
 # plt.show()
 plt.close()
 
 # %%
-print(f"Interpolating data to the new grid ({new_nz}, {ny}, {nx})...")
-new_points = (new_zv, new_yv, new_xv)
-pops = interpn((z, y, x), pops_orig, new_points)
-temp = interpn((z, y, x), temp_orig, new_points)
-b_xyz = interpn((z, y, x), b_xyz_orig, new_points)
-vel = interpn((z, y, x), vel_orig, new_points)
-n_e = interpn((z, y, x), n_e_orig, new_points)
-# n_h = interpn((z, y, x), n_h_orig, new_points)
-# n_p = interpn((z, y, x), n_p_orig, new_points)
-rho = interpn((z, y, x), rho_orig, new_points)
-press = interpn((z, y, x), press_orig, new_points)
-print("Interpolation complete.")
-print(f"New shape: {pops.shape}")
-
-# %%
 # ---- Normalization ----
 # IMPORTANT: Use the normalization parameters saved from the training run
 feature_norm_params = checkpoint['feature_norm_params']
-pop_norm_params = checkpoint['normalization_params']
 
-features_labels = ['vx', 'vy', 'vz', 'bx', 'by', 'bz', 'temp', 'ne',
-                #    'n_h', 'n_p']
-                   'rho', 'press']
-features_labels_simple = ['vel', 'b', 'temp', 'n_e',
-                        #   'n_h', 'n_p']
-                          'rho', 'press']
-features_data = [vel, b_xyz, temp, n_e,
-                #  n_h, n_p]
-                 rho, press]
+features_labels = ['vx', 'vy', 'vz', 'temp', 'rho', 'press',
+                   'lte_4s', 'lte_3d32', 'lte_3d52', 'lte_4p12', 'lte_4p32', 'lte_CaIII']
+features_labels_simple = ['vel', 'temp', 'rho', 'press', 'lte']
+assert features_labels_simple == list(checkpoint['features_labels']), checkpoint['features_labels']
 
-# We need to re-run the normalization to get the features for the dataset
-# Note: For a true inference-only script, you would apply the saved means/stds,
-# but since we're using the full dataset here, re-calculating is equivalent.
-normalized_features, _ = normalize_features(features_data, features_labels_simple, log_offset, normalization_type)
-pops_normalized, _ = normalize_pops(pops, factor=config['normalization']['factor'], log_offset=log_offset, type=normalization_type)
+# LTE fractions of the Ca levels (an input) from the temperature and the electron density, on the native levels
+lte_orig = lte_log_fractions(temp_orig, n_e_orig, log_offset)
+features_data = [vel_orig, temp_orig, rho_orig, press_orig, lte_orig]
+
+# The native cube normalized with the saved statistics of the training run (no re-fit)
+normalized_features = normalize_features_with_params(features_data, features_labels_simple, feature_norm_params)
+pops_normalized, pop_norm_params = normalize_pops(pops_orig, log_offset=log_offset)
+del features_data, lte_orig
 
 # ---- Create Test Dataset ----
 # All parameters are now from the loaded config object
 dataset_params = {
     'list_X': normalized_features,
     'list_Y': [pops_normalized],
-    'radius_neighbors': config['dataset']['radius_neighbors'],
+    'z_native': z_native,
+    'pixel_Mm': config['data']['pixel_Mm'],
     'xdim': config['dataset']['x_range_graph'],
     'ydim': config['dataset']['y_range_graph'],
-    'fully_connected': config['dataset']['fully_connected'],
-    'pos_file': config['data']['grid_file'],
-    'seed': config['system']['seed'],
+    'z_levels': zz_grid,
     'train_ratio': config['dataset']['train_ratio'],
-    'nz_linear': config['dataset']['nz_linear'],
-    'nz_log': config['dataset']['nz_log'],
-    'logspace_fraction': config['dataset']['logspace_fraction'],
-    'epoch_size_fraction': 1.0,  # Use full dataset for testing
-    'max_stride': 5, # config["dataset"].get("max_stride", 2),
-    'random_stride': False, #config["dataset"].get("random_stride", False),
-    'split': 'full'
+    'max_stride': stride,
+    'split_stride': train_stride,  # the held-out corner of the training run, whatever the inference stride
+    'stencil_radius': config['dataset']['stencil_radius'],
+    'edge_reach_Mm': config['dataset']['edge_reach_Mm'],
+    'central_reach_Mm': config['dataset']['central_reach_Mm'],
+    'log_offset': log_offset,
+    'split': split
 }
 
 datast_test = EfficientDataset(**dataset_params)
 # loader_test = DataLoader(datast_test, batch_size=config['training']['batch_size']*6, shuffle=False)
 
 num_workers = min(12, multiprocessing.cpu_count())
+# graphs per batch scaled with the edges per graph (48 graphs of the dense:60 grid, ~139k edges each; finer grids have more)
+edges_per_graph = datast_test.template['edge_index'].shape[1]
+inference_batch = max(1, min(config['training']['batch_size'] * 6, int(config['training']['batch_size'] * 6 * 140000 / edges_per_graph)))
+print(f"Inference batch: {inference_batch} graphs of {edges_per_graph} edges")
 loader_test = DataLoader(
     datast_test, 
-    batch_size=config['training']['batch_size']*6,
+    batch_size=inference_batch,
     shuffle=False, 
     num_workers=num_workers,
     pin_memory=cuda_available,
@@ -221,8 +200,10 @@ with torch.no_grad():
         node, edge_attr, edge_index = data.x.to(device), data.edge_attr.to(device), data.edge_index.to(device)
         u, batch, target = data.u.to(device), data.batch.to(device), data.y.to(device)
         out = model(node, edge_attr, edge_index, u, batch)
-        all_predictions.append(out.cpu().numpy())
-        all_targets.append(target.cpu().numpy())
+        # keep the central column of every graph only (its new_nz nodes, level by level)
+        central_mask = data.central_mask.to(device)
+        all_predictions.append(out[central_mask].cpu().numpy())
+        all_targets.append(target[central_mask].cpu().numpy())
 
 predictions_flat = np.concatenate(all_predictions, axis=0)
 targets_flat = np.concatenate(all_targets, axis=0)
@@ -236,16 +217,12 @@ ydim = config['dataset']['y_range_graph']
 nx_size = datast_test.x1 - datast_test.x0
 ny_size = datast_test.y1 - datast_test.y0
 
-nodes_per_sample = new_nz * (2 * xdim + 1) * (2 * ydim + 1)
+# only the central column of every sample was kept, in the order of sample_centers
+nodes_per_sample = new_nz
 
 # Create empty arrays for spatial data
 predictions_spatial = np.zeros((new_nz, ny_size, nx_size, nlev))
 targets_spatial = np.zeros((new_nz, ny_size, nx_size, nlev))
-
-# Create lists to store flattened data for central columns
-predictions_norm_central_flat = []
-targets_norm_central_flat = []
-k_indices_central_flat = [] # To store the vertical index 'k'
 
 start_idx = 0
 num_test_samples = len(datast_test)
@@ -253,40 +230,24 @@ num_test_samples = len(datast_test)
 for i in tqdm(range(num_test_samples), desc="Reconstructing"):
     ix, iy = datast_test.sample_centers[i]
     
-    y_range = np.arange(iy - ydim, iy + ydim + 1)
-    x_range = np.arange(ix - xdim, ix + xdim + 1)
-    k_range = np.arange(new_nz)
-    kv, yv, xv = np.meshgrid(k_range, y_range, x_range, indexing='ij')
-    
-    node_pos_indices = np.stack([kv.ravel(), yv.ravel(), xv.ravel()], axis=1)
-    central_mask = (node_pos_indices[:, 1] == iy) & (node_pos_indices[:, 2] == ix)
-    
     end_idx = start_idx + nodes_per_sample
-    preds_subvolume = predictions_flat[start_idx:end_idx]
-    targets_subvolume = targets_flat[start_idx:end_idx]
+    pred_column = predictions_flat[start_idx:end_idx]
+    target_column = targets_flat[start_idx:end_idx]
 
-    pred_column = preds_subvolume[central_mask]
-    target_column = targets_subvolume[central_mask]
-    k_column = node_pos_indices[central_mask, 0] # Get the 'k' indices
-    
-    predictions_norm_central_flat.append(pred_column)
-    targets_norm_central_flat.append(target_column)
-    k_indices_central_flat.append(k_column)
-
-    if pred_column.shape[0] == new_nz:
-        predictions_spatial[:, iy - datast_test.y0, ix - datast_test.x0, :] = pred_column
-        targets_spatial[:, iy - datast_test.y0, ix - datast_test.x0, :] = target_column
+    predictions_spatial[:, iy - datast_test.y0, ix - datast_test.x0, :] = pred_column
+    targets_spatial[:, iy - datast_test.y0, ix - datast_test.x0, :] = target_column
         
     start_idx = end_idx
 
-# Concatenate lists into flat numpy arrays for analysis
-predictions_norm_flat = np.concatenate(predictions_norm_central_flat, axis=0)
-targets_norm_flat = np.concatenate(targets_norm_central_flat, axis=0)
-k_indices_flat = np.concatenate(k_indices_central_flat, axis=0)
+# Flat numpy arrays of the central columns for analysis
+predictions_norm_flat = predictions_flat
+targets_norm_flat = targets_flat
 
 # %%
 predictions_spatial.shape
-pop_norm_params['totals'] = pop_norm_params['totals'][:, datast_test.x0:datast_test.x1, datast_test.y0:datast_test.y1]
+# Totals of the predicted region: the native totals interpolated in log10 to the evaluation grid (axes z, y, x)
+pop_norm_params['totals'] = to_levels(pop_norm_params['totals'][:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1],
+                                      z_native, zz_grid, log=True)
 
 # %%
 # --- Denormalized Analysis ---
@@ -300,37 +261,78 @@ for i in range(num_test_samples):
     ix, iy = datast_test.sample_centers[i]
     test_mask[iy - datast_test.y0, ix - datast_test.x0] = True
 
-predictions_denorm_flat = predictions_denorm[:, test_mask, :].reshape(-1, nlev)
-targets_denorm_flat = targets_denorm[:, test_mask, :].reshape(-1, nlev)
+# Metric columns: the predicted columns at least `guard` px away from the training region (test split) and inside the
+# region of the training stride (x, y < nx - xdim * train_stride), so that the test split scores the same columns at
+# every stride up to the training stride
+metric_mask = test_mask.copy()
+if split == 'test':
+    metric_mask[:guard, :] = False
+    metric_mask[:, :guard] = False
+metric_mask[ny - ydim * train_stride - datast_test.y0:, :] = False
+metric_mask[:, nx - xdim * train_stride - datast_test.x0:] = False
+print(f"\nMetric columns: {metric_mask.sum()} of the {test_mask.sum()} predicted (stride {stride}, split stride {train_stride}, guard {guard if split == 'test' else 0} px)")
+
+predictions_denorm_flat = predictions_denorm[:, metric_mask, :].reshape(-1, nlev)
+targets_denorm_flat = targets_denorm[:, metric_mask, :].reshape(-1, nlev)
 
 residuals_denorm = (predictions_denorm_flat - targets_denorm_flat) / (targets_denorm_flat + 1e-12)
 mae_denorm = np.mean(np.abs(residuals_denorm), axis=0)
 rmse_denorm = np.sqrt(np.mean(residuals_denorm**2, axis=0))
 
-# --- Normalized Analysis ---
-print("\nCalculating metrics on normalized values...")
-residuals_normalized = (predictions_norm_flat - targets_norm_flat) / (targets_norm_flat + 1e-12)
-mae_normalized = np.mean(np.abs(residuals_normalized), axis=0)
-rmse_normalized = np.sqrt(np.mean(residuals_normalized**2, axis=0))
+# --- Errors in dex, e = log10(n_pred / n_target): all nodes, weighted by the Ca II relevance (nodes with a Ca II
+# fraction below 1e-2 weigh less), per level and per height band [Mm above tau500 = 1] ---
+print("\nCalculating metrics in dex...")
+with np.errstate(divide='ignore', invalid='ignore'):
+    e_dex = np.log10(predictions_denorm_flat) - np.log10(targets_denorm_flat)
+e_dex[~np.isfinite(e_dex)] = np.nan
+num_pixels_in_test = metric_mask.sum()
+z_grid_flat = np.repeat(zz_grid, num_pixels_in_test)          # the flat arrays are level-major
+bands = [(-np.inf, 0.0, 'z<0'), (0.0, 0.5, '0-0.5'), (0.5, 1.0, '0.5-1'), (1.0, 1.5, '1-1.5'), (1.5, 2.2, '1.5-2.2'), (2.2, 3.5, '2.2-3.5'), (3.5, np.inf, '>3.5')]
+level_names = ['4s', '3d3/2', '3d5/2', '4p1/2', '4p3/2', 'CaIII']
+rms = lambda e: np.sqrt(np.nanmean(e**2))
+weighted_rms = lambda e, w: np.sqrt(np.nansum(w * e**2) / np.nansum(w * np.isfinite(e)))
+w_rel = np.clip((1.0 - targets_denorm_flat[:, -1] / targets_denorm_flat.sum(1)) / 1e-2, 0.0, 1.0)[:, None]
+print(f"RMS log10(n_pred/n_target): {rms(e_dex):.4f} dex, Ca II-weighted {weighted_rms(e_dex, w_rel):.4f} dex")
+print('per level: ' + '  '.join(f"{name} {rms(e_dex[:, l]):.4f} (bias {np.nanmean(e_dex[:, l]):+.4f})" for l, name in enumerate(level_names)))
+print('per band : ' + '  '.join(f"{name} {rms(e_dex[(z_grid_flat >= lo) & (z_grid_flat < hi)]):.4f}" for lo, hi, name in bands))
+
+# --- End-to-end error at the native levels: the log10 of the predictions (and of the targets on the grid, the
+# interpolation floor of the grid: what a perfect model on this grid would still miss) interpolated linearly in height
+# to the native levels and compared with the native populations. It does not depend on the grid ---
+native = np.asarray(pops_orig[:, datast_test.y0:datast_test.y1, datast_test.x0:datast_test.x1][:, metric_mask], dtype=np.float64)
+with np.errstate(divide='ignore', invalid='ignore'):
+    e_native = to_levels(np.log10(predictions_denorm[:, metric_mask]), zz_grid, z_native) - np.log10(native)
+    e_floor = to_levels(np.log10(targets_denorm[:, metric_mask]), zz_grid, z_native) - np.log10(native)
+e_native[~np.isfinite(e_native)] = np.nan
+e_floor[~np.isfinite(e_floor)] = np.nan
+w_native = np.clip((1.0 - native[..., -1] / native.sum(-1)) / 1e-2, 0.0, 1.0)[..., None]
+print(f"native levels ({nz}): RMS {rms(e_native):.4f} dex, Ca II-weighted {weighted_rms(e_native, w_native):.4f} dex, "
+      f"interpolation floor of the grid {rms(e_floor):.4f} dex")
+print('native per band : ' + '  '.join(f"{name} {rms(e_native[(z_native >= lo) & (z_native < hi)]):.4f} "
+                                       f"(floor {rms(e_floor[(z_native >= lo) & (z_native < hi)]):.4f})" for lo, hi, name in bands))
+print('native per level: ' + '  '.join(f"{name} {rms(e_native[..., l]):.4f}" for l, name in enumerate(level_names)))
 
 print(f"\nMAE on original populations: {mae_denorm}")
 print(f"RMSE on original populations: {rmse_denorm}")
-
-print(f"\nMAE on normalized values: {mae_normalized}")
-print(f"RMSE on normalized values: {rmse_normalized}")
 
 # %%
 print(f"predictions_denorm.shape: {predictions_denorm.shape}, targets_denorm.shape: {targets_denorm.shape}")
 
 # %%
-# Save both populations for further synthesis
-np.save(f'{config['training']['savedir']}predictions_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy', predictions_denorm)
-np.save(f'{config['training']['savedir']}targets_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy', targets_denorm)
+# Save both populations for further synthesis, with the region, the metric columns and the grid (inference.npz), in a
+# folder next to the checkpoint
+run_dir = os.path.join(os.path.dirname(os.path.abspath(checkpoint_path)), f"bifrost_stride{stride}_{split}_{grid_name.replace(':', '')}")
+os.makedirs(run_dir, exist_ok=True)
+np.save(os.path.join(run_dir, f'predictions_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy'), predictions_denorm)
+np.save(os.path.join(run_dir, f'targets_patch_stride_{dataset_params["max_stride"]}_{dataset_params["split"]}.npy'), targets_denorm)
+np.savez(os.path.join(run_dir, 'inference.npz'), checkpoint=os.path.abspath(checkpoint_path), stride=stride, split=split,
+         x0=datast_test.x0, x1=datast_test.x1, y0=datast_test.y0, y1=datast_test.y1, metric_mask=metric_mask, z_levels=zz_grid)
+print(f"Saved to {run_dir}")
 
 # %%
 # 1. Configuration
-z_slices = [6, 20, 35, 45]   
-n_levels = pops.shape[-1]    # 6 levels
+z_slices = [int(np.argmin(np.abs(zz_grid - h))) for h in (0.0, 1.25, 3.1, 6.6)]   # map heights [Mm above tau500 = 1]
+n_levels = nlev    # 6 levels
 cols = len(z_slices)
 rows = n_levels + 1          # +1 for the Target row at the top
 
@@ -404,7 +406,7 @@ for r in range(rows):
         ax.set_xticks([])
         ax.set_yticks([])
 
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_maps_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_maps_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -448,7 +450,7 @@ for i in range(nlev):
 
 # fig1.suptitle('Predicted vs. Actual Departure Coefficients (Original Scale)', fontsize=16)
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_scatter_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_scatter_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -477,7 +479,7 @@ for i in range(predictions_norm_flat.shape[1]):
 
 fig2.suptitle('Predicted vs. Actual Values for Each Target Feature (Normalized)', fontsize=16)
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_scatter_normalized_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_scatter_normalized_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -503,23 +505,23 @@ for i in range(nlev):
              transform=ax1.transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round,pad=0.3', fc='lightblue', alpha=0.7))
 
-    # --- Row 2: Residuals on Normalized Scale ---
+    # --- Row 2: Error in dex ---
     ax2 = axes3[i, 1]
-    data = residuals_normalized[:, i] * 100
-    lower, upper = -50, 50 # np.percentile(data, [3, 97])
+    data = e_dex[:, i]
+    lower, upper = -0.5, 0.5
     ax2.set_xlim(lower, upper)
-    ax2.hist(data, bins=100, range=(lower, upper), density=True, alpha=0.75, color='orange')
+    ax2.hist(data[np.isfinite(data)], bins=100, range=(lower, upper), density=True, alpha=0.75, color='orange')
     ax2.axvline(0, color='r', linestyle='--')
-    ax2.set_title(f'Level {i+1} Residuals (Normalized)')
-    ax2.set_xlabel('Relative Error (%)')
+    ax2.set_title(f'Level {i+1} Error (dex)')
+    ax2.set_xlabel('log10(pred / target)')
     # ax2.set_yscale('log')
     if i == 0: ax2.set_ylabel('Density')
     ax2.grid(True, linestyle='--', alpha=0.5)
-    ax2.text(0.05, 0.95, f'MAE: {mae_normalized[i]:.3f}\nRMSE: {rmse_normalized[i]:.3f}', 
+    ax2.text(0.05, 0.95, f'MAE: {np.nanmean(np.abs(data)):.3f}\nRMSE: {rms(data):.3f}', 
              transform=ax2.transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.7))
 
-    # --- Row 3: Distribution of Departure Coefficients (Original Scale) ---
+    # --- Row 3: Distribution of Populations (Original Scale) ---
     ax3 = axes3[i, 2]
     valid_mask = (targets_denorm_flat[:, i] > 0) & (predictions_denorm_flat[:, i] > 0)
     x_act = targets_denorm_flat[valid_mask, i]
@@ -532,14 +534,14 @@ for i in range(nlev):
       ax3.hist(x_pred, bins=bins, alpha=0.7, label='Predicted')
       ax3.set_xscale('log')
 
-    ax3.set_title(f'Level {i+1} Coefficient Distribution')
+    ax3.set_title(f'Level {i+1} Population Distribution')
     ax3.set_xlabel('Population')
     if i == 0: ax3.set_ylabel('Count')
     ax3.grid(True, linestyle='--', alpha=0.5)
     ax3.legend()
 
 plt.tight_layout(rect=[0, 0, 1, 0.96])
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_errors_histograms_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_errors_histograms_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -547,10 +549,7 @@ plt.close()
 # %%
 print("Generating height-color-coded scatter plots...")
 
-# To perform the height-based analysis, we need the z-index for each flattened point
-num_pixels_in_test = test_mask.sum()
-z_indices_flat = np.repeat(np.arange(new_nz), num_pixels_in_test)
-z_grid_flat = np.repeat(zz_grid, num_pixels_in_test)
+# The height-based analysis uses the height of each flattened point (z_grid_flat, from the metrics cell)
 
 fig_scatter, axes_scatter = plt.subplots(3, 2, figsize=(12, 15), dpi=100, gridspec_kw={'hspace': 0.1, 'wspace': 0.15})
 axes_scatter = axes_scatter.flatten()
@@ -569,9 +568,11 @@ for i in range(nlev):
         scatter = ax.scatter(x, y, c=z_colors, cmap='viridis', s=0.75, alpha=0.1, rasterized=True)
         last_scatter = scatter
 
-        # np.corrcoef returns a matrix; we want the off-diagonal element [0, 1]
-        pearson_r = np.corrcoef(x, y)[0, 1]
-        r_squared = pearson_r ** 2
+        # Coefficient of determination of log10(pred) against log10(target) (a linear R^2 is dominated by the
+        # deepest, densest nodes)
+        pos = (x > 0) & (y > 0)
+        log_x, log_y = np.log10(x[pos]), np.log10(y[pos])
+        r_squared = 1.0 - np.sum((log_y - log_x) ** 2) / np.sum((log_x - log_x.mean()) ** 2)
         
         # Add R^2 text to the plot (bottom right corner to avoid overlap)
         # transform=ax.transAxes ensures the coordinates (0.95, 0.05) are relative to the box, not data
@@ -605,7 +606,7 @@ if last_scatter is not None:
     cbar.set_label('Height [Mm]', fontsize=14)
     cbar.solids.set(alpha=1)
 
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_scatter_height_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_scatter_height_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
@@ -619,9 +620,9 @@ fig_comp, axes_comp = plt.subplots(nlev, 3, figsize=(12, 15), dpi=100, sharex='c
 
 # Define height groups for color-coding
 height_groups = {
-    f'Bottom (z < 2) Mm': (z_indices_flat < 25),
-    f'Middle (2 < z < 4) Mm': (z_indices_flat >= 25) & (z_indices_flat < 37),
-    f'Top (z >= 4) Mm': (z_indices_flat >= 37)
+    f'Bottom (z < 2) Mm': (z_grid_flat < 2.0),
+    f'Middle (2 < z < 4) Mm': (z_grid_flat >= 2.0) & (z_grid_flat < 4.0),
+    f'Top (z >= 4) Mm': (z_grid_flat >= 4.0)
 }
 colors = ['blue', 'green', 'red']
 
@@ -646,18 +647,18 @@ for i in range(nlev):
     ax1.grid(True, linestyle='--', alpha=0.5)
     # if i == 0: leg1 = ax1.legend(framealpha=0.5, facecolor='white', loc='lower left', fontsize=10)
 
-    # --- Row 2: Residuals on Normalized Scale ---
+    # --- Row 2: Error in dex ---
     ax2 = axes_comp[i, 1]
-    all_norm_residuals = residuals_normalized[:, i] * 100
-    lower, upper = -50, 50 
+    all_dex = e_dex[:, i]
+    lower, upper = -0.5, 0.5 
 
     for color, (label, mask) in zip(colors, height_groups.items()):
-        data = all_norm_residuals[mask]
-        ax2.hist(data, bins=100, range=(lower, upper), density=True, alpha=0.5, label=label, color=color)
+        data = all_dex[mask]
+        ax2.hist(data[np.isfinite(data)], bins=100, range=(lower, upper), density=True, alpha=0.5, label=label, color=color)
 
     ax2.axvline(0, color='k', linestyle='--')
-    if i == 0: ax2.set_title(f'Residuals (Normalized)', fontsize=14)
-    if i == nlev-1: ax2.set_xlabel('Relative Error (%)', fontsize=14)
+    if i == 0: ax2.set_title(f'Error (dex)', fontsize=14)
+    if i == nlev-1: ax2.set_xlabel('log10(pred / target)', fontsize=14)
     
     ax2.grid(True, linestyle='--', alpha=0.5)
     if i == 0: leg2 = ax2.legend(framealpha=0.5, facecolor='white', loc='lower left', fontsize=10)
@@ -669,7 +670,7 @@ for i in range(nlev):
     ax2.locator_params(axis='y', nbins=5)
     # ---------------------------------------
 
-    # --- Row 3: Distribution of Departure Coefficients ---
+    # --- Row 3: Distribution of Populations ---
     ax3 = axes_comp[i, 2]
     valid_mask = (targets_denorm_flat[:, i] > 0)
     
@@ -699,7 +700,7 @@ for i in range(nlev):
     # ---------------------------------------
 
 plt.tight_layout()
-save_path_dist = os.path.join(config['training']['savedir'], f'inference_errors_hist_height_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
+save_path_dist = os.path.join(run_dir, f'inference_errors_hist_height_s{dataset_params["max_stride"]}_{dataset_params["split"]}.png')
 plt.savefig(save_path_dist, dpi=300)
 # plt.show()
 plt.close()
