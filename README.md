@@ -44,7 +44,7 @@ The core architecture follows the "Encode-Process-Decode" paradigm described in 
 
 * **Nodes:** Same physical properties, but representing a voxel: the 49 columns of a disc of radius 4 inside the 9x9 stencil around the predicted column, with hops of `max_stride` pixels, at the levels of a vertical grid. Inputs per node (12): vx, vy, vz in units of 10 km/s; log10 T, log10 rho and log10 P standardized with one mean and standard deviation of the training cube; and the six log10 LTE (Saha-Boltzmann) fractions of the Ca levels computed from the atmosphere's own T and n_e. No magnetic field and no height coordinate.
 
-* **Edges:** Connections are defined by physical distance (star topology): a node is linked to the nodes of the central column less than 0.5 Mm above or below it (2 Mm between two nodes of the central column, adjacent levels always), so the receptive field in km is the same for every hop and grid. Edge features: the vertical and horizontal distances and |dr| in Mm.
+* **Edges:** Connections are defined by physical distance (star topology): a node is linked to the nodes of the central column within a sphere of radius 1 Mm around them (|dr| <= `edge_radius_Mm`), and two nodes of the central column within 2 Mm in height (`central_reach_Mm`, adjacent levels always). Neighbour columns are not linked to each other. Edge features: the vertical and horizontal distances and |dr| in Mm.
 
 * **Message Passing:** Information propagates primarily vertically (due to stratification) but also horizontally, mimicking 3D radiative transfer effects, and only to the center column, neibourgs are only used for context and not actually predicted.
 

@@ -10,7 +10,7 @@
 gpu = 0
 seed = 777
 # fraction of the GPU memory the training may use (shared GPU; the training graphs vary in size)
-gpu_memory_fraction = 0.65
+gpu_memory_fraction = 1.0
 
 [data]
 datadir = '../data_train_v2'
@@ -26,17 +26,17 @@ pixel_Mm = 0.047619
 [dataset]
 # Validation grid (= the deployment grid): 'dense:60' = 60 km steps from the bottom level to 4.5 Mm + 7 coronal levels
 # (vertical_grids.fixed_grid). The training samples draw random two-zone grids (vertical_grids.random_grid)
-grid = 'dense:60'
+grid = 'dense:125'
 # Graph construction: the columns of the (2 x_range_graph + 1) x (2 y_range_graph + 1) stencil within stencil_radius
 # (stencil units), hops of max_stride pixels (1..max_stride drawn per axis in training). Star edges: a node and a node
-# of the central column are linked when their heights differ by <= edge_reach_Mm (two central nodes: <= central_reach_Mm,
-# or adjacent levels); the neighbour columns are not linked to each other
+# of the central column are linked when their distance |dr| is <= edge_radius_Mm (two central nodes: when their heights
+# differ by <= central_reach_Mm, or adjacent levels); the neighbour columns are not linked to each other
 x_range_graph = 4
 y_range_graph = 4
-max_stride = 4
+max_stride = 5
 stencil_radius = 4.01
-edge_reach_Mm = 0.5
-central_reach_Mm = 2.0
+edge_radius_Mm = 1.01
+central_reach_Mm = 1.51
 # Data split for train/test
 train_ratio = 0.7
 
@@ -44,8 +44,8 @@ train_ratio = 0.7
 lr = 1e-3
 batch_size = 8
 # fraction of the training columns drawn (afresh) every epoch
-epoch_size_fraction = 0.2
-n_epochs = 15
+epoch_size_fraction = 0.15
+n_epochs = 100
 savedir = 'checkpoints/v3_lte'
 # Smoothed loss factor
 smooth = 0.01
@@ -70,7 +70,7 @@ global_input_size = 1
 latent_size = 128
 mlp_hidden_size = 64
 mlp_n_hidden_layers = 3
-dropout=0.25
+dropout=0.2
 n_message_passing_steps = 8
 # Output size is 6 CaII levels
 output_size = 6

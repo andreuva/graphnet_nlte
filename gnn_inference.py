@@ -124,7 +124,7 @@ dataset_params = {
     'max_stride': stride,
     'split_stride': train_stride,  # the held-out corner of the training run, whatever the inference stride
     'stencil_radius': config['dataset']['stencil_radius'],
-    'edge_reach_Mm': config['dataset']['edge_reach_Mm'],
+    'edge_radius_Mm': config['dataset']['edge_radius_Mm'],
     'central_reach_Mm': config['dataset']['central_reach_Mm'],
     'log_offset': log_offset,
     'split': split

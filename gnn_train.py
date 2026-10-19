@@ -119,7 +119,7 @@ dataset_params = {
     'train_ratio': config['dataset']['train_ratio'],
     'max_stride': config['dataset']['max_stride'],
     'stencil_radius': config['dataset']['stencil_radius'],
-    'edge_reach_Mm': config['dataset']['edge_reach_Mm'],
+    'edge_radius_Mm': config['dataset']['edge_radius_Mm'],
     'central_reach_Mm': config['dataset']['central_reach_Mm'],
     'log_offset': log_offset,
 }

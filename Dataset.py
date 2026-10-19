@@ -6,23 +6,26 @@ from torch_geometric.data import Data
 from vertical_grids import interp_weights, random_grid
 
 
-def star_graph(z, col_x, col_y, c0, edge_reach, central_reach):
+def star_graph(z, col_x, col_y, c0, edge_radius, central_reach):
     """
     Edges of one graph, their features and the central mask. Nodes are level-major, node = level * ncol + column, with
     z (nl,) the heights of the levels [Mm] and col_x, col_y (ncol,) the horizontal offsets of the columns from the
     central column c0 [Mm].
     Star topology, every edge touches the central column: a node of another column and a central node are linked (in
-    both directions) when their height difference is <= edge_reach; two central nodes when it is <= central_reach or
-    their levels are adjacent; no self loops. Edge features: dz (source minus target), horizontal distance, |dr| [Mm].
+    both directions) when their distance |dr| is <= edge_radius; two central nodes when their height difference is
+    <= central_reach or their levels are adjacent; no self loops. Edge features: dz (source minus target), horizontal
+    distance, |dr| [Mm].
     """
     nl, ncol = len(z), len(col_x)
     dz = np.abs(z[:, None] - z[None, :])                       # [level of a node, level of a central node]
-    l, m = np.nonzero(dz <= edge_reach + 1e-9)                 # 1e-9: a tie at the reach does not depend on rounding
+    others = np.delete(np.arange(ncol), c0)
+    col_dh = np.hypot(col_x[others] - col_x[c0], col_y[others] - col_y[c0])     # horizontal distance of every column
+    # 1e-9: a tie at the radius does not depend on rounding
+    c, l, m = np.nonzero(dz[None, :, :] ** 2 + col_dh[:, None, None] ** 2 <= (edge_radius + 1e-9) ** 2)
     adjacent = np.abs(np.arange(nl)[:, None] - np.arange(nl)[None, :]) == 1
     lc, mc = np.nonzero(((dz <= central_reach + 1e-9) | adjacent) & ~np.eye(nl, dtype=bool))
-    others = np.delete(np.arange(ncol), c0)
-    src = (l[None, :] * ncol + others[:, None]).ravel()        # node (l, column) ...
-    dst = np.tile(m * ncol + c0, len(others))                  # ... -> central node (m, c0)
+    src = l * ncol + others[c]                                 # node (l, column) ...
+    dst = m * ncol + c0                                        # ... -> central node (m, c0)
     edge_index = np.concatenate([np.stack([src, dst]), np.stack([dst, src]),
                                  np.stack([lc * ncol + c0, mc * ncol + c0])], axis=1)
 
@@ -39,7 +42,7 @@ class EfficientDataset(torch.utils.data.Dataset):
                  z_levels=None, random_geometry: bool = False,
                  split: str = 'train', train_ratio: float = 0.7,
                  max_stride: int = 1, split_stride: int = None,
-                 stencil_radius: float = 4.01, edge_reach_Mm: float = 0.5, central_reach_Mm: float = 2.0,
+                 stencil_radius: float = 4.01, edge_radius_Mm: float = 1.0, central_reach_Mm: float = 2.0,
                  log_offset: float = 1e-12):
         """
         One graph per central column of a cube given on its native levels. list_X: normalized inputs, list_Y:
@@ -58,7 +61,7 @@ class EfficientDataset(torch.utils.data.Dataset):
         self.max_stride = max_stride
         self.random_geometry = random_geometry
         self.pixel = pixel_Mm
-        self.edge_reach = edge_reach_Mm
+        self.edge_radius = edge_radius_Mm
         self.central_reach = central_reach_Mm
         self.log_offset = log_offset
 
@@ -136,7 +139,7 @@ class EfficientDataset(torch.utils.data.Dataset):
         relative_flat = (k0[:, None] * self.ny * self.nx + col[None, :]).ravel()        # node = level * ncol + column
         edge_index, edge_attr, central_mask = star_graph(z_levels, self.cols_i * x_stride * self.pixel,
                                                          self.cols_j * y_stride * self.pixel, self.c0,
-                                                         self.edge_reach, self.central_reach)
+                                                         self.edge_radius, self.central_reach)
         return {'relative_flat': torch.from_numpy(relative_flat),
                 'w': torch.tensor(np.repeat(w, len(col))[:, None], dtype=torch.float32),
                 'edge_index': edge_index, 'edge_attr': edge_attr, 'central_mask': central_mask}
