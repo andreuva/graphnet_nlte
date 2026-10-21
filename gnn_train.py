@@ -256,31 +256,32 @@ for epoch in range(1, n_epochs + 1):
     print(f"Epoch {epoch} finished with validation loss: {val_loss_avg:.6f}, held-out RMS {val_dex:.5f} dex "
           f"(EMA weights {val_dex_ema:.5f} dex)")
 
+    # The weights of this epoch (raw or EMA, whichever validated better): last.pth every epoch, best.pth when the
+    # held-out RMS improves (both overwritten)
     best_loss = min(best_loss, val_loss_avg)
+    use_ema = val_dex_ema < val_dex
+    checkpoint = {
+        'epoch': epoch,
+        'state_dict': (ema.module if use_ema else model).state_dict(),
+        'weights': 'ema' if use_ema else 'raw',
+        'best_loss': best_loss,
+        'best_dex': min(best_dex, val_dex, val_dex_ema),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'config': config,
+        'features_labels': features_labels,
+        'feature_norm_params': feature_norm_params,
+        'train_loss_history': train_loss,
+        'valid_loss_history': valid_loss,
+        'valid_dex_history': valid_dex,
+        'valid_dex_ema_history': valid_dex_ema,
+    }
     if min(val_dex, val_dex_ema) < best_dex:
-        use_ema = val_dex_ema < val_dex
         best_dex = min(val_dex, val_dex_ema)
-
-        checkpoint = {
-            'epoch': epoch,
-            'state_dict': (ema.module if use_ema else model).state_dict(),
-            'weights': 'ema' if use_ema else 'raw',
-            'best_loss': best_loss,
-            'best_dex': best_dex,
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'config': config,
-            'features_labels': features_labels,
-            'feature_norm_params': feature_norm_params,
-            'train_loss_history': train_loss,
-            'valid_loss_history': valid_loss,
-            'valid_dex_history': valid_dex,
-            'valid_dex_ema_history': valid_dex_ema,
-        }
-
         print(f"New best held-out RMS: {best_dex:.5f} dex ({checkpoint['weights']} weights). Saving model...")
-        torch.save(checkpoint, os.path.join(savedir, f'{filename}_best.pth'))
-    
+        torch.save(checkpoint, os.path.join(savedir, 'best.pth'))
+    torch.save(checkpoint, os.path.join(savedir, 'last.pth'))
+
     lrs.append(scheduler.get_last_lr())
 
     # ---- Plotting ----

@@ -104,7 +104,7 @@ Set the parameters in `conf.dat` (each key is commented there) and run:
 CUDA_VISIBLE_DEVICES=<free gpu> python gnn_train.py conf.dat [seed]     # -> checkpoints/v3_lte_seed<seed>/
 ```
 
-The training minimizes the weighted mean squared error of the log10 level fractions described above. The `*_best.pth` checkpoint (the epoch with the lowest held-out error, of the raw or the EMA weights) holds the weights, the configuration, the input list and the normalization statistics. Checkpoints written by earlier versions of the code do not load.
+The training minimizes the weighted mean squared error of the log10 level fractions described above. The run folder holds two checkpoints, `best.pth` (the epoch with the lowest held-out error) and `last.pth` (the last epoch), each with the raw or the EMA weights, whichever validated better, the optimizer and scheduler state, the configuration, the input list and the normalization statistics. Checkpoints written by earlier versions of the code do not load.
 
 ### 2. Inference (Prediction)
 
@@ -124,7 +124,7 @@ python muram_comparison/compare_datasets.py <checkpoint> [grid]                 
 Defaults: the CPU; on Bifrost the held-out corner and the training hop (`max_stride`, 5 px = 238 km); on MURaM the full snapshot and the same hop in km (10 px). The grid defaults to `dense:60` in every script, whatever the training grid: pass it explicitly to evaluate on the training grid, e.g.
 
 ```bash
-python gnn_inference.py checkpoints/v3_lte_seed777/<date>_best.pth 5 test cuda dense:125
+python gnn_inference.py checkpoints/v3_lte_seed777/best.pth 5 test cuda dense:125
 ```
 
 The notebooks (`gnn_inference.ipynb`, `synthesis.ipynb`, ...) use the code of commit fbaba82, and `plot_scripts/plot_graph.py` illustrates the index-space graph of that code.
